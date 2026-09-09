@@ -1,0 +1,16 @@
+{
+  "schema_version": 1,
+  "plugins": [
+    {
+      "id": "cpa-key-policy",
+      "name": "CPA Key Policy (lawyer61)",
+      "description": "Account-isolation build based on origin652/cpa-plugin-key-policy PR #13, with fail-closed per-key upstream account binding.",
+      "author": "lawyer61",
+      "version": "0.5.2",
+      "repository": "https://github.com/lawyer61/cpa-plugin-key-policy",
+      "homepage": "https://github.com/lawyer61/cpa-plugin-key-policy",
+      "license": "MIT",
+      "tags": ["Management", "Auth", "Account Isolation"]
+    }
+  ]
+}
