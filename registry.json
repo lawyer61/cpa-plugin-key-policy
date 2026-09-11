@@ -4,13 +4,20 @@
     {
       "id": "cpa-key-policy",
       "name": "CPA Key Policy (lawyer61)",
-      "description": "Account-isolation build based on origin652/cpa-plugin-key-policy PR #13, with fail-closed per-key upstream account binding.",
+      "description": "Fail-closed account isolation, per-key and per-auth concurrency limits, self-service usage lookup, and availability-first session affinity.",
       "author": "lawyer61",
-      "version": "0.5.2",
+      "version": "0.6.0",
       "repository": "https://github.com/lawyer61/cpa-plugin-key-policy",
       "homepage": "https://github.com/lawyer61/cpa-plugin-key-policy",
       "license": "MIT",
-      "tags": ["Management", "Auth", "Account Isolation"]
+      "tags": [
+        "Management",
+        "Auth",
+        "Account Isolation",
+        "Concurrency",
+        "Usage",
+        "Session Affinity"
+      ]
     }
   ]
 }
