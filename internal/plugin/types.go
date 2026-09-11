@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/url"
+	"time"
 )
 
 const (
@@ -16,9 +17,10 @@ const (
 	MethodFrontendAuthIdentifier   = "frontend_auth.identifier"
 	MethodFrontendAuthAuthenticate = "frontend_auth.authenticate"
 
-	MethodModelRoute = "model.route"
+	MethodModelRoute             = "model.route"
 	MethodRequestInterceptBefore = "request.intercept_before"
 	MethodRequestInterceptAfter  = "request.intercept_after"
+	MethodRequestComplete        = "request.complete"
 
 	MethodResponseInterceptAfter = "response.intercept_after"
 
@@ -45,7 +47,7 @@ const (
 const (
 	PluginID   = "cpa-key-policy"
 	PluginName = "cpa-key-policy"
-	Version    = "0.5.2"
+	Version    = "0.6.0"
 )
 
 type Envelope struct {
@@ -93,6 +95,7 @@ type Capabilities struct {
 	ModelRouter                   bool `json:"model_router"`
 	Scheduler                     bool `json:"scheduler,omitempty"`
 	RequestInterceptor            bool `json:"request_interceptor,omitempty"`
+	RequestLifecyclePlugin        bool `json:"request_lifecycle_plugin,omitempty"`
 	ResponseInterceptor           bool `json:"response_interceptor"`
 	UsagePlugin                   bool `json:"usage_plugin"`
 	ManagementAPI                 bool `json:"management_api"`
@@ -157,6 +160,23 @@ type RequestInterceptResponse struct {
 	ResponseHeaders http.Header `json:"ResponseHeaders,omitempty"`
 	ResponseBody    []byte      `json:"ResponseBody,omitempty"`
 }
+
+type RequestCompletion struct {
+	RequestID      string         `json:"RequestID,omitempty"`
+	TraceID        string         `json:"TraceID,omitempty"`
+	SourceFormat   string         `json:"SourceFormat,omitempty"`
+	Model          string         `json:"Model,omitempty"`
+	RequestedModel string         `json:"RequestedModel,omitempty"`
+	Stream         bool           `json:"Stream,omitempty"`
+	Outcome        string         `json:"Outcome,omitempty"`
+	StatusCode     int            `json:"StatusCode,omitempty"`
+	Error          string         `json:"Error,omitempty"`
+	StartedAt      time.Time      `json:"StartedAt,omitempty"`
+	CompletedAt    time.Time      `json:"CompletedAt,omitempty"`
+	Metadata       map[string]any `json:"Metadata,omitempty"`
+}
+
+type RequestCompletionResponse struct{}
 
 // SchedulerPickRequest 是宿主调用 scheduler.pick 时的载荷。
 // 其结构与 pluginapi.SchedulerPickRequest 保持一致：Options 携带请求头与

@@ -16,10 +16,18 @@ import (
 )
 
 type Config struct {
-	Enabled                  bool        `yaml:"enabled" json:"enabled"`
-	StateFile                string      `yaml:"state_file" json:"state_file"`
-	GlobalWeightedRoundRobin bool        `yaml:"global_weighted_round_robin,omitempty" json:"global_weighted_round_robin,omitempty"`
-	Keys                     []KeyConfig `yaml:"keys" json:"keys"`
+	Enabled                  bool   `yaml:"enabled" json:"enabled"`
+	StateFile                string `yaml:"state_file" json:"state_file"`
+	GlobalWeightedRoundRobin bool   `yaml:"global_weighted_round_robin,omitempty" json:"global_weighted_round_robin,omitempty"`
+	// AuthConcurrencyLimits caps concurrent in-flight model executions by exact
+	// host credential ID. Missing IDs and zero values are unlimited.
+	AuthConcurrencyLimits map[string]int `yaml:"auth_concurrency_limits,omitempty" json:"auth_concurrency_limits,omitempty"`
+	// SessionAffinityIdleTTLSeconds controls how long an idle session binding is
+	// retained in memory. It applies only to keys with SessionAffinity enabled.
+	SessionAffinityIdleTTLSeconds int `yaml:"session_affinity_idle_ttl_seconds,omitempty" json:"session_affinity_idle_ttl_seconds,omitempty"`
+	// SessionAffinityMaxEntries bounds the in-memory session-affinity cache.
+	SessionAffinityMaxEntries int         `yaml:"session_affinity_max_entries,omitempty" json:"session_affinity_max_entries,omitempty"`
+	Keys                      []KeyConfig `yaml:"keys" json:"keys"`
 	// Aliases is the global alias mapping table. Each entry maps a downstream
 	// alias name to one or more (provider, model, group) targets with a shared
 	// pricing config. Keys reference aliases by name via KeyAliasRef.
@@ -31,20 +39,26 @@ type Config struct {
 }
 
 type KeyConfig struct {
-	ID         string      `yaml:"id" json:"id"`
-	Name       string      `yaml:"name" json:"name"`
-	Enabled    bool        `yaml:"enabled" json:"enabled"`
+	ID      string `yaml:"id" json:"id"`
+	Name    string `yaml:"name" json:"name"`
+	Enabled bool   `yaml:"enabled" json:"enabled"`
 	// Native leaves frontend authentication and model routing to CPA. It is
 	// useful for importing a CPA api-key solely to enforce an account binding.
-	Native     bool        `yaml:"native,omitempty" json:"native,omitempty"`
-	KeyHash    string      `yaml:"key_hash" json:"key_hash"`
-	KeyPreview string      `yaml:"key_preview" json:"key_preview"`
+	Native     bool   `yaml:"native,omitempty" json:"native,omitempty"`
+	KeyHash    string `yaml:"key_hash" json:"key_hash"`
+	KeyPreview string `yaml:"key_preview" json:"key_preview"`
 	// CallerScope is CPA's irreversible namespace for the downstream key. It
 	// identifies imported native keys without retaining another plaintext copy.
 	CallerScope    string          `yaml:"caller_scope,omitempty" json:"caller_scope,omitempty"`
 	AccountBinding *AccountBinding `yaml:"account_binding,omitempty" json:"account_binding,omitempty"`
 	RPM            int             `yaml:"rpm" json:"rpm"`
-	Models     []ModelRule `yaml:"models" json:"models"`
+	// MaxConcurrentRequests caps this key's in-flight model executions in one
+	// CPA process. Zero means unlimited.
+	MaxConcurrentRequests int `yaml:"max_concurrent_requests,omitempty" json:"max_concurrent_requests,omitempty"`
+	// SessionAffinity prefers the same allowed auth file for requests carrying a
+	// stable session identity. It never permits routing outside AccountBinding.
+	SessionAffinity bool        `yaml:"session_affinity,omitempty" json:"session_affinity,omitempty"`
+	Models          []ModelRule `yaml:"models" json:"models"`
 	// Aliases references global alias mappings by name. When non-empty, the key
 	// uses these aliases for routing and billing. Per-key price overrides are
 	// optional (nil = use global alias pricing). This field coexists with
@@ -278,11 +292,14 @@ type UsageWindow struct {
 }
 
 type State struct {
-	Version                  int                    `json:"version"`
-	Keys                     []KeyConfig            `json:"keys"`
-	Usage                    map[string]*UsageState `json:"usage,omitempty"`
-	UpdatedAt                time.Time              `json:"updated_at"`
-	GlobalWeightedRoundRobin *bool                  `json:"global_weighted_round_robin,omitempty"`
+	Version                       int                    `json:"version"`
+	Keys                          []KeyConfig            `json:"keys"`
+	Usage                         map[string]*UsageState `json:"usage,omitempty"`
+	UpdatedAt                     time.Time              `json:"updated_at"`
+	GlobalWeightedRoundRobin      *bool                  `json:"global_weighted_round_robin,omitempty"`
+	AuthConcurrencyLimits         *map[string]int        `json:"auth_concurrency_limits,omitempty"`
+	SessionAffinityIdleTTLSeconds *int                   `json:"session_affinity_idle_ttl_seconds,omitempty"`
+	SessionAffinityMaxEntries     *int                   `json:"session_affinity_max_entries,omitempty"`
 	// Aliases is the global alias mapping table, persisted so that key alias
 	// references survive restarts even when config.yaml is not re-read. On
 	// Configure, the config.yaml Aliases take precedence; state Aliases are a
@@ -291,10 +308,87 @@ type State struct {
 	ClassifyRules []ClassifyRule `json:"classify_rules,omitempty"`
 }
 
+const (
+	DefaultSessionAffinityIdleTTLSeconds = 60 * 60
+	DefaultSessionAffinityMaxEntries     = 10_000
+)
+
+var ErrInvalidRuntimeSettings = errors.New("invalid runtime settings")
+
+// RuntimeSettings are plugin-wide scheduler controls persisted alongside the
+// key state. Maps are copied at Store boundaries so callers cannot mutate live
+// configuration.
+type RuntimeSettings struct {
+	GlobalWeightedRoundRobin      bool           `json:"global_weighted_round_robin"`
+	AuthConcurrencyLimits         map[string]int `json:"auth_concurrency_limits"`
+	SessionAffinityIdleTTLSeconds int            `json:"session_affinity_idle_ttl_seconds"`
+	SessionAffinityMaxEntries     int            `json:"session_affinity_max_entries"`
+}
+
+func runtimeSettingsFromConfig(cfg Config) RuntimeSettings {
+	return RuntimeSettings{
+		GlobalWeightedRoundRobin:      cfg.GlobalWeightedRoundRobin,
+		AuthConcurrencyLimits:         cloneIntMap(cfg.AuthConcurrencyLimits),
+		SessionAffinityIdleTTLSeconds: cfg.SessionAffinityIdleTTLSeconds,
+		SessionAffinityMaxEntries:     cfg.SessionAffinityMaxEntries,
+	}
+}
+
+func applyRuntimeSettings(cfg *Config, settings RuntimeSettings) {
+	if cfg == nil {
+		return
+	}
+	cfg.GlobalWeightedRoundRobin = settings.GlobalWeightedRoundRobin
+	cfg.AuthConcurrencyLimits = cloneIntMap(settings.AuthConcurrencyLimits)
+	cfg.SessionAffinityIdleTTLSeconds = settings.SessionAffinityIdleTTLSeconds
+	cfg.SessionAffinityMaxEntries = settings.SessionAffinityMaxEntries
+}
+
+func normalizeRuntimeSettings(settings RuntimeSettings) (RuntimeSettings, error) {
+	if settings.SessionAffinityIdleTTLSeconds == 0 {
+		settings.SessionAffinityIdleTTLSeconds = DefaultSessionAffinityIdleTTLSeconds
+	}
+	if settings.SessionAffinityMaxEntries == 0 {
+		settings.SessionAffinityMaxEntries = DefaultSessionAffinityMaxEntries
+	}
+	if settings.SessionAffinityIdleTTLSeconds < 0 {
+		return RuntimeSettings{}, errors.New("session_affinity_idle_ttl_seconds cannot be negative")
+	}
+	if settings.SessionAffinityMaxEntries < 0 {
+		return RuntimeSettings{}, errors.New("session_affinity_max_entries cannot be negative")
+	}
+	normalizedAuthLimits := make(map[string]int, len(settings.AuthConcurrencyLimits))
+	for rawID, limit := range settings.AuthConcurrencyLimits {
+		id := strings.TrimSpace(rawID)
+		if id == "" {
+			return RuntimeSettings{}, errors.New("auth_concurrency_limits contains an empty credential id")
+		}
+		if limit < 0 {
+			return RuntimeSettings{}, fmt.Errorf("auth concurrency limit for %q cannot be negative", id)
+		}
+		if limit > 0 {
+			normalizedAuthLimits[id] = limit
+		}
+	}
+	settings.AuthConcurrencyLimits = normalizedAuthLimits
+	return settings, nil
+}
+
+func cloneIntMap(src map[string]int) map[string]int {
+	out := make(map[string]int, len(src))
+	for key, value := range src {
+		out[key] = value
+	}
+	return out
+}
+
 func DefaultConfig() Config {
 	return Config{
-		Enabled:   true,
-		StateFile: "cpa-key-policy-state.json",
+		Enabled:                       true,
+		StateFile:                     "cpa-key-policy-state.json",
+		AuthConcurrencyLimits:         map[string]int{},
+		SessionAffinityIdleTTLSeconds: DefaultSessionAffinityIdleTTLSeconds,
+		SessionAffinityMaxEntries:     DefaultSessionAffinityMaxEntries,
 	}
 }
 
@@ -433,6 +527,12 @@ func mergeAliasTarget(a *AliasMapping, target AliasTarget) {
 }
 
 func normalizeConfig(cfg *Config) error {
+	settings, err := normalizeRuntimeSettings(runtimeSettingsFromConfig(*cfg))
+	if err != nil {
+		return err
+	}
+	applyRuntimeSettings(cfg, settings)
+
 	// Auto-migrate: when a key has per-key Models but no Aliases, promote
 	// Models to the global alias table and convert the key to reference aliases.
 	// This runs on every normalizeConfig call (DecodeConfig, Configure, state
@@ -511,6 +611,9 @@ func normalizeConfig(cfg *Config) error {
 		}
 		if key.RPM < 0 {
 			return fmt.Errorf("key %q rpm cannot be negative", key.ID)
+		}
+		if key.MaxConcurrentRequests < 0 {
+			return fmt.Errorf("key %q max_concurrent_requests cannot be negative", key.ID)
 		}
 		if key.DailyLimitUSD < 0 {
 			return fmt.Errorf("key %q daily_limit_usd cannot be negative", key.ID)
@@ -734,12 +837,15 @@ func SaveState(path string, keys []KeyConfig, usage map[string]*UsageState, alia
 	return saveStateDocument(path, keys, usage, aliases, rules, nil)
 }
 
-func saveStateWithSettings(path string, keys []KeyConfig, usage map[string]*UsageState, aliases []AliasMapping, rules []ClassifyRule, globalWeightedRoundRobin bool) error {
-	value := globalWeightedRoundRobin
-	return saveStateDocument(path, keys, usage, aliases, rules, &value)
+func saveStateWithSettings(path string, keys []KeyConfig, usage map[string]*UsageState, aliases []AliasMapping, rules []ClassifyRule, settings RuntimeSettings) error {
+	normalized, err := normalizeRuntimeSettings(settings)
+	if err != nil {
+		return err
+	}
+	return saveStateDocument(path, keys, usage, aliases, rules, &normalized)
 }
 
-func saveStateDocument(path string, keys []KeyConfig, usage map[string]*UsageState, aliases []AliasMapping, rules []ClassifyRule, globalWeightedRoundRobin *bool) error {
+func saveStateDocument(path string, keys []KeyConfig, usage map[string]*UsageState, aliases []AliasMapping, rules []ClassifyRule, settings *RuntimeSettings) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return err
 	}
@@ -756,13 +862,22 @@ func saveStateDocument(path string, keys []KeyConfig, usage map[string]*UsageSta
 		cleanKeys[i].Models = nil
 	}
 	state := State{
-		Version:                  1,
-		Keys:                     cleanKeys,
-		Usage:                    usage,
-		UpdatedAt:                time.Now().UTC(),
-		GlobalWeightedRoundRobin: globalWeightedRoundRobin,
-		Aliases:                  aliases,
-		ClassifyRules:            rules,
+		Version:       1,
+		Keys:          cleanKeys,
+		Usage:         usage,
+		UpdatedAt:     time.Now().UTC(),
+		Aliases:       aliases,
+		ClassifyRules: rules,
+	}
+	if settings != nil {
+		globalWeightedRoundRobin := settings.GlobalWeightedRoundRobin
+		authConcurrencyLimits := cloneIntMap(settings.AuthConcurrencyLimits)
+		idleTTLSeconds := settings.SessionAffinityIdleTTLSeconds
+		maxEntries := settings.SessionAffinityMaxEntries
+		state.GlobalWeightedRoundRobin = &globalWeightedRoundRobin
+		state.AuthConcurrencyLimits = &authConcurrencyLimits
+		state.SessionAffinityIdleTTLSeconds = &idleTTLSeconds
+		state.SessionAffinityMaxEntries = &maxEntries
 	}
 	raw, err := json.MarshalIndent(state, "", "  ")
 	if err != nil {
@@ -788,11 +903,17 @@ func SaveUsageOnly(path string, usage map[string]*UsageState) error {
 	var aliases []AliasMapping
 	var rules []ClassifyRule
 	var globalWeightedRoundRobin *bool
+	var authConcurrencyLimits *map[string]int
+	var sessionAffinityIdleTTLSeconds *int
+	var sessionAffinityMaxEntries *int
 	if cur, err := LoadState(path); err == nil {
 		keys = cur.Keys
 		aliases = cur.Aliases
 		rules = cur.ClassifyRules
 		globalWeightedRoundRobin = cur.GlobalWeightedRoundRobin
+		authConcurrencyLimits = cur.AuthConcurrencyLimits
+		sessionAffinityIdleTTLSeconds = cur.SessionAffinityIdleTTLSeconds
+		sessionAffinityMaxEntries = cur.SessionAffinityMaxEntries
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return err
 	}
@@ -803,13 +924,16 @@ func SaveUsageOnly(path string, usage map[string]*UsageState) error {
 		keys[i].Models = nil
 	}
 	state := State{
-		Version:                  1,
-		Keys:                     keys,
-		Usage:                    usage,
-		UpdatedAt:                time.Now().UTC(),
-		GlobalWeightedRoundRobin: globalWeightedRoundRobin,
-		Aliases:                  aliases,
-		ClassifyRules:            rules,
+		Version:                       1,
+		Keys:                          keys,
+		Usage:                         usage,
+		UpdatedAt:                     time.Now().UTC(),
+		GlobalWeightedRoundRobin:      globalWeightedRoundRobin,
+		AuthConcurrencyLimits:         authConcurrencyLimits,
+		SessionAffinityIdleTTLSeconds: sessionAffinityIdleTTLSeconds,
+		SessionAffinityMaxEntries:     sessionAffinityMaxEntries,
+		Aliases:                       aliases,
+		ClassifyRules:                 rules,
 	}
 	raw, err := json.MarshalIndent(state, "", "  ")
 	if err != nil {

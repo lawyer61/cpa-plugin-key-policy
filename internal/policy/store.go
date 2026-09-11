@@ -12,17 +12,20 @@ import (
 )
 
 type Store struct {
-	mu                       sync.RWMutex
-	updateMu                 sync.Mutex
-	persistMu                sync.Mutex
-	enabled                  bool
-	globalWeightedRoundRobin bool
-	statePath                string
-	keys                     map[string]*KeyConfig
-	keysByHash               map[string]*KeyConfig
-	keysByCallerScope        map[string]*KeyConfig
-	limiter                  *RateLimiter
-	usage                    *usageLedger
+	mu                            sync.RWMutex
+	updateMu                      sync.Mutex
+	persistMu                     sync.Mutex
+	enabled                       bool
+	globalWeightedRoundRobin      bool
+	authConcurrencyLimits         map[string]int
+	sessionAffinityIdleTTLSeconds int
+	sessionAffinityMaxEntries     int
+	statePath                     string
+	keys                          map[string]*KeyConfig
+	keysByHash                    map[string]*KeyConfig
+	keysByCallerScope             map[string]*KeyConfig
+	limiter                       *RateLimiter
+	usage                         *usageLedger
 	// flusher for periodically persisting the usage ledger to the state file.
 	flusher *usageFlusher
 	// aliases is the global alias mapping table from config.yaml. Used to
@@ -69,24 +72,22 @@ type AuthDecision struct {
 	ModelList   bool
 	RateLimited bool
 	CostLimited bool
-	// PreCharged reports that this request was billed at access time because
-	// it targets an image/video endpoint whose per_call alias CPA cannot bill
-	// via usage.handle (the XAI executor skips UsageReporter on those paths).
-	// The charge is unconditional (no failure refund), so this is a deliberate
-	// trade-off documented in the UI.
-	PreCharged bool
 }
 
 func NewStore() *Store {
+	defaults := DefaultConfig()
 	return &Store{
-		enabled:      DefaultConfig().Enabled,
-		keys:         make(map[string]*KeyConfig),
-		keysByHash:   make(map[string]*KeyConfig),
-		keysByCallerScope: make(map[string]*KeyConfig),
-		limiter:      NewRateLimiter(),
-		usage:        newUsageLedger(time.Now),
-		rrCounters:   make(map[string]int),
-		pendingPicks: make(map[string][]pendingPick),
+		enabled:                       defaults.Enabled,
+		authConcurrencyLimits:         cloneIntMap(defaults.AuthConcurrencyLimits),
+		sessionAffinityIdleTTLSeconds: defaults.SessionAffinityIdleTTLSeconds,
+		sessionAffinityMaxEntries:     defaults.SessionAffinityMaxEntries,
+		keys:                          make(map[string]*KeyConfig),
+		keysByHash:                    make(map[string]*KeyConfig),
+		keysByCallerScope:             make(map[string]*KeyConfig),
+		limiter:                       NewRateLimiter(),
+		usage:                         newUsageLedger(time.Now),
+		rrCounters:                    make(map[string]int),
+		pendingPicks:                  make(map[string][]pendingPick),
 	}
 }
 
@@ -128,6 +129,20 @@ func (s *Store) Configure(cfg Config) error {
 		if state.GlobalWeightedRoundRobin != nil {
 			cfg.GlobalWeightedRoundRobin = *state.GlobalWeightedRoundRobin
 		}
+		if state.AuthConcurrencyLimits != nil {
+			cfg.AuthConcurrencyLimits = cloneIntMap(*state.AuthConcurrencyLimits)
+		}
+		if state.SessionAffinityIdleTTLSeconds != nil {
+			cfg.SessionAffinityIdleTTLSeconds = *state.SessionAffinityIdleTTLSeconds
+		}
+		if state.SessionAffinityMaxEntries != nil {
+			cfg.SessionAffinityMaxEntries = *state.SessionAffinityMaxEntries
+		}
+		settings, errSettings := normalizeRuntimeSettings(runtimeSettingsFromConfig(cfg))
+		if errSettings != nil {
+			return fmt.Errorf("load state settings: %w", errSettings)
+		}
+		applyRuntimeSettings(&cfg, settings)
 		// If config.yaml has no global alias table, fall back to the one
 		// persisted in state (so state-only reloads resolve key alias refs).
 		stateAliases := cfg.Aliases
@@ -141,6 +156,7 @@ func (s *Store) Configure(cfg Config) error {
 		// Validate state keys against the global alias table. normalizeConfig
 		// also auto-migrates any state keys still using per-key Models.
 		merged := Config{Enabled: cfg.Enabled, StateFile: cfg.StateFile, Keys: keys, Aliases: stateAliases, ClassifyRules: stateRules}
+		applyRuntimeSettings(&merged, runtimeSettingsFromConfig(cfg))
 		if errNorm := normalizeConfig(&merged); errNorm != nil {
 			return fmt.Errorf("load state: %w", errNorm)
 		}
@@ -193,6 +209,9 @@ func (s *Store) Configure(cfg Config) error {
 	// deleted key cannot be resurrected from an older in-memory snapshot.
 	s.enabled = cfg.Enabled
 	s.globalWeightedRoundRobin = cfg.GlobalWeightedRoundRobin
+	s.authConcurrencyLimits = cloneIntMap(cfg.AuthConcurrencyLimits)
+	s.sessionAffinityIdleTTLSeconds = cfg.SessionAffinityIdleTTLSeconds
+	s.sessionAffinityMaxEntries = cfg.SessionAffinityMaxEntries
 	s.statePath = statePath
 	// Store the global alias table and classify rules for routing/billing.
 	s.aliases = make(map[string]*AliasMapping, len(cfg.Aliases))
@@ -251,18 +270,61 @@ func (s *Store) GlobalWeightedRoundRobin() bool {
 	return s.globalWeightedRoundRobin
 }
 
-// SetGlobalWeightedRoundRobin 更新并持久化全局加权轮询开关。
-func (s *Store) SetGlobalWeightedRoundRobin(enabled bool) error {
+// RuntimeSettings returns a detached snapshot of plugin-wide scheduling
+// controls.
+func (s *Store) RuntimeSettings() RuntimeSettings {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return RuntimeSettings{
+		GlobalWeightedRoundRobin:      s.globalWeightedRoundRobin,
+		AuthConcurrencyLimits:         cloneIntMap(s.authConcurrencyLimits),
+		SessionAffinityIdleTTLSeconds: s.sessionAffinityIdleTTLSeconds,
+		SessionAffinityMaxEntries:     s.sessionAffinityMaxEntries,
+	}
+}
+
+// RuntimeSettingsPatch applies only the non-nil fields, then persists the
+// complete normalized settings snapshot.
+type RuntimeSettingsPatch struct {
+	GlobalWeightedRoundRobin      *bool
+	AuthConcurrencyLimits         *map[string]int
+	SessionAffinityIdleTTLSeconds *int
+	SessionAffinityMaxEntries     *int
+}
+
+func (s *Store) UpdateRuntimeSettings(patch RuntimeSettingsPatch) (RuntimeSettings, error) {
 	s.updateMu.Lock()
 	defer s.updateMu.Unlock()
 
 	s.mu.Lock()
-	previous := s.globalWeightedRoundRobin
-	if previous == enabled {
-		s.mu.Unlock()
-		return nil
+	previous := RuntimeSettings{
+		GlobalWeightedRoundRobin:      s.globalWeightedRoundRobin,
+		AuthConcurrencyLimits:         cloneIntMap(s.authConcurrencyLimits),
+		SessionAffinityIdleTTLSeconds: s.sessionAffinityIdleTTLSeconds,
+		SessionAffinityMaxEntries:     s.sessionAffinityMaxEntries,
 	}
-	s.globalWeightedRoundRobin = enabled
+	next := previous
+	if patch.GlobalWeightedRoundRobin != nil {
+		next.GlobalWeightedRoundRobin = *patch.GlobalWeightedRoundRobin
+	}
+	if patch.AuthConcurrencyLimits != nil {
+		next.AuthConcurrencyLimits = cloneIntMap(*patch.AuthConcurrencyLimits)
+	}
+	if patch.SessionAffinityIdleTTLSeconds != nil {
+		next.SessionAffinityIdleTTLSeconds = *patch.SessionAffinityIdleTTLSeconds
+	}
+	if patch.SessionAffinityMaxEntries != nil {
+		next.SessionAffinityMaxEntries = *patch.SessionAffinityMaxEntries
+	}
+	next, err := normalizeRuntimeSettings(next)
+	if err != nil {
+		s.mu.Unlock()
+		return RuntimeSettings{}, fmt.Errorf("%w: %v", ErrInvalidRuntimeSettings, err)
+	}
+	s.globalWeightedRoundRobin = next.GlobalWeightedRoundRobin
+	s.authConcurrencyLimits = cloneIntMap(next.AuthConcurrencyLimits)
+	s.sessionAffinityIdleTTLSeconds = next.SessionAffinityIdleTTLSeconds
+	s.sessionAffinityMaxEntries = next.SessionAffinityMaxEntries
 	keys := s.keysSnapshotLocked()
 	usage := s.usageSnapshotLocked()
 	aliases := s.aliasesSnapshotLocked()
@@ -272,11 +334,32 @@ func (s *Store) SetGlobalWeightedRoundRobin(enabled bool) error {
 
 	if err := s.saveState(path, keys, usage, aliases, rules); err != nil {
 		s.mu.Lock()
-		s.globalWeightedRoundRobin = previous
+		s.globalWeightedRoundRobin = previous.GlobalWeightedRoundRobin
+		s.authConcurrencyLimits = cloneIntMap(previous.AuthConcurrencyLimits)
+		s.sessionAffinityIdleTTLSeconds = previous.SessionAffinityIdleTTLSeconds
+		s.sessionAffinityMaxEntries = previous.SessionAffinityMaxEntries
 		s.mu.Unlock()
-		return err
+		return RuntimeSettings{}, err
 	}
-	return nil
+	return next, nil
+}
+
+// SetGlobalWeightedRoundRobin 更新并持久化全局加权轮询开关。
+func (s *Store) SetGlobalWeightedRoundRobin(enabled bool) error {
+	_, err := s.UpdateRuntimeSettings(RuntimeSettingsPatch{GlobalWeightedRoundRobin: &enabled})
+	return err
+}
+
+func (s *Store) AuthConcurrencyLimit(authID string) int {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.authConcurrencyLimits[strings.TrimSpace(authID)]
+}
+
+func (s *Store) HasAuthConcurrencyLimits() bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return len(s.authConcurrencyLimits) > 0
 }
 
 func (s *Store) runtimeComponents() (*RateLimiter, *usageLedger) {
@@ -381,29 +464,49 @@ func (s *Store) Authenticate(method, path string, headers http.Header, query map
 		s.rememberPick(key.ID, requested, decision.Rule)
 	}
 
-	// Per-call image/video pre-charge workaround. CPA's XAI executor does not
-	// emit usage records for /v1/images/* and /v1/videos/* (executeImages and
-	// executeVideos lack a UsageReporter), so usage.handle never fires and the
-	// plugin would never bill these. When the matched rule is per_call and the
-	// path is an image/video endpoint, charge now, at access time. This is
-	// unconditional (we cannot observe the upstream outcome here), so failed
-	// requests are also charged — a known trade-off surfaced in the UI.
-	if decision.Rule.BillingMode == "per_call" && IsImageVideoEndpoint(path) {
-		alias := decision.Rule.Alias
-		if alias == "" {
-			alias = decision.Requested
-		}
-		model := decision.Rule.TargetModel
-		if model == "" {
-			model = alias
-		}
-		// failed=false so the per_call branch charges PerCallUSD. This is the
-		// intended behavior for this workaround (no refund on upstream failure).
-		s.RecordUsage(key.ID, alias, model, false, UsageDetail{})
-		decision.PreCharged = true
-	}
-
 	return decision
+}
+
+// ChargeDeferredPerCall applies the image/video fixed-price workaround after
+// key and auth concurrency admission. It returns true when the request matched a
+// per-call rule, including zero-cost rules. The charge remains unconditional
+// with respect to the later upstream outcome because CPA does not report usage
+// for these execution paths.
+func (s *Store) ChargeDeferredPerCall(keyID, path, requestedModel, model string) bool {
+	if !IsImageVideoEndpoint(path) {
+		return false
+	}
+	key := s.findByID(keyID)
+	if key == nil || key.Native || !key.Enabled {
+		return false
+	}
+	requestedModel = strings.TrimSpace(requestedModel)
+	model = strings.TrimSpace(model)
+	var rule ModelRule
+	var found bool
+	for _, candidate := range key.Models {
+		if requestedModel != "" && strings.EqualFold(candidate.Alias, requestedModel) {
+			rule, found = candidate, true
+			break
+		}
+		if requestedModel == "" && model != "" && strings.EqualFold(candidate.TargetModel, model) {
+			rule, found = candidate, true
+			break
+		}
+	}
+	if !found || !strings.EqualFold(rule.BillingMode, "per_call") {
+		return false
+	}
+	alias := strings.TrimSpace(rule.Alias)
+	if alias == "" {
+		alias = requestedModel
+	}
+	resolvedModel := strings.TrimSpace(rule.TargetModel)
+	if resolvedModel == "" {
+		resolvedModel = model
+	}
+	s.RecordUsage(key.ID, alias, resolvedModel, false, UsageDetail{})
+	return true
 }
 
 func (s *Store) Route(headers http.Header, query map[string][]string, requested string) (ModelRule, string, bool) {
@@ -754,6 +857,11 @@ func (s *Store) AliasUsageFor(keyID string) (KeyConfig, []AliasUsageEntry, bool)
 // FindByAPIKey resolves a downstream plain key to policy (copy). Returns nil when unknown.
 func (s *Store) FindByAPIKey(raw string) *KeyConfig {
 	return s.findBySecret(raw)
+}
+
+// FindByID returns a detached key snapshot for runtime lifecycle correlation.
+func (s *Store) FindByID(id string) *KeyConfig {
+	return s.findByID(id)
 }
 
 // FindByCallerScope resolves the host-generated irreversible caller namespace.
@@ -1529,10 +1637,8 @@ func (s *Store) FlushUsage() error {
 func (s *Store) saveState(path string, keys []KeyConfig, usage map[string]*UsageState, aliases []AliasMapping, rules []ClassifyRule) error {
 	s.persistMu.Lock()
 	defer s.persistMu.Unlock()
-	s.mu.RLock()
-	globalWeightedRoundRobin := s.globalWeightedRoundRobin
-	s.mu.RUnlock()
-	return saveStateWithSettings(path, keys, usage, aliases, rules, globalWeightedRoundRobin)
+	settings := s.RuntimeSettings()
+	return saveStateWithSettings(path, keys, usage, aliases, rules, settings)
 }
 
 func (s *Store) saveUsageOnly(path string, usage map[string]*UsageState) error {
@@ -1599,7 +1705,12 @@ func (f *usageFlusher) loop() {
 func (s *Store) Status() map[string]any {
 	s.mu.RLock()
 	enabled := s.enabled
-	globalWeightedRoundRobin := s.globalWeightedRoundRobin
+	settings := RuntimeSettings{
+		GlobalWeightedRoundRobin:      s.globalWeightedRoundRobin,
+		AuthConcurrencyLimits:         cloneIntMap(s.authConcurrencyLimits),
+		SessionAffinityIdleTTLSeconds: s.sessionAffinityIdleTTLSeconds,
+		SessionAffinityMaxEntries:     s.sessionAffinityMaxEntries,
+	}
 	statePath := s.statePath
 	keys := s.keysSnapshotLocked()
 	limiter := s.limiter
@@ -1610,12 +1721,15 @@ func (s *Store) Status() map[string]any {
 		rpmUsage = limiter.Snapshot()
 	}
 	out := map[string]any{
-		"enabled":                     enabled,
-		"global_weighted_round_robin": globalWeightedRoundRobin,
-		"state_file":                  statePath,
-		"key_count":                   len(keys),
-		"rpm_usage":                   rpmUsage,
-		"usage":                       usageSummaryForKeys(usage, keys),
+		"enabled":                           enabled,
+		"global_weighted_round_robin":       settings.GlobalWeightedRoundRobin,
+		"auth_concurrency_limits":           settings.AuthConcurrencyLimits,
+		"session_affinity_idle_ttl_seconds": settings.SessionAffinityIdleTTLSeconds,
+		"session_affinity_max_entries":      settings.SessionAffinityMaxEntries,
+		"state_file":                        statePath,
+		"key_count":                         len(keys),
+		"rpm_usage":                         rpmUsage,
+		"usage":                             usageSummaryForKeys(usage, keys),
 	}
 	return out
 }

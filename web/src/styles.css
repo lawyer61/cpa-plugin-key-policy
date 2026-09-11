@@ -1086,3 +1086,275 @@ td.strong { font-weight: 600; color: var(--text); }
   background: var(--accent-soft); border-color: var(--accent); color: var(--accent);
   font-weight: 600;
 }
+
+/* Runtime scheduler settings */
+.runtime-settings {
+  margin-bottom: 20px;
+  padding: 20px;
+}
+.runtime-settings-head,
+.runtime-auth-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+}
+.runtime-settings-head h2,
+.runtime-auth-head h3 {
+  margin: 0;
+  font-size: 15px;
+  font-weight: 700;
+}
+.runtime-settings-head p,
+.runtime-auth-head p {
+  margin: 4px 0 0;
+  font-size: 12px;
+}
+.runtime-settings-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 16px;
+  margin-top: 18px;
+}
+.runtime-auth-limits {
+  margin-top: 4px;
+  padding-top: 16px;
+  border-top: 1px solid var(--border);
+}
+.runtime-auth-add {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+  flex-wrap: wrap;
+  max-width: 620px;
+}
+.runtime-auth-add .input {
+  width: auto;
+  min-width: 180px;
+}
+.runtime-auth-rows {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-top: 12px;
+}
+.runtime-auth-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.runtime-auth-id {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 12px;
+}
+.runtime-auth-limit {
+  width: 110px;
+}
+.runtime-auth-unit {
+  width: 140px;
+  font-size: 12px;
+}
+.runtime-auth-empty {
+  margin: 12px 0 0;
+  font-size: 12px;
+}
+.runtime-stats {
+  display: flex;
+  gap: 16px;
+  margin-top: 14px;
+  padding-top: 12px;
+  border-top: 1px solid var(--border);
+  font-size: 12px;
+}
+
+/* Public key lookup page */
+.lookup-page {
+  min-height: 100vh;
+  max-width: 920px;
+  margin: 0 auto;
+  padding: 48px 24px 64px;
+}
+.lookup-header {
+  margin-bottom: 24px;
+}
+.lookup-header h1 {
+  margin: 0;
+  font-size: 28px;
+  letter-spacing: -0.02em;
+}
+.lookup-header p {
+  margin: 8px 0 0;
+  color: var(--muted);
+  font-size: 14px;
+}
+.lookup-query-card {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: var(--r-lg);
+  box-shadow: var(--shadow-sm);
+  padding: 20px;
+}
+.lookup-query-form > label {
+  display: block;
+  margin-bottom: 6px;
+  color: var(--text);
+  font-size: 13px;
+  font-weight: 600;
+}
+.lookup-query-controls {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.lookup-query-controls .input {
+  flex: 1;
+  min-width: 0;
+}
+.lookup-error {
+  margin-top: 16px;
+}
+.lookup-results {
+  margin-top: 24px;
+}
+.lookup-result-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+  margin-bottom: 22px;
+  padding-bottom: 16px;
+  border-bottom: 1px solid var(--border);
+}
+.lookup-result-kicker {
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+.lookup-result-head h2 {
+  margin: 2px 0 0;
+  font-size: 22px;
+}
+.lookup-section {
+  margin-bottom: 24px;
+}
+.lookup-section h3 {
+  margin: 0 0 10px;
+  font-size: 15px;
+}
+.lookup-limit-grid,
+.lookup-window-grid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 10px;
+}
+.lookup-window-grid {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+.lookup-limit-card,
+.lookup-window-card,
+.lookup-concurrency-card {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: var(--r-md);
+  padding: 14px;
+}
+.lookup-limit-label,
+.lookup-window-label,
+.lookup-concurrency-label {
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+.lookup-limit-value {
+  margin-top: 5px;
+  font-family: "Courier Prime", ui-monospace, Consolas, monospace;
+  font-size: 18px;
+  font-weight: 700;
+  word-break: break-word;
+}
+.lookup-window-value {
+  margin-top: 3px;
+  font-family: "Courier Prime", ui-monospace, Consolas, monospace;
+  font-size: 24px;
+  font-weight: 700;
+}
+.lookup-progress {
+  height: 6px;
+  margin: 12px 0 7px;
+  overflow: hidden;
+  border-radius: var(--r-full);
+  background: var(--muted-bg);
+}
+.lookup-progress > span {
+  display: block;
+  height: 100%;
+  border-radius: var(--r-full);
+  background: var(--accent);
+}
+.lookup-window-caption,
+.lookup-window-reset {
+  color: var(--muted);
+  font-size: 11px;
+}
+.lookup-window-reset {
+  margin-top: 4px;
+}
+.lookup-concurrency-card {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 16px;
+}
+.lookup-concurrency-value {
+  margin-top: 4px;
+  font-family: "Courier Prime", ui-monospace, Consolas, monospace;
+  font-size: 22px;
+  font-weight: 700;
+}
+.lookup-alias-table-wrap {
+  overflow-x: auto;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: var(--r-md);
+}
+.lookup-alias-table {
+  min-width: 540px;
+}
+.lookup-empty {
+  margin: 0;
+  padding: 16px;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: var(--r-md);
+}
+
+@media (max-width: 640px) {
+  .runtime-settings { padding: 16px; }
+  .runtime-settings-head,
+  .runtime-auth-head { flex-direction: column; }
+  .runtime-settings-grid { grid-template-columns: 1fr; gap: 0; }
+  .runtime-auth-add { width: 100%; justify-content: stretch; }
+  .runtime-auth-add .input,
+  .runtime-auth-add select { width: 100%; min-width: 0; }
+  .runtime-auth-row { flex-wrap: wrap; }
+  .runtime-auth-id { flex-basis: calc(100% - 34px); }
+  .runtime-auth-limit { flex: 1; width: auto; }
+  .runtime-auth-unit { flex: 1; width: auto; }
+  .lookup-page { padding: 28px 16px 44px; }
+  .lookup-header h1 { font-size: 24px; }
+  .lookup-query-controls { flex-wrap: wrap; }
+  .lookup-query-controls .input { flex-basis: 100%; }
+  .lookup-query-controls .btn { flex: 1; }
+  .lookup-limit-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .lookup-window-grid { grid-template-columns: 1fr; }
+  .lookup-result-head { align-items: stretch; flex-direction: column; }
+  .lookup-result-head .btn { align-self: flex-start; }
+}

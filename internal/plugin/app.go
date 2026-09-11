@@ -1,6 +1,7 @@
 package plugin
 
 import (
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -8,18 +9,22 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"time"
 
 	"cpa-key-policy/internal/plugin/web"
 	"cpa-key-policy/internal/policy"
 )
 
 type App struct {
-	store         *policy.Store
-	classifyMu    sync.RWMutex
-	classifyCache map[string][]string
-	schedulerMu   sync.Mutex
-	schedulerRR   map[string]*smoothWeightedState
+	store           *policy.Store
+	classifyMu      sync.RWMutex
+	classifyCache   map[string][]string
+	schedulerMu     sync.Mutex
+	schedulerRR     map[string]*smoothWeightedState
 	schedulerCursor map[string]string
+	selectionMu     sync.Mutex
+	concurrency     *concurrencyTracker
+	affinity        *affinityCache
 }
 
 const classifyCacheCapacity = 4096
@@ -27,11 +32,14 @@ const classifyCacheCapacity = 4096
 func NewApp() *App {
 	store := policy.NewStore()
 	_ = store.Configure(policy.DefaultConfig())
+	settings := store.RuntimeSettings()
 	return &App{
-		store:         store,
-		classifyCache: make(map[string][]string),
-		schedulerRR:   make(map[string]*smoothWeightedState),
+		store:           store,
+		classifyCache:   make(map[string][]string),
+		schedulerRR:     make(map[string]*smoothWeightedState),
 		schedulerCursor: make(map[string]string),
+		concurrency:     newConcurrencyTracker(),
+		affinity:        newAffinityCache(time.Now, time.Duration(settings.SessionAffinityIdleTTLSeconds)*time.Second, settings.SessionAffinityMaxEntries),
 	}
 }
 
@@ -57,7 +65,9 @@ func (a *App) handleMethod(method string, request []byte) ([]byte, error) {
 	case MethodRequestInterceptBefore:
 		return a.interceptRequestBefore(request)
 	case MethodRequestInterceptAfter:
-		return OKEnvelope(RequestInterceptResponse{})
+		return a.interceptRequestAfter(request)
+	case MethodRequestComplete:
+		return a.handleRequestComplete(request)
 	case MethodSchedulerPick:
 		return a.pickScheduler(request)
 	case MethodResponseInterceptAfter:
@@ -97,6 +107,8 @@ func (a *App) configure(raw []byte) error {
 	if err := a.store.Configure(cfg); err != nil {
 		return err
 	}
+	settings := a.store.RuntimeSettings()
+	a.affinity.configure(time.Duration(settings.SessionAffinityIdleTTLSeconds)*time.Second, settings.SessionAffinityMaxEntries)
 	// Register the classify cache clear callback, then clear once for safety.
 	a.store.SetOnClassifyRulesChanged(func() {
 		a.clearClassifyCache()
@@ -110,6 +122,7 @@ func (a *App) configure(raw []byte) error {
 
 // Shutdown flushes usage. Host calls this on plugin unload.
 func (a *App) Shutdown() {
+	a.concurrency.stopAccepting()
 	a.store.StopUsageFlusher()
 }
 
@@ -125,6 +138,9 @@ func (a *App) registration() Registration {
 				{Name: "enabled", Type: "boolean", Description: "Enable or disable this plugin without unloading it."},
 				{Name: "state_file", Type: "string", Description: "JSON state file used for key policy changes made through the Management API."},
 				{Name: "global_weighted_round_robin", Type: "boolean", Description: "忽略别名目标的 group，对当前 provider/model 的全部候选凭证执行全局加权轮询。"},
+				{Name: "auth_concurrency_limits", Type: "object", Description: "Exact auth-file ID to maximum controlled in-flight requests; zero or missing means unlimited."},
+				{Name: "session_affinity_idle_ttl_seconds", Type: "integer", Description: "Idle TTL for in-memory session affinity bindings."},
+				{Name: "session_affinity_max_entries", Type: "integer", Description: "Maximum in-memory session affinity bindings."},
 				{Name: "keys", Type: "array", Description: "Downstream key policies, including optional fail-closed account_binding allow globs. State file wins after it exists."},
 			},
 		},
@@ -134,6 +150,7 @@ func (a *App) registration() Registration {
 			ModelRouter:                   true,
 			Scheduler:                     true,
 			RequestInterceptor:            true,
+			RequestLifecyclePlugin:        true,
 			ResponseInterceptor:           true,
 			UsagePlugin:                   true,
 			ManagementAPI:                 true,
@@ -191,11 +208,9 @@ func (a *App) routeModel(raw []byte) ([]byte, error) {
 	})
 }
 
-// interceptRequestBefore rejects unsafe credential presentation for an
-// explicitly account-bound key before the selected upstream executor runs.
-// Frontend-auth cannot express a terminal rejection: Authenticated=false is
-// treated by CPA as "try the next provider". The request interceptor can stop
-// query-only or conflicting protected credentials without changing the host.
+// interceptRequestBefore validates controlled request identity and atomically
+// acquires its process-local key slot. Frontend-auth cannot express a terminal
+// rejection: Authenticated=false is treated by CPA as "try the next provider".
 func (a *App) interceptRequestBefore(raw []byte) ([]byte, error) {
 	var req RequestInterceptRequest
 	if err := json.Unmarshal(raw, &req); err != nil {
@@ -205,25 +220,42 @@ func (a *App) interceptRequestBefore(raw []byte) ([]byte, error) {
 		return OKEnvelope(RequestInterceptResponse{})
 	}
 	resolution := a.store.ResolveRequestKey(req.Headers, req.Metadata)
-	if resolution.Key == nil || resolution.Key.AccountBinding == nil {
+	key := resolution.Key
+	if !pluginControlsKey(key) {
 		return OKEnvelope(RequestInterceptResponse{})
 	}
-	if !resolution.Key.Enabled {
-		return OKEnvelope(requestRejection(http.StatusUnauthorized, "key_disabled", "cpa-key-policy: account-bound key is disabled"))
+	if !key.Enabled {
+		return OKEnvelope(requestRejection(http.StatusUnauthorized, "key_disabled", "cpa-key-policy: configured key is disabled"))
 	}
-	if resolution.Conflict {
-		return OKEnvelope(requestRejection(http.StatusBadRequest, "credential_conflict", "cpa-key-policy: protected requests must not contain conflicting credentials"))
+	if key.AccountBinding != nil {
+		if resolution.Conflict {
+			return OKEnvelope(requestRejection(http.StatusBadRequest, "credential_conflict", "cpa-key-policy: protected requests must not contain conflicting credentials"))
+		}
+		if !resolution.HeaderPresent || !resolution.HeaderMatches {
+			return OKEnvelope(requestRejection(http.StatusUnauthorized, "header_key_required", "cpa-key-policy: account-bound requests require the configured key in a request header"))
+		}
 	}
-	if !resolution.HeaderPresent || !resolution.HeaderMatches {
-		return OKEnvelope(requestRejection(http.StatusUnauthorized, "header_key_required", "cpa-key-policy: account-bound requests require the configured key in a request header"))
+	if strings.TrimSpace(req.RequestID) == "" {
+		return OKEnvelope(requestRejectionWithType(http.StatusServiceUnavailable, "service_unavailable", "request_lifecycle_unavailable", "cpa-key-policy: host did not provide a request lifecycle id"))
+	}
+	current, acquired := a.concurrency.acquireKey(req.RequestID, key.ID, key.MaxConcurrentRequests)
+	if !acquired {
+		if key.MaxConcurrentRequests > 0 && current >= key.MaxConcurrentRequests {
+			return OKEnvelope(requestRejectionWithType(http.StatusTooManyRequests, "rate_limit_error", "key_concurrency_exceeded", fmt.Sprintf("cpa-key-policy: key %q already has %d in-flight request(s), limit %d", key.ID, current, key.MaxConcurrentRequests)))
+		}
+		return OKEnvelope(requestRejectionWithType(http.StatusServiceUnavailable, "service_unavailable", "request_lifecycle_conflict", "cpa-key-policy: request lifecycle id is already owned by another key"))
 	}
 	return OKEnvelope(RequestInterceptResponse{})
 }
 
 func requestRejection(status int, code, message string) RequestInterceptResponse {
+	return requestRejectionWithType(status, "authentication_error", code, message)
+}
+
+func requestRejectionWithType(status int, errorType, code, message string) RequestInterceptResponse {
 	body, _ := json.Marshal(map[string]any{
 		"error": map[string]any{
-			"type":    "authentication_error",
+			"type":    errorType,
 			"code":    code,
 			"message": message,
 		},
@@ -234,6 +266,80 @@ func requestRejection(status int, code, message string) RequestInterceptResponse
 		ResponseHeaders: http.Header{"Content-Type": []string{"application/json"}},
 		ResponseBody:    body,
 	}
+}
+
+func pluginControlsKey(key *policy.KeyConfig) bool {
+	return key != nil && (!key.Native || key.AccountBinding != nil)
+}
+
+// interceptRequestAfter atomically admits the selected credential. This is the
+// final concurrency gate: scheduler capacity is advisory and races are expected
+// to be rejected here rather than oversubscribed.
+func (a *App) interceptRequestAfter(raw []byte) ([]byte, error) {
+	var req RequestInterceptRequest
+	if err := json.Unmarshal(raw, &req); err != nil {
+		return nil, err
+	}
+	if !a.store.Enabled() {
+		return OKEnvelope(RequestInterceptResponse{})
+	}
+	keyID := a.concurrency.requestKey(req.RequestID)
+	if keyID == "" {
+		resolution := a.store.ResolveRequestKey(req.Headers, req.Metadata)
+		if !pluginControlsKey(resolution.Key) {
+			return OKEnvelope(RequestInterceptResponse{})
+		}
+		return OKEnvelope(requestRejectionWithType(http.StatusServiceUnavailable, "service_unavailable", "request_lifecycle_unavailable", "cpa-key-policy: request reached auth admission without a key lease"))
+	}
+	key := a.store.FindByID(keyID)
+	if key == nil || !key.Enabled {
+		return OKEnvelope(requestRejection(http.StatusUnauthorized, "key_disabled", "cpa-key-policy: configured key was disabled or removed before execution"))
+	}
+	authID := metadataString(req.Metadata, "selected_auth_id")
+	proposalKey := schedulerAffinityProposalKey(key.ID, req.RequestedModel, authID, req.Metadata)
+	if authID == "" {
+		a.affinity.resolveProposal(proposalKey, false)
+		return OKEnvelope(requestRejectionWithType(http.StatusServiceUnavailable, "service_unavailable", "selected_auth_unavailable", "cpa-key-policy: host did not expose the selected auth id"))
+	}
+	// Re-check an explicit binding at the final gate. A management update may
+	// narrow the allowed pool after scheduler.pick but before execution starts;
+	// that race must fail closed rather than run a now-disallowed credential.
+	if key.AccountBinding != nil && !key.AccountBinding.Matches(authID) {
+		a.affinity.resolveProposal(proposalKey, false)
+		return OKEnvelope(requestRejectionWithType(http.StatusForbidden, "permission_error", "auth_not_bound", "cpa-key-policy: selected auth no longer satisfies the key's account binding"))
+	}
+	limit := a.store.AuthConcurrencyLimit(authID)
+	current, acquired := a.concurrency.acquireAuth(req.RequestID, authID, limit)
+	if !acquired {
+		a.affinity.resolveProposal(proposalKey, false)
+		if limit > 0 && current >= limit {
+			return OKEnvelope(requestRejectionWithType(http.StatusTooManyRequests, "rate_limit_error", "auth_concurrency_exceeded", fmt.Sprintf("cpa-key-policy: auth %q already has %d controlled in-flight request(s), limit %d", authID, current, limit)))
+		}
+		return OKEnvelope(requestRejectionWithType(http.StatusServiceUnavailable, "service_unavailable", "request_lifecycle_conflict", "cpa-key-policy: selected auth could not be attached to the request lease"))
+	}
+	a.affinity.resolveProposal(proposalKey, true)
+	if a.concurrency.markPerCallCharged(req.RequestID) {
+		a.store.ChargeDeferredPerCall(key.ID, metadataString(req.Metadata, "request_path"), req.RequestedModel, req.Model)
+	}
+	return OKEnvelope(RequestInterceptResponse{})
+}
+
+func (a *App) handleRequestComplete(raw []byte) ([]byte, error) {
+	var completion RequestCompletion
+	if err := json.Unmarshal(raw, &completion); err != nil {
+		return nil, err
+	}
+	a.concurrency.complete(completion.RequestID)
+	return OKEnvelope(RequestCompletionResponse{})
+}
+
+func metadataString(metadata map[string]any, name string) string {
+	for key, value := range metadata {
+		if strings.EqualFold(strings.TrimSpace(key), name) {
+			return strings.TrimSpace(fmt.Sprint(value))
+		}
+	}
+	return ""
 }
 
 // resolveProviderKey maps a ModelRule's provider to the provider key CPA's
@@ -392,21 +498,130 @@ func (a *App) pickScheduler(raw []byte) ([]byte, error) {
 		return ErrorEnvelope("auth_not_found", "cpa-key-policy: 匹配的凭证均没有正权重", http.StatusServiceUnavailable), nil
 	}
 
+	available := make([]SchedulerAuthCandidate, 0, len(weighted))
+	availableIDs := make(map[string]struct{}, len(weighted))
+	enforceAuthConcurrency := pluginControlsKey(key)
+	for _, cand := range weighted {
+		// Auth limits deliberately cover only plugin-controlled requests. Legacy
+		// group-only scheduling has no lifecycle lease and must not pretend to
+		// provide a strict limit for otherwise unmanaged native traffic.
+		if enforceAuthConcurrency && !a.concurrency.authAvailable(cand.ID, a.store.AuthConcurrencyLimit(cand.ID)) {
+			continue
+		}
+		available = append(available, cand)
+		availableIDs[cand.ID] = struct{}{}
+	}
+	if len(available) == 0 {
+		return ErrorEnvelope("auth_concurrency_exceeded", "cpa-key-policy: all eligible auth files are at their configured concurrency limit", http.StatusTooManyRequests), nil
+	}
+
 	strategy := policy.BindingStrategyWeightedRoundRobin
 	if binding != nil {
 		strategy = binding.Strategy
 	}
-	poolKey := schedulerPoolKey(req, owner, group, maxPriority)
+	pickBase := func() SchedulerAuthCandidate {
+		poolKey := schedulerPoolKey(req, owner, group, maxPriority)
+		switch strategy {
+		case policy.BindingStrategyRoundRobin:
+			return a.pickRoundRobin(poolKey, available)
+		case policy.BindingStrategyFillFirst:
+			return pickFillFirst(req, available)
+		default:
+			return a.pickSmoothWeighted(req, owner, group, maxPriority, available)
+		}
+	}
+
 	var picked SchedulerAuthCandidate
-	switch strategy {
-	case policy.BindingStrategyRoundRobin:
-		picked = a.pickRoundRobin(poolKey, weighted)
-	case policy.BindingStrategyFillFirst:
-		picked = pickFillFirst(req, weighted)
-	default:
-		picked = a.pickSmoothWeighted(req, owner, group, maxPriority, weighted)
+	sessionID := schedulerSessionID(req.Options.Metadata)
+	if key != nil && key.SessionAffinity && sessionID != "" {
+		affinityKey := schedulerAffinityKey(req, key, group, globalMode, sessionID)
+		proposalKey := func(authID string) string {
+			return schedulerAffinityProposalKey(key.ID, schedulerRequestedModel(req.Options.Metadata), authID, req.Options.Metadata)
+		}
+		a.selectionMu.Lock()
+		if authID, ok := a.affinity.use(affinityKey, availableIDs, proposalKey); ok {
+			for _, candidate := range available {
+				if candidate.ID == authID {
+					picked = candidate
+					break
+				}
+			}
+		}
+		if picked.ID == "" {
+			picked = pickBase()
+			a.affinity.propose(affinityKey, proposalKey(picked.ID), picked.ID)
+		}
+		a.selectionMu.Unlock()
+	} else {
+		picked = pickBase()
 	}
 	return OKEnvelope(SchedulerPickResponse{Handled: true, AuthID: picked.ID})
+}
+
+func schedulerSessionID(metadata map[string]any) string {
+	if value := metadataString(metadata, "canonical_session_id"); value != "" {
+		return value
+	}
+	return metadataString(metadata, "derived_session_id")
+}
+
+func schedulerAffinityKey(req SchedulerPickRequest, key *policy.KeyConfig, group string, globalMode bool, sessionID string) string {
+	providers := append([]string(nil), req.Providers...)
+	for index := range providers {
+		providers[index] = strings.ToLower(strings.TrimSpace(providers[index]))
+	}
+	sort.Strings(providers)
+	allow := []string(nil)
+	strategy := ""
+	if key != nil && key.AccountBinding != nil {
+		allow = append(allow, key.AccountBinding.Allow...)
+		sort.Strings(allow)
+		strategy = string(key.AccountBinding.Strategy)
+	}
+	var source strings.Builder
+	source.WriteString(strings.ToLower(strings.TrimSpace(key.ID)))
+	source.WriteByte(0)
+	source.WriteString(strings.ToLower(strings.TrimSpace(req.Provider)))
+	source.WriteByte(0)
+	source.WriteString(strings.Join(providers, ","))
+	source.WriteByte(0)
+	source.WriteString(strings.ToLower(strings.TrimSpace(req.Model)))
+	source.WriteByte(0)
+	source.WriteString(strings.ToLower(strings.TrimSpace(schedulerRequestedModel(req.Options.Metadata))))
+	source.WriteByte(0)
+	source.WriteString(strings.ToLower(strings.TrimSpace(group)))
+	source.WriteByte(0)
+	source.WriteString(strategy)
+	source.WriteByte(0)
+	source.WriteString(strings.Join(allow, "\x1f"))
+	source.WriteByte(0)
+	if globalMode {
+		source.WriteByte('1')
+	} else {
+		source.WriteByte('0')
+	}
+	routeHash := sha256.Sum256([]byte(source.String()))
+	sessionHash := sha256.Sum256([]byte(sessionID))
+	return fmt.Sprintf("%x:%x", sessionHash, routeHash)
+}
+
+// schedulerAffinityProposalKey contains only data available in both
+// scheduler.pick and request.intercept_after. It intentionally hashes the
+// session identity and never stores a raw client key or request body.
+func schedulerAffinityProposalKey(owner, requestedModel, authID string, metadata map[string]any) string {
+	sessionID := schedulerSessionID(metadata)
+	if strings.TrimSpace(owner) == "" || sessionID == "" {
+		return ""
+	}
+	sessionHash := sha256.Sum256([]byte(sessionID))
+	var route strings.Builder
+	for _, field := range []string{"request_path", "target_provider", "target_model", "group", "auth_selection_model", "pinned_auth_id"} {
+		route.WriteString(strings.ToLower(metadataString(metadata, field)))
+		route.WriteByte(0)
+	}
+	routeHash := sha256.Sum256([]byte(route.String()))
+	return strings.ToLower(strings.TrimSpace(owner)) + "\x00" + fmt.Sprintf("%x", sessionHash) + "\x00" +
+		strings.ToLower(strings.TrimSpace(requestedModel)) + "\x00" + strings.TrimSpace(authID) + "\x00" + fmt.Sprintf("%x", routeHash)
 }
 
 func schedulerRequestedModel(metadata map[string]any) string {
@@ -647,6 +862,8 @@ func (a *App) managementRegistration() ManagementRegistrationResponse {
 		},
 		Resources: []ResourceRoute{
 			{Path: web.IndexPath, Menu: "Key Policy", Description: "Web UI for managing downstream CPA key policies (create keys, pick models)."},
+			{Path: web.LookupPath, Menu: "Key Usage", Description: "Read-only self-service usage lookup for one downstream key."},
+			{Path: web.LookupDataPath, Description: "Bearer-authenticated self-service usage data."},
 		},
 	}
 }
@@ -662,7 +879,22 @@ func (a *App) handleManagement(raw []byte) ([]byte, error) {
 	// the same management.handle method by CPA's ServeResourceHTTP.
 	resourcePrefix := "/v0/resource/plugins/" + PluginID
 	if req.Method == http.MethodGet && strings.HasPrefix(path, resourcePrefix) {
-		status, headers, body := web.Serve(strings.TrimPrefix(path, resourcePrefix))
+		resourcePath := strings.TrimPrefix(path, resourcePrefix)
+		if resourcePath == web.LookupDataPath {
+			for name, values := range req.Query {
+				switch strings.ToLower(strings.TrimSpace(name)) {
+				case "key", "api_key", "key_id", "id":
+					if len(values) == 0 {
+						continue
+					}
+					response := jsonError(http.StatusBadRequest, "query_key_forbidden", "lookup keys must be supplied only in the Authorization header")
+					setLookupHeaders(&response)
+					return OKEnvelope(response)
+				}
+			}
+			return OKEnvelope(a.lookupData(req.Headers))
+		}
+		status, headers, body := web.Serve(resourcePath)
 		return OKEnvelope(ManagementResponse{StatusCode: status, Headers: headers, Body: body})
 	}
 
@@ -712,12 +944,23 @@ func (a *App) handleManagement(raw []byte) ([]byte, error) {
 }
 
 type schedulerSettingsRequest struct {
-	GlobalWeightedRoundRobin *bool `json:"global_weighted_round_robin"`
+	GlobalWeightedRoundRobin      *bool           `json:"global_weighted_round_robin"`
+	AuthConcurrencyLimits         *map[string]int `json:"auth_concurrency_limits"`
+	SessionAffinityIdleTTLSeconds *int            `json:"session_affinity_idle_ttl_seconds"`
+	SessionAffinityMaxEntries     *int            `json:"session_affinity_max_entries"`
 }
 
 func (a *App) schedulerSettings() ManagementResponse {
+	settings := a.store.RuntimeSettings()
+	concurrency := a.concurrency.snapshot()
 	return jsonResponse(http.StatusOK, map[string]any{
-		"global_weighted_round_robin": a.store.GlobalWeightedRoundRobin(),
+		"global_weighted_round_robin":       settings.GlobalWeightedRoundRobin,
+		"auth_concurrency_limits":           settings.AuthConcurrencyLimits,
+		"session_affinity_idle_ttl_seconds": settings.SessionAffinityIdleTTLSeconds,
+		"session_affinity_max_entries":      settings.SessionAffinityMaxEntries,
+		"current_concurrent_requests":       concurrency.Total,
+		"auth_concurrency_current":          concurrency.Auths,
+		"session_affinity_entries":          a.affinity.size(),
 	})
 }
 
@@ -726,48 +969,64 @@ func (a *App) updateSchedulerSettings(body []byte) ManagementResponse {
 	if err := json.Unmarshal(body, &request); err != nil {
 		return jsonError(http.StatusBadRequest, "invalid_json", err.Error())
 	}
-	if request.GlobalWeightedRoundRobin == nil {
-		return jsonError(http.StatusBadRequest, "missing_setting", "缺少 global_weighted_round_robin 设置")
+	if request.GlobalWeightedRoundRobin == nil && request.AuthConcurrencyLimits == nil &&
+		request.SessionAffinityIdleTTLSeconds == nil && request.SessionAffinityMaxEntries == nil {
+		return jsonError(http.StatusBadRequest, "missing_setting", "缺少可更新的调度设置")
 	}
-	if err := a.store.SetGlobalWeightedRoundRobin(*request.GlobalWeightedRoundRobin); err != nil {
+	settings, err := a.store.UpdateRuntimeSettings(policy.RuntimeSettingsPatch{
+		GlobalWeightedRoundRobin:      request.GlobalWeightedRoundRobin,
+		AuthConcurrencyLimits:         request.AuthConcurrencyLimits,
+		SessionAffinityIdleTTLSeconds: request.SessionAffinityIdleTTLSeconds,
+		SessionAffinityMaxEntries:     request.SessionAffinityMaxEntries,
+	})
+	if err != nil {
+		if errors.Is(err, policy.ErrInvalidRuntimeSettings) {
+			return jsonError(http.StatusBadRequest, "invalid_setting", err.Error())
+		}
 		return jsonError(http.StatusInternalServerError, "settings_persist_failed", "保存调度设置失败: "+err.Error())
 	}
+	a.affinity.configure(time.Duration(settings.SessionAffinityIdleTTLSeconds)*time.Second, settings.SessionAffinityMaxEntries)
 	a.clearSchedulerState()
 	return a.schedulerSettings()
 }
 
 type keyWriteRequest struct {
-	ID                  string               `json:"id"`
-	Name                *string              `json:"name,omitempty"`
-	Enabled             *bool                `json:"enabled,omitempty"`
-	Native              *bool                `json:"native,omitempty"`
-	Key                 string               `json:"key,omitempty"`
-	AccountBinding      *policy.AccountBinding `json:"account_binding,omitempty"`
-	ClearAccountBinding bool                 `json:"clear_account_binding,omitempty"`
-	RPM                 *int                 `json:"rpm,omitempty"`
-	Models              []policy.ModelRule   `json:"models,omitempty"`
-	Aliases             []policy.KeyAliasRef `json:"aliases,omitempty"`
-	DailyLimitUSD       *float64             `json:"daily_limit_usd,omitempty"`
-	WeeklyLimitUSD      *float64             `json:"weekly_limit_usd,omitempty"`
-	AllowModelsEndpoint *bool                `json:"allow_models_endpoint,omitempty"`
+	ID                    string                 `json:"id"`
+	Name                  *string                `json:"name,omitempty"`
+	Enabled               *bool                  `json:"enabled,omitempty"`
+	Native                *bool                  `json:"native,omitempty"`
+	Key                   string                 `json:"key,omitempty"`
+	AccountBinding        *policy.AccountBinding `json:"account_binding,omitempty"`
+	ClearAccountBinding   bool                   `json:"clear_account_binding,omitempty"`
+	RPM                   *int                   `json:"rpm,omitempty"`
+	MaxConcurrentRequests *int                   `json:"max_concurrent_requests,omitempty"`
+	SessionAffinity       *bool                  `json:"session_affinity,omitempty"`
+	Models                []policy.ModelRule     `json:"models,omitempty"`
+	Aliases               []policy.KeyAliasRef   `json:"aliases,omitempty"`
+	DailyLimitUSD         *float64               `json:"daily_limit_usd,omitempty"`
+	WeeklyLimitUSD        *float64               `json:"weekly_limit_usd,omitempty"`
+	AllowModelsEndpoint   *bool                  `json:"allow_models_endpoint,omitempty"`
 }
 
 type publicKey struct {
-	ID                  string               `json:"id"`
-	Name                string               `json:"name"`
-	Enabled             bool                 `json:"enabled"`
-	Native              bool                 `json:"native,omitempty"`
-	KeyPreview          string               `json:"key_preview"`
-	AccountBinding      *policy.AccountBinding `json:"account_binding,omitempty"`
-	RPM                 int                  `json:"rpm"`
-	Models              []policy.ModelRule   `json:"models"`
-	Aliases             []policy.KeyAliasRef `json:"aliases"`
-	DailyLimitUSD       float64              `json:"daily_limit_usd"`
-	WeeklyLimitUSD      float64              `json:"weekly_limit_usd"`
-	AllowModelsEndpoint bool                 `json:"allow_models_endpoint,omitempty"`
-	Usage               policy.UsageSummary  `json:"usage"`
-	CreatedAt           string               `json:"created_at,omitempty"`
-	UpdatedAt           string               `json:"updated_at,omitempty"`
+	ID                        string                 `json:"id"`
+	Name                      string                 `json:"name"`
+	Enabled                   bool                   `json:"enabled"`
+	Native                    bool                   `json:"native,omitempty"`
+	KeyPreview                string                 `json:"key_preview"`
+	AccountBinding            *policy.AccountBinding `json:"account_binding,omitempty"`
+	RPM                       int                    `json:"rpm"`
+	MaxConcurrentRequests     int                    `json:"max_concurrent_requests"`
+	CurrentConcurrentRequests int                    `json:"current_concurrent_requests"`
+	SessionAffinity           bool                   `json:"session_affinity"`
+	Models                    []policy.ModelRule     `json:"models"`
+	Aliases                   []policy.KeyAliasRef   `json:"aliases"`
+	DailyLimitUSD             float64                `json:"daily_limit_usd"`
+	WeeklyLimitUSD            float64                `json:"weekly_limit_usd"`
+	AllowModelsEndpoint       bool                   `json:"allow_models_endpoint,omitempty"`
+	Usage                     policy.UsageSummary    `json:"usage"`
+	CreatedAt                 string                 `json:"created_at,omitempty"`
+	UpdatedAt                 string                 `json:"updated_at,omitempty"`
 }
 
 func (a *App) createKey(body []byte) ManagementResponse {
@@ -810,20 +1069,22 @@ func (a *App) createKey(body []byte) ManagementResponse {
 		name = strings.TrimSpace(*req.Name)
 	}
 	item := policy.KeyConfig{
-		ID:                  req.ID,
-		Name:                name,
-		Enabled:             enabled,
-		Native:              native,
-		KeyHash:             hash,
-		KeyPreview:          policy.PreviewKey(plain),
-		CallerScope:         policy.CallerScopeForKey(req.ID),
-		AccountBinding:      req.AccountBinding,
-		RPM:                 rpm,
-		Models:              req.Models,
-		Aliases:             req.Aliases,
-		DailyLimitUSD:       applyFloat64(req.DailyLimitUSD, 0),
-		WeeklyLimitUSD:      applyFloat64(req.WeeklyLimitUSD, 0),
-		AllowModelsEndpoint: applyBool(req.AllowModelsEndpoint, false),
+		ID:                    req.ID,
+		Name:                  name,
+		Enabled:               enabled,
+		Native:                native,
+		KeyHash:               hash,
+		KeyPreview:            policy.PreviewKey(plain),
+		CallerScope:           policy.CallerScopeForKey(req.ID),
+		AccountBinding:        req.AccountBinding,
+		RPM:                   rpm,
+		MaxConcurrentRequests: applyInt(req.MaxConcurrentRequests, 0),
+		SessionAffinity:       applyBool(req.SessionAffinity, false),
+		Models:                req.Models,
+		Aliases:               req.Aliases,
+		DailyLimitUSD:         applyFloat64(req.DailyLimitUSD, 0),
+		WeeklyLimitUSD:        applyFloat64(req.WeeklyLimitUSD, 0),
+		AllowModelsEndpoint:   applyBool(req.AllowModelsEndpoint, false),
 	}
 	if native {
 		item.CallerScope = policy.CallerScopeForKey(plain)
@@ -875,6 +1136,12 @@ func (a *App) patchKey(body []byte) ManagementResponse {
 	}
 	if req.RPM != nil {
 		current.RPM = *req.RPM
+	}
+	if req.MaxConcurrentRequests != nil {
+		current.MaxConcurrentRequests = *req.MaxConcurrentRequests
+	}
+	if req.SessionAffinity != nil {
+		current.SessionAffinity = *req.SessionAffinity
 	}
 	if req.DailyLimitUSD != nil {
 		current.DailyLimitUSD = *req.DailyLimitUSD
@@ -1015,13 +1282,16 @@ func (a *App) publicKeyFromConfig(key policy.KeyConfig) publicKey {
 		binding = &copy
 	}
 	out := publicKey{
-		ID:         key.ID,
-		Name:       key.Name,
-		Enabled:    key.Enabled,
-		Native:     key.Native,
-		KeyPreview: key.KeyPreview,
-		AccountBinding: binding,
-		RPM:        key.RPM,
+		ID:                        key.ID,
+		Name:                      key.Name,
+		Enabled:                   key.Enabled,
+		Native:                    key.Native,
+		KeyPreview:                key.KeyPreview,
+		AccountBinding:            binding,
+		RPM:                       key.RPM,
+		MaxConcurrentRequests:     key.MaxConcurrentRequests,
+		CurrentConcurrentRequests: a.concurrency.keyCurrent(key.ID),
+		SessionAffinity:           key.SessionAffinity,
 		// Ensure models/aliases always serialize as [] (never null). A nil slice
 		// would marshal to JSON null, which the UI accesses as .length and
 		// crashes on. Models is derived (resolved from Aliases × global table);
@@ -1043,6 +1313,13 @@ func (a *App) publicKeyFromConfig(key policy.KeyConfig) publicKey {
 }
 
 func applyFloat64(v *float64, def float64) float64 {
+	if v == nil {
+		return def
+	}
+	return *v
+}
+
+func applyInt(v *int, def int) int {
 	if v == nil {
 		return def
 	}

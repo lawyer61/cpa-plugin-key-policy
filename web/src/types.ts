@@ -63,6 +63,12 @@ export interface KeyPublic {
   aliases?: KeyAliasRef[];
   daily_limit_usd: number;
   weekly_limit_usd: number;
+  // Maximum simultaneous upstream requests for this key; 0 means unlimited.
+  max_concurrent_requests: number;
+  // Current in-flight requests for this key, reported by the plugin.
+  current_concurrent_requests: number;
+  // Keep requests for this key on the same upstream session when possible.
+  session_affinity: boolean;
   // Per-key override for GET /v1/models (see KeyFormValues).
   allow_models_endpoint?: boolean;
   usage: UsageSummary;
@@ -83,6 +89,8 @@ export interface KeyWriteRequest {
   aliases?: KeyAliasRef[];
   daily_limit_usd?: number;
   weekly_limit_usd?: number;
+  max_concurrent_requests?: number;
+  session_affinity?: boolean;
   allow_models_endpoint?: boolean;
 }
 
@@ -155,6 +163,47 @@ export interface StatusResponse {
 
 export interface SchedulerSettings {
   global_weighted_round_robin: boolean;
+  auth_concurrency_limits: Record<string, number>;
+  session_affinity_idle_ttl_seconds: number;
+  session_affinity_max_entries: number;
+  // Optional runtime counters returned by newer plugin builds.
+  current_concurrent_requests?: number;
+  session_affinity_entries?: number;
+}
+
+export type SchedulerSettingsPatch = Partial<Pick<
+  SchedulerSettings,
+  | "global_weighted_round_robin"
+  | "auth_concurrency_limits"
+  | "session_affinity_idle_ttl_seconds"
+  | "session_affinity_max_entries"
+>>;
+
+export interface LookupLimits {
+  rpm: number;
+  daily_usd: number;
+  weekly_usd: number;
+  max_concurrent_requests: number;
+}
+
+export interface LookupConcurrency {
+  current: number;
+  maximum: number;
+}
+
+export interface LookupAliasSummary {
+  alias: string;
+  billing_mode?: "tokens" | "per_call";
+  daily: UsageWindow | number;
+  weekly: UsageWindow | number;
+}
+
+export interface LookupResponse {
+  name: string;
+  limits: LookupLimits;
+  usage: UsageSummary;
+  concurrency: LookupConcurrency;
+  aliases: LookupAliasSummary[];
 }
 
 // --- Advanced Mapping types ---

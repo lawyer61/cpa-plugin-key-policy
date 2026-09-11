@@ -87,7 +87,7 @@ func TestStoreAuthenticateRateLimits(t *testing.T) {
 }
 
 // perCallImageStore builds a store with one per_call-billed image alias, used
-// to exercise the access-time pre-charge for image/video endpoints.
+// to exercise the deferred after-auth charge for image/video endpoints.
 func perCallImageStore(t *testing.T) (*Store, string) {
 	t.Helper()
 	plain := "cpa_image_key"
@@ -127,12 +127,18 @@ func imgTeamKey(store *Store) KeyConfig {
 	return *k
 }
 
-func TestAuthenticatePerCallImagePreCharged(t *testing.T) {
+func TestPerCallImageChargeIsDeferredUntilAfterAdmission(t *testing.T) {
 	store, plain := perCallImageStore(t)
 	headers := http.Header{"Authorization": {"Bearer " + plain}}
 	decision := store.Authenticate("POST", "/v1/images/generations", headers, nil, []byte(`{"model":"grok-imagine-image-quality","prompt":"a boat"}`))
-	if !decision.Allowed || !decision.PreCharged {
-		t.Fatalf("decision = %+v, want Allowed+PreCharged", decision)
+	if !decision.Allowed {
+		t.Fatalf("decision = %+v, want Allowed without access-time charge", decision)
+	}
+	if sum := store.UsageSummaryFor(imgTeamKey(store)); sum.DailyUSD != 0 {
+		t.Fatalf("usage before deferred charge = %+v, want zero", sum)
+	}
+	if !store.ChargeDeferredPerCall("img-team", "/v1/images/generations", "grok-imagine-image-quality", "grok-imagine-image-quality") {
+		t.Fatal("deferred image charge did not match")
 	}
 	sum := store.UsageSummaryFor(imgTeamKey(store))
 	if sum.DailyUSD != 2 || sum.DailyCallCount != 1 {
@@ -140,14 +146,18 @@ func TestAuthenticatePerCallImagePreCharged(t *testing.T) {
 	}
 }
 
-func TestAuthenticatePerCallVideoPreCharged(t *testing.T) {
+func TestPerCallVideoChargeSupportsPathSubresources(t *testing.T) {
 	store, plain := perCallImageStore(t)
 	headers := http.Header{"Authorization": {"Bearer " + plain}}
 	body := []byte(`{"model":"grok-imagine-image-quality","prompt":"a clip"}`)
-	// Path-parameter video subresource (/v1/videos/<id>) must also pre-charge.
+	// Path-parameter video subresource (/v1/videos/<id>) must also charge after
+	// concurrency admission.
 	decision := store.Authenticate("GET", "/v1/videos/req_123", headers, nil, body)
-	if !decision.Allowed || !decision.PreCharged {
-		t.Fatalf("decision = %+v, want Allowed+PreCharged on video subresource", decision)
+	if !decision.Allowed {
+		t.Fatalf("decision = %+v, want Allowed without access-time charge", decision)
+	}
+	if !store.ChargeDeferredPerCall("img-team", "/v1/videos/req_123", "grok-imagine-image-quality", "grok-imagine-image-quality") {
+		t.Fatal("deferred video charge did not match")
 	}
 	sum := store.UsageSummaryFor(imgTeamKey(store))
 	if sum.DailyUSD != 2 {
@@ -155,15 +165,16 @@ func TestAuthenticatePerCallVideoPreCharged(t *testing.T) {
 	}
 }
 
-func TestAuthenticatePerCallChatNotPreCharged(t *testing.T) {
+func TestDeferredPerCallChargeIgnoresChatEndpoints(t *testing.T) {
 	store, plain := perCallImageStore(t)
 	headers := http.Header{"Authorization": {"Bearer " + plain}}
-	// Same per_call alias, but on a chat endpoint — must NOT pre-charge. Chat
-	// is billed via usage.handle (CPA emits a record there), and pre-charging
-	// would double-bill.
+	// Same per_call alias, but on a chat endpoint — usage.handle bills it.
 	decision := store.Authenticate("POST", "/v1/chat/completions", headers, nil, []byte(`{"model":"grok-imagine-image-quality"}`))
-	if !decision.Allowed || decision.PreCharged {
-		t.Fatalf("decision = %+v, want Allowed and NOT PreCharged on chat path", decision)
+	if !decision.Allowed {
+		t.Fatalf("decision = %+v, want Allowed and no deferred charge on chat path", decision)
+	}
+	if store.ChargeDeferredPerCall("img-team", "/v1/chat/completions", "grok-imagine-image-quality", "grok-imagine-image-quality") {
+		t.Fatal("chat endpoint matched deferred image/video charge")
 	}
 	sum := store.UsageSummaryFor(imgTeamKey(store))
 	if sum.DailyUSD != 0 {
@@ -171,15 +182,18 @@ func TestAuthenticatePerCallChatNotPreCharged(t *testing.T) {
 	}
 }
 
-func TestAuthenticateTokenModeImageNotPreCharged(t *testing.T) {
+func TestDeferredPerCallChargeIgnoresTokenModeImage(t *testing.T) {
 	store, plain := perCallImageStore(t)
 	headers := http.Header{"Authorization": {"Bearer " + plain}}
 	// Image endpoint, but the alias is token-billed ("fast") — pre-charge only
 	// applies to per_call aliases. Token-mode images would be billed by tokens
 	// if CPA reported usage, and pre-charging a fixed USD would be wrong.
 	decision := store.Authenticate("POST", "/v1/images/generations", headers, nil, []byte(`{"model":"fast","prompt":"x"}`))
-	if !decision.Allowed || decision.PreCharged {
-		t.Fatalf("decision = %+v, want Allowed and NOT PreCharged for token-mode alias", decision)
+	if !decision.Allowed {
+		t.Fatalf("decision = %+v, want Allowed and no fixed charge for token-mode alias", decision)
+	}
+	if store.ChargeDeferredPerCall("img-team", "/v1/images/generations", "fast", "gpt-5-codex") {
+		t.Fatal("token-billed image alias matched fixed deferred charge")
 	}
 	sum := store.UsageSummaryFor(imgTeamKey(store))
 	if sum.DailyUSD != 0 {

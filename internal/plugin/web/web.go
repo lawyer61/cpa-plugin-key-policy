@@ -21,12 +21,19 @@ const contentType = "text/html; charset=utf-8"
 // IndexPath is the resource path (relative to the plugin resource base) the UI
 // is served at.
 const IndexPath = "/index.html"
+const LookupPath = "/lookup"
+const LookupDataPath = "/lookup/data"
 
 // Serve returns a management response for a plugin resource GET request. It
 // only handles the index page; any other path yields 404.
 func Serve(path string) (status int, headers http.Header, body []byte) {
-	if strings.TrimRight(path, "/") != IndexPath {
+	path = strings.TrimRight(path, "/")
+	if path != IndexPath && path != LookupPath {
 		return http.StatusNotFound, http.Header{"Content-Type": []string{"text/plain; charset=utf-8"}}, []byte("not found")
 	}
-	return http.StatusOK, http.Header{"Content-Type": []string{contentType}}, indexHTML
+	return http.StatusOK, http.Header{
+		"Content-Type":           []string{contentType},
+		"Cache-Control":          []string{"no-store"},
+		"X-Content-Type-Options": []string{"nosniff"},
+	}, indexHTML
 }

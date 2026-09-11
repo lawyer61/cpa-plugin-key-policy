@@ -5,6 +5,7 @@ import type {
   CredentialDescriptor,
   ClassifyPreviewResponse,
   SchedulerSettings,
+  SchedulerSettingsPatch,
 } from "../types";
 import { readPlanType } from "./models";
 
@@ -33,11 +34,14 @@ export async function fetchSchedulerSettings(): Promise<SchedulerSettings> {
   return data;
 }
 
-export async function updateSchedulerSettings(globalWeightedRoundRobin: boolean): Promise<SchedulerSettings> {
+export async function updateSchedulerSettings(
+  patch: boolean | SchedulerSettingsPatch,
+): Promise<SchedulerSettings> {
   const c = apiClient();
-  const { data } = await c.patch<SchedulerSettings>(pluginPath("/settings"), {
-    global_weighted_round_robin: globalWeightedRoundRobin,
-  });
+  const body: SchedulerSettingsPatch = typeof patch === "boolean"
+    ? { global_weighted_round_robin: patch }
+    : patch;
+  const { data } = await c.patch<SchedulerSettings>(pluginPath("/settings"), body);
   return data;
 }
 

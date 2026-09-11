@@ -13,6 +13,12 @@ plugins:
       # Unbound plugin keys may ignore group in this compatibility mode.
       # Explicit account_binding constraints always win over this setting.
       global_weighted_round_robin: false
+      # Process-local session affinity defaults. Old keys remain opt-out.
+      session_affinity_idle_ttl_seconds: 3600
+      session_affinity_max_entries: 10000
+      # Exact CPA auth candidate IDs only. Missing/zero means unlimited.
+      auth_concurrency_limits:
+        "codex-team-a.json": 4
 
       # Prefer creating keys/aliases/classify rules via Web UI or Management API.
       # Seed keys below are mainly for first boot when state_file does not exist.
@@ -23,6 +29,8 @@ plugins:
           key_hash: "sha256:replace-with-hash"
           key_preview: "cpa_abc...xyz"
           rpm: 60
+          max_concurrent_requests: 4 # 0 = unlimited
+          session_affinity: true
           # Optional fail-closed account isolation. Globs match the exact CPA
           # auth candidate ID. A present empty allow list denies every account.
           account_binding:

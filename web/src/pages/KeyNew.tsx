@@ -21,7 +21,8 @@ export default function KeyNew() {
   // KeyForm's price-map init from `initial.models`.
   const picked = (loc.state as { pickedModels?: ModelRule[] } | null)?.pickedModels;
   const initial = useMemo<KeyPublic | undefined>(
-    () => (picked ? ({ id: "", name: "", enabled: true, rpm: 0, models: picked, daily_limit_usd: 0, weekly_limit_usd: 0 } as KeyPublic) : undefined),
+    () => (picked ? ({ id: "", name: "", enabled: true, rpm: 0, models: picked, daily_limit_usd: 0, weekly_limit_usd: 0,
+        max_concurrent_requests: 0, current_concurrent_requests: 0, session_affinity: false } as KeyPublic) : undefined),
     [picked],
   );
 
@@ -45,6 +46,8 @@ export default function KeyNew() {
             models: v.models,
             daily_limit_usd: v.daily_limit_usd,
             weekly_limit_usd: v.weekly_limit_usd,
+            max_concurrent_requests: v.max_concurrent_requests,
+            session_affinity: v.session_affinity,
             allow_models_endpoint: v.allow_models_endpoint,
             account_binding: v.account_binding,
             clear_account_binding: v.clear_account_binding,

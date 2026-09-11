@@ -15,6 +15,8 @@ export interface KeyFormValues {
   models: ModelRule[];
   daily_limit_usd: number;
   weekly_limit_usd: number;
+  max_concurrent_requests: number;
+  session_affinity: boolean;
   // Per-key override for GET /v1/models. CPA cannot filter the model list per
   // downstream key, so the only plugin-enforceable choice is binary: 401 (hide
   // the list) or allow (client sees the full global list). Default false.
@@ -89,6 +91,8 @@ export default function KeyForm({
   const [rpm, setRpm] = useState(initial?.rpm ?? 0);
   const [dailyLimit, setDailyLimit] = useState(initial?.daily_limit_usd ?? 0);
   const [weeklyLimit, setWeeklyLimit] = useState(initial?.weekly_limit_usd ?? 0);
+  const [maxConcurrent, setMaxConcurrent] = useState(initial?.max_concurrent_requests ?? 0);
+  const [sessionAffinity, setSessionAffinity] = useState(initial?.session_affinity ?? false);
   const [allowModels, setAllowModels] = useState<boolean>(initial?.allow_models_endpoint ?? false);
   const [bindingEnabled, setBindingEnabled] = useState<boolean>(initial?.account_binding !== undefined);
   const [bindingAllow, setBindingAllow] = useState((initial?.account_binding?.allow ?? []).join("\n"));
@@ -294,6 +298,8 @@ export default function KeyForm({
         models: pricedModels,
         daily_limit_usd: dailyLimit,
         weekly_limit_usd: weeklyLimit,
+        max_concurrent_requests: Math.max(0, Math.floor(maxConcurrent) || 0),
+        session_affinity: sessionAffinity,
         allow_models_endpoint: allowModels,
 		account_binding: accountBinding,
 		clear_account_binding: !isNative && !bindingEnabled && initial?.account_binding !== undefined,
@@ -570,30 +576,50 @@ export default function KeyForm({
             </div>}
           </>
         ))}
-        {!isNative && section(t("keyForm.mobile.sectionLimits"), (
+        {section(t("keyForm.mobile.sectionLimits"), (
           <>
             <div className="form-row">
-              <label>{t("keyForm.dailyLimitLabel")}</label>
+              <label>{t("keyForm.maxConcurrentLabel")}</label>
               <input
                 className="input"
                 type="number"
                 min={0}
-                step="0.01"
-                value={dailyLimit}
-                onChange={(e) => setDailyLimit(parseNum(e.target.value))}
+                step="1"
+                value={maxConcurrent}
+                onChange={(e) => setMaxConcurrent(parseInt(e.target.value || "0", 10) || 0)}
               />
+              <p className="muted kf-hint">{t("keyForm.maxConcurrentHint")}</p>
             </div>
-            <div className="form-row">
-              <label>{t("keyForm.weeklyLimitLabel")}</label>
-              <input
-                className="input"
-                type="number"
-                min={0}
-                step="0.01"
-                value={weeklyLimit}
-                onChange={(e) => setWeeklyLimit(parseNum(e.target.value))}
-              />
-            </div>
+            <label className="switch kf-access-switch">
+              <input type="checkbox" checked={sessionAffinity} onChange={(e) => setSessionAffinity(e.target.checked)} />
+              <span className="track"><span className="thumb" /></span>
+              <span>{t("keyForm.sessionAffinityLabel")}</span>
+            </label>
+            <p className="muted kf-hint">{t("keyForm.sessionAffinityHint")}</p>
+            {!isNative && <>
+              <div className="form-row">
+                <label>{t("keyForm.dailyLimitLabel")}</label>
+                <input
+                  className="input"
+                  type="number"
+                  min={0}
+                  step="0.01"
+                  value={dailyLimit}
+                  onChange={(e) => setDailyLimit(parseNum(e.target.value))}
+                />
+              </div>
+              <div className="form-row">
+                <label>{t("keyForm.weeklyLimitLabel")}</label>
+                <input
+                  className="input"
+                  type="number"
+                  min={0}
+                  step="0.01"
+                  value={weeklyLimit}
+                  onChange={(e) => setWeeklyLimit(parseNum(e.target.value))}
+                />
+              </div>
+            </>}
           </>
         ))}
         {section(t("keyForm.mobile.sectionAccess"), (
@@ -747,6 +773,29 @@ export default function KeyForm({
             <span className="track"><span className="thumb" /></span>
             <span>{t("keyForm.enableKey")}</span>
           </label>
+        </div>
+      </div>
+
+      <div className="row2">
+        <div className="form-row">
+          <label>{t("keyForm.maxConcurrentLabel")}</label>
+          <input
+            className="input"
+            type="number"
+            min={0}
+            step="1"
+            value={maxConcurrent}
+            onChange={(e) => setMaxConcurrent(parseInt(e.target.value || "0", 10) || 0)}
+          />
+          <span className="muted" style={{ fontSize: "0.85em" }}>{t("keyForm.maxConcurrentHint")}</span>
+        </div>
+        <div className="form-row">
+          <label className="switch" title={t("keyForm.sessionAffinityTitle")}>
+            <input type="checkbox" checked={sessionAffinity} onChange={(e) => setSessionAffinity(e.target.checked)} />
+            <span className="track"><span className="thumb" /></span>
+            <span>{t("keyForm.sessionAffinityLabel")}</span>
+          </label>
+          <span className="muted" style={{ fontSize: "0.85em" }}>{t("keyForm.sessionAffinityHint")}</span>
         </div>
       </div>
 

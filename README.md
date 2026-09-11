@@ -17,10 +17,11 @@ In plain words: you issue your own `cpa_…` keys to clients. Each key only sees
 
 1. **Issue keys** — create many downstream keys; each has an allow-list of models (or shared aliases).
 2. **Route** — client calls with alias name `fast`; plugin rewrites to e.g. `codex` + `gpt-5.4-mini`.
-3. **Limit** — per-key RPM, optional daily/weekly USD caps, token or per-call billing.
+3. **Limit** — per-key RPM and in-flight concurrency, optional daily/weekly USD caps, plus exact auth-ID concurrency limits.
 4. **Isolate credentials (tiers / groups)** — pin a request to Codex free/team/… or to a **custom classify group** so it never lands on the wrong auth file.
 5. **Multi-target aliases** — one alias can point at several backends (priority or round-robin).
-6. **Web UI** — manage keys, global aliases, and credential classification inside CPA.
+6. **Session affinity** — prefer a previous auth, but fail over only inside the allowed account pool.
+7. **Web UI + self-service lookup** — manage policies and let each key holder inspect only their own usage.
 
 ---
 
@@ -32,6 +33,8 @@ A plugin-owned secret (`cpa_…`). Authenticated only by this plugin. Holds:
 
 - allowed **models** and/or **aliases**
 - RPM
+- process-local maximum concurrent model executions
+- optional session affinity
 - optional daily / weekly dollar limits
 - optional `allow_models_endpoint` (see below)
 
@@ -83,6 +86,16 @@ The scheduler intersects the binding, the uniquely recovered target group, candi
 
 CPA-native keys are untouched unless explicitly imported as `native: true`. Importing stores the ordinary key hash plus CPA's irreversible `caller_scope`, never another plaintext copy; the secret is not echoed by the API. Native keys keep host authentication and model routing, but an imported binding is enforced by this scheduler. Host session affinity remains available only to native keys that are not taken over by a binding; plugin-handled RR/WRR does not automatically inherit it.
 
+### Concurrency limits and session affinity
+
+- `max_concurrent_requests` caps one controlled key's in-flight model executions; `0` is unlimited.
+- `auth_concurrency_limits` maps exact CPA auth candidate IDs to global controlled concurrency across plugin-managed keys and models.
+- Ordinary HTTP and SSE executions hold slots until completion, failure, rejection, or cancellation. Saturation returns `429`; there is no queue.
+- Session affinity is opt-in. It prefers the last successfully admitted auth for the host's canonical/derived session identity.
+- If that auth is full, cooling, unavailable, or no longer allowed, selection falls back through the configured WRR/RR/fill-first policy **inside the same allowed pool**. It never delegates to the host's global pool.
+- Slots and affinity are process-local memory. Lowering a limit during hot reconfigure gates new work but does not evict active work.
+- Image/video `per_call` compensation is charged once after concurrency admission. A later upstream failure still cannot be refunded.
+
 **Operational boundary:** this is a plugin-only control. Keep the plugin enabled and healthy, and do not use CPA Home mode for account-bound traffic because Home selects before the ordinary plugin scheduler. If the plugin is unloaded/fused, a key that still exists in CPA `api-keys` is again governed only by CPA's global pool. For the strongest fail-closed behavior under plugin removal, use plugin-issued keys and never duplicate them in CPA `api-keys`.
 
 **Custom classification** (Web UI → Mapping → Credential Classification):
@@ -108,8 +121,9 @@ Channels under CPA `openai-compatibility` (e.g. a named proxy) use the **channel
 |------|------|
 | Frontend auth | Know plugin keys; enforce alias allow-list, RPM, budget; stamp route + group metadata |
 | Model router | Alias → provider + target model |
-| Request interceptor | Reject query-only or conflicting credentials for account-bound keys before upstream execution |
-| Scheduler | Intersect key binding + target group, fail closed, then apply WRR/RR/fill-first within the highest Priority tier |
+| Request interceptor | Validate controlled identity and atomically acquire the key concurrency slot |
+| Request lifecycle | Final auth admission and idempotent release for HTTP/SSE success, failure, rejection, or cancellation |
+| Scheduler | Intersect binding + group, then apply capacity, affinity, and WRR/RR/fill-first within the highest Priority tier |
 | Response interceptor | Non-stream JSON: rewrite top-level `model` back to the alias |
 | Usage | Token / per-call billing into the state file |
 | Management API + embedded Web UI | Keys, aliases, classify rules, status |
@@ -149,6 +163,10 @@ plugins:
       priority: 10
       state_file: "cpa-key-policy-state.json"
       global_weighted_round_robin: true
+      session_affinity_idle_ttl_seconds: 3600
+      session_affinity_max_entries: 10000
+      auth_concurrency_limits:
+        "codex-team-a.json": 4
 ```
 
 Notes:
@@ -169,6 +187,14 @@ http://<your-cpa-host>:<api-port>/v0/resource/plugins/cpa-key-policy/index.html
 ```
 
 Login with CPA **management** secret (`remote-management.secret-key` / management password). The secret stays in memory only (not `localStorage`); refresh → re-login.
+
+Key holders can open the read-only self-service page without a management secret:
+
+```text
+http://<your-cpa-host>:<api-port>/v0/resource/plugins/cpa-key-policy/lookup
+```
+
+It submits the current secret only as `Authorization: Bearer <own-key>` and shows plugin-priced UTC-day/current 7-day-window usage, call/token summaries, and current key concurrency. URL keys and arbitrary `key_id` lookups are rejected; bindings, auth IDs, hashes, and other keys are never returned. Imported CPA-native keys currently have no model/pricing ledger and receive an explicit unsupported response.
 
 UI areas:
 
@@ -200,6 +226,7 @@ Exact paths (no path templates). Auth: CPA management bearer token.
 - `POST …/keys/reset-rpm?id=…`
 - `GET …/keys/usage?id=…`
 - `GET …/status`
+- `GET/PATCH …/settings` (global WRR, auth concurrency, affinity TTL/capacity)
 
 **Aliases**
 
@@ -222,6 +249,8 @@ curl -X POST "$CPA/v0/management/plugins/cpa-key-policy/keys" \
     "id": "team-a",
     "name": "Team A",
     "rpm": 60,
+    "max_concurrent_requests": 4,
+    "session_affinity": true,
     "account_binding": {
       "allow": ["codex-team-*.json"],
       "strategy": "weighted-round-robin"

@@ -1,7 +1,15 @@
 import { useEffect, useState, useCallback } from "react";
 import { useNavigate, useParams, useLocation } from "react-router-dom";
 import { useT } from "../i18n";
-import type { AliasMapping, AliasTarget, ClassifyRule, ClassifyPreviewResponse, CredentialDescriptor } from "../types";
+import type {
+  AliasMapping,
+  AliasTarget,
+  ClassifyRule,
+  ClassifyPreviewResponse,
+  CredentialDescriptor,
+  SchedulerSettings,
+  SchedulerSettingsPatch,
+} from "../types";
 import {
   fetchAliases,
   upsertAlias,
@@ -53,17 +61,23 @@ function AliasListTab() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
   const [globalWeighted, setGlobalWeighted] = useState(false);
+  const [schedulerSettings, setSchedulerSettings] = useState<SchedulerSettings | null>(null);
+  const [credentialDescriptors, setCredentialDescriptors] = useState<CredentialDescriptor[]>([]);
   const [settingsSaving, setSettingsSaving] = useState(false);
 
   const load = useCallback(async () => {
     setLoading(true);
+    setError("");
     try {
-      const [list, settings] = await Promise.all([
+      const [list, settings, descriptors] = await Promise.all([
         fetchAliases(),
         fetchSchedulerSettings(),
+        fetchCredentialDescriptors().catch(() => [] as CredentialDescriptor[]),
       ]);
       setAliases(list);
+      setSchedulerSettings(settings);
       setGlobalWeighted(settings.global_weighted_round_robin);
+      setCredentialDescriptors(descriptors);
     } catch (e: unknown) {
       setError(String(e));
     } finally {
@@ -89,10 +103,25 @@ function AliasListTab() {
     setError("");
     try {
       const settings = await updateSchedulerSettings(enabled);
+      setSchedulerSettings((prev) => prev ? { ...prev, ...settings } : settings);
       setGlobalWeighted(settings.global_weighted_round_robin);
     } catch (e: unknown) {
       setGlobalWeighted(previous);
       setError(t("mapping.globalWeightedSaveFailed") + ": " + String(e));
+    } finally {
+      setSettingsSaving(false);
+    }
+  };
+
+  const handleRuntimeSave = async (patch: SchedulerSettingsPatch) => {
+    setSettingsSaving(true);
+    setError("");
+    try {
+      const settings = await updateSchedulerSettings(patch);
+      setSchedulerSettings((prev) => prev ? { ...prev, ...settings } : settings);
+      setGlobalWeighted(settings.global_weighted_round_robin ?? globalWeighted);
+    } catch (e: unknown) {
+      setError(t("mapping.runtimeSaveFailed") + ": " + String(e));
     } finally {
       setSettingsSaving(false);
     }
@@ -120,6 +149,13 @@ function AliasListTab() {
         </button>
       </div>
       {error && <div className="error">{error}</div>}
+      <RuntimeSettingsPanel
+        settings={schedulerSettings}
+        descriptors={credentialDescriptors}
+        loading={loading}
+        saving={settingsSaving}
+        onSave={handleRuntimeSave}
+      />
       {loading ? (
         <div className="muted" style={{ padding: 20 }}>{t("keys.loading") || "Loading..."}</div>
       ) : aliases.length === 0 ? (
@@ -132,6 +168,183 @@ function AliasListTab() {
         </div>
       )}
     </>
+  );
+}
+
+function RuntimeSettingsPanel({
+  settings,
+  descriptors,
+  loading,
+  saving,
+  onSave,
+}: {
+  settings: SchedulerSettings | null;
+  descriptors: CredentialDescriptor[];
+  loading: boolean;
+  saving: boolean;
+  onSave: (patch: SchedulerSettingsPatch) => Promise<void>;
+}) {
+  const t = useT();
+  const [ttl, setTtl] = useState(0);
+  const [cacheCap, setCacheCap] = useState(0);
+  const [authLimits, setAuthLimits] = useState<Record<string, number>>({});
+  const [newAuthId, setNewAuthId] = useState("");
+  const [selectedDescriptor, setSelectedDescriptor] = useState("");
+
+  useEffect(() => {
+    if (!settings) return;
+    setTtl(settings.session_affinity_idle_ttl_seconds ?? 0);
+    setCacheCap(settings.session_affinity_max_entries ?? 0);
+    setAuthLimits({ ...(settings.auth_concurrency_limits ?? {}) });
+  }, [settings]);
+
+  const configuredIds = Object.keys(authLimits).sort((a, b) => a.localeCompare(b));
+  const availableDescriptors = descriptors
+    .map((descriptor) => descriptor.id.trim())
+    .filter((id, index, all) => id && all.indexOf(id) === index && !(id in authLimits))
+    .sort((a, b) => a.localeCompare(b));
+
+  const addAuthLimit = (value: string) => {
+    const id = value.trim();
+    if (!id) return;
+    setAuthLimits((prev) => ({ ...prev, [id]: prev[id] ?? 0 }));
+    setNewAuthId("");
+    setSelectedDescriptor("");
+  };
+
+  const save = async () => {
+    const limits: Record<string, number> = {};
+    for (const [rawId, rawLimit] of Object.entries(authLimits)) {
+      const id = rawId.trim();
+      const limit = Number.isFinite(rawLimit) ? Math.max(0, Math.floor(rawLimit)) : 0;
+      // A zero limit means no override and must not be sent to the backend.
+      if (id && limit > 0) limits[id] = limit;
+    }
+    await onSave({
+      auth_concurrency_limits: limits,
+      session_affinity_idle_ttl_seconds: Math.max(0, Math.floor(ttl) || 0),
+      session_affinity_max_entries: Math.max(0, Math.floor(cacheCap) || 0),
+    });
+  };
+
+  return (
+    <section className="runtime-settings card" aria-labelledby="runtime-settings-title">
+      <div className="runtime-settings-head">
+        <div>
+          <h2 id="runtime-settings-title">{t("mapping.runtimeTitle")}</h2>
+          <p className="muted">{t("mapping.runtimeHint")}</p>
+        </div>
+        <button className="btn primary sm" type="button" disabled={loading || saving || !settings} onClick={() => void save()}>
+          {saving ? t("mapping.runtimeSaving") : t("mapping.runtimeSave")}
+        </button>
+      </div>
+      <div className="runtime-settings-grid">
+        <div className="form-row">
+          <label htmlFor="runtime-affinity-ttl">{t("mapping.affinityIdleTtl")}</label>
+          <input
+            id="runtime-affinity-ttl"
+            className="input"
+            type="number"
+            min={0}
+            step="1"
+            value={ttl}
+            disabled={loading || !settings}
+            onChange={(event) => setTtl(Math.max(0, parseInt(event.target.value || "0", 10) || 0))}
+          />
+        </div>
+        <div className="form-row">
+          <label htmlFor="runtime-affinity-cap">{t("mapping.affinityMaxEntries")}</label>
+          <input
+            id="runtime-affinity-cap"
+            className="input"
+            type="number"
+            min={0}
+            step="1"
+            value={cacheCap}
+            disabled={loading || !settings}
+            onChange={(event) => setCacheCap(Math.max(0, parseInt(event.target.value || "0", 10) || 0))}
+          />
+        </div>
+      </div>
+      <div className="runtime-auth-limits">
+        <div className="runtime-auth-head">
+          <div>
+            <h3>{t("mapping.authConcurrencyTitle")}</h3>
+            <p className="muted">{t("mapping.authConcurrencyHint")}</p>
+          </div>
+          <div className="runtime-auth-add">
+            {availableDescriptors.length > 0 && (
+              <select
+                className="input"
+                value={selectedDescriptor}
+                disabled={loading || saving || !settings}
+                onChange={(event) => {
+                  setSelectedDescriptor(event.target.value);
+                  addAuthLimit(event.target.value);
+                }}
+                aria-label={t("mapping.authIdPlaceholder")}
+              >
+                <option value="">{t("mapping.selectAuthId")}</option>
+                {availableDescriptors.map((id) => <option key={id} value={id}>{id}</option>)}
+              </select>
+            )}
+            <input
+              className="input mono"
+              value={newAuthId}
+              disabled={loading || saving || !settings}
+              onChange={(event) => setNewAuthId(event.target.value)}
+              placeholder={t("mapping.authIdPlaceholder")}
+              list="runtime-auth-id-options"
+              aria-label={t("mapping.authIdPlaceholder")}
+            />
+            <datalist id="runtime-auth-id-options">
+              {availableDescriptors.map((id) => <option key={id} value={id} />)}
+            </datalist>
+            <button className="btn sm" type="button" disabled={loading || saving || !settings || !newAuthId.trim()} onClick={() => addAuthLimit(newAuthId)}>
+              + {t("mapping.addAuthId")}
+            </button>
+          </div>
+        </div>
+        {configuredIds.length === 0 ? (
+          <p className="muted runtime-auth-empty">{t("mapping.noAuthLimits")}</p>
+        ) : (
+          <div className="runtime-auth-rows">
+            {configuredIds.map((id) => (
+              <div className="runtime-auth-row" key={id}>
+                <span className="mono runtime-auth-id">{id}</span>
+                <input
+                  className="input runtime-auth-limit"
+                  type="number"
+                  min={0}
+                  step="1"
+                  value={authLimits[id] ?? 0}
+                  disabled={loading || saving || !settings}
+                  onChange={(event) => setAuthLimits((prev) => ({
+                    ...prev,
+                    [id]: Math.max(0, parseInt(event.target.value || "0", 10) || 0),
+                  }))}
+                  aria-label={t("mapping.authLimitLabel", { id })}
+                />
+                <span className="muted runtime-auth-unit">{t("mapping.authLimitUnit")}</span>
+                <button className="btn sm danger-outline" type="button" disabled={loading || saving || !settings} onClick={() => setAuthLimits((prev) => {
+                  const next = { ...prev };
+                  delete next[id];
+                  return next;
+                })}>
+                  {t("mapping.delete")}
+                </button>
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+      {settings && (settings.current_concurrent_requests !== undefined || settings.session_affinity_entries !== undefined) && (
+        <div className="runtime-stats muted">
+          {settings.current_concurrent_requests !== undefined && <span>{t("mapping.runtimeCurrent", { n: settings.current_concurrent_requests })}</span>}
+          {settings.session_affinity_entries !== undefined && <span>{t("mapping.runtimeEntries", { n: settings.session_affinity_entries })}</span>}
+        </div>
+      )}
+    </section>
   );
 }
 

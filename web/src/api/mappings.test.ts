@@ -38,4 +38,28 @@ describe("调度设置接口", () => {
       { global_weighted_round_robin: false },
     );
   });
+
+  it("通过 PATCH 保存运行时并发设置", async () => {
+    const settings = {
+      global_weighted_round_robin: true,
+      auth_concurrency_limits: { "codex-team.json": 2 },
+      session_affinity_idle_ttl_seconds: 900,
+      session_affinity_max_entries: 128,
+    };
+    patch.mockResolvedValue({ data: settings });
+
+    await expect(updateSchedulerSettings({
+      auth_concurrency_limits: settings.auth_concurrency_limits,
+      session_affinity_idle_ttl_seconds: settings.session_affinity_idle_ttl_seconds,
+      session_affinity_max_entries: settings.session_affinity_max_entries,
+    })).resolves.toEqual(settings);
+    expect(patch).toHaveBeenCalledWith(
+      "/v0/management/plugins/cpa-key-policy/settings",
+      {
+        auth_concurrency_limits: { "codex-team.json": 2 },
+        session_affinity_idle_ttl_seconds: 900,
+        session_affinity_max_entries: 128,
+      },
+    );
+  });
 });

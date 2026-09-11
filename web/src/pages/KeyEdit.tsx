@@ -109,6 +109,8 @@ export default function KeyEdit() {
             models: v.models,
             daily_limit_usd: v.daily_limit_usd,
             weekly_limit_usd: v.weekly_limit_usd,
+            max_concurrent_requests: v.max_concurrent_requests,
+            session_affinity: v.session_affinity,
             allow_models_endpoint: v.allow_models_endpoint,
             account_binding: v.account_binding,
             clear_account_binding: v.clear_account_binding,

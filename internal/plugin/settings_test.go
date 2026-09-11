@@ -11,8 +11,14 @@ func TestSchedulerSettingsManagementAndRestartPersistence(t *testing.T) {
 	statePath := filepath.Join(t.TempDir(), "state.json")
 	app := configureSettingsApp(t, statePath)
 
-	patchResponse := callManagementForTest(t, app, http.MethodPatch, "/v0/management/plugins/cpa-key-policy/settings", []byte(`{"global_weighted_round_robin":true}`))
+	patchResponse := callManagementForTest(t, app, http.MethodPatch, "/v0/management/plugins/cpa-key-policy/settings", []byte(`{
+		"global_weighted_round_robin": true,
+		"auth_concurrency_limits": {"auth-a.json": 4},
+		"session_affinity_idle_ttl_seconds": 900,
+		"session_affinity_max_entries": 321
+	}`))
 	assertGlobalWeightedSetting(t, patchResponse, http.StatusOK, true)
+	assertRuntimeSettings(t, patchResponse, 4, 900, 321)
 
 	getResponse := callManagementForTest(t, app, http.MethodGet, "/v0/management/plugins/cpa-key-policy/settings", nil)
 	assertGlobalWeightedSetting(t, getResponse, http.StatusOK, true)
@@ -20,6 +26,15 @@ func TestSchedulerSettingsManagementAndRestartPersistence(t *testing.T) {
 	restarted := configureSettingsApp(t, statePath)
 	restartedResponse := callManagementForTest(t, restarted, http.MethodGet, "/v0/management/plugins/cpa-key-policy/settings", nil)
 	assertGlobalWeightedSetting(t, restartedResponse, http.StatusOK, true)
+	assertRuntimeSettings(t, restartedResponse, 4, 900, 321)
+}
+
+func TestSchedulerSettingsRejectsInvalidConcurrencyLimit(t *testing.T) {
+	app := configureSettingsApp(t, filepath.Join(t.TempDir(), "state.json"))
+	response := callManagementForTest(t, app, http.MethodPatch, "/v0/management/plugins/cpa-key-policy/settings", []byte(`{"auth_concurrency_limits":{"auth-a.json":-1}}`))
+	if response.StatusCode != http.StatusBadRequest {
+		t.Fatalf("invalid setting status = %d, want 400; body=%s", response.StatusCode, response.Body)
+	}
 }
 
 func TestSchedulerSettingsRejectsMissingValue(t *testing.T) {
@@ -70,5 +85,22 @@ func assertGlobalWeightedSetting(t *testing.T, response ManagementResponse, expe
 	}
 	if payload.GlobalWeightedRoundRobin != expectedValue {
 		t.Fatalf("全局加权轮询 = %v，期望 %v", payload.GlobalWeightedRoundRobin, expectedValue)
+	}
+}
+
+func assertRuntimeSettings(t *testing.T, response ManagementResponse, authLimit, idleTTL, maxEntries int) {
+	t.Helper()
+	var payload struct {
+		AuthConcurrencyLimits         map[string]int `json:"auth_concurrency_limits"`
+		SessionAffinityIdleTTLSeconds int            `json:"session_affinity_idle_ttl_seconds"`
+		SessionAffinityMaxEntries     int            `json:"session_affinity_max_entries"`
+	}
+	if err := json.Unmarshal(response.Body, &payload); err != nil {
+		t.Fatal(err)
+	}
+	if payload.AuthConcurrencyLimits["auth-a.json"] != authLimit ||
+		payload.SessionAffinityIdleTTLSeconds != idleTTL ||
+		payload.SessionAffinityMaxEntries != maxEntries {
+		t.Fatalf("runtime settings = %+v", payload)
 	}
 }

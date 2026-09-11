@@ -17,10 +17,11 @@
 
 1. **发钥匙** — 批量创建下游 key，每把绑定可用模型 / 别名。  
 2. **做映射** — 客户端写 `model: fast`，插件转到例如 `codex` + `gpt-5.4-mini`。  
-3. **做限制** — 单 key 的 RPM、可选每日/每周美元额度，按 token 或按次计费。  
+3. **做限制** — 单 key 的 RPM、最大在途请求并发、可选每日/每周美元额度，并可限制某个 auth 文件的全局受控并发。
 4. **凭证分档 / 归类** — 请求可以钉死在 Codex free/team 等内置档，或你自定义的归类组，**不会串到别的凭证文件**。  
 5. **多目标别名** — 一个别名挂多个后端（优先 或 轮询）。  
-6. **网页管理** — 在 CPA 里管 key、全局别名、凭证归类。  
+6. **会话亲和** — 同一会话优先复用同一 auth；满载时只在允许账号池内切换。
+7. **网页管理与自助查询** — 管理员配置策略，key 持有人只读查看自己的用量。
 
 ---
 
@@ -32,6 +33,8 @@
 
 - 允许的 **模型** 和/或 **别名**
 - RPM
+- 最大并发中的模型请求数（单进程）
+- 可选的 session affinity
 - 每日 / 每周美元上限（可选）
 - 是否允许主端口访问 `/v1/models`（见下文）
 
@@ -81,6 +84,16 @@ account_binding:
 
 CPA 原生 key 默认完全不受影响；只有显式以 `native: true` 导入后才接管其账号绑定。导入只保存普通 key hash 与 CPA 的不可逆 `caller_scope`，不会保存或回显第二份明文。原生 key 仍由宿主鉴权和模型路由，但绑定由本插件强制执行。只有未被绑定接管的原生 key 才继续使用宿主 session affinity；插件自己返回 AuthID 的 RR/WRR 不会自动继承亲和性。
 
+### 并发限制与会话亲和
+
+- `max_concurrent_requests` 限制某个受控 key 同时在途的模型执行；`0` 表示不限。
+- `auth_concurrency_limits` 用**精确 auth ID**配置某个凭证的最大受控并发，跨插件 key、跨模型汇总；未配置表示不限。
+- 普通 HTTP 与 SSE 都从请求准入占位到完成、失败、拒绝或取消时释放。满载立即返回 `429`，不排队。
+- session affinity 缺省关闭。启用后使用宿主提供的 canonical/derived session id，在内存中优先复用上次成功准入的 auth。
+- 若亲和 auth 已满、冷却、不可用或已不在绑定内，会按原 WRR/RR/fill-first 策略改选**同一允许池**里的账号；池内全部满载才返回 429，绝不跨池。
+- 并发名额与亲和缓存都是单进程内存状态，不在多 CPA 实例之间共享。热更新降低上限不会驱逐已有请求，只会阻止新请求。
+- image/video 的 `per_call` 补偿计费改为并发准入成功后扣除一次；后续上游失败仍无法退款。
+
 **运行边界：** 这是纯插件控制。账号绑定流量必须保持插件启用且健康，也不能使用 CPA Home 模式，因为 Home 会在普通插件 scheduler 之前完成选择。若插件被卸载或熔断，仍留在 CPA `api-keys` 中的原生 key 会重新只受宿主全局账号池控制。若要求插件被移除时也尽量失败关闭，请使用插件签发的 key，并且绝不要把它重复放进 CPA `api-keys`。
 
 **自定义归类**（网页 → 映射 → 凭证归类）：
@@ -106,8 +119,9 @@ CPA 里配置的兼容通道，映射时 `provider` 填通道 **name**。插件�
 |------|------|
 | 前端鉴权 | 识别插件 key；校验别名、RPM、额度；写入路由与 group 元数据 |
 | 模型路由 | 别名 → provider + 目标模型 |
-| 请求拦截 | 受绑定 key 仅 query 传参或 Header 凭证冲突时，在访问上游前拒绝 |
-| 调度 | 取 key 绑定与目标 group 的交集，失败关闭，再在最高 Priority 层内执行 WRR/RR/fill-first |
+| 请求拦截 | 校验受控请求身份，并原子占用 key 并发名额 |
+| 请求生命周期 | auth 并发最终准入；HTTP/SSE 完成、失败、拒绝或取消时幂等释放 |
+| 调度 | 取 key 绑定与目标 group 的交集，再按容量、session affinity、WRR/RR/fill-first 选择 |
 | 响应拦截 | 非流式 JSON：把顶层 `model` 改回别名 |
 | 用量 | token / 按次计费写入 state |
 | 管理 API + 内嵌网页 | Key、别名、归类、状态 |
@@ -147,6 +161,10 @@ plugins:
       priority: 10
       state_file: "cpa-key-policy-state.json"
       global_weighted_round_robin: true
+      session_affinity_idle_ttl_seconds: 3600
+      session_affinity_max_entries: 10000
+      auth_concurrency_limits:
+        "codex-team-a.json": 4
 ```
 
 说明：
@@ -167,6 +185,14 @@ http://<你的-cpa-主机>:<api端口>/v0/resource/plugins/cpa-key-policy/index.
 ```
 
 用 CPA **管理密钥**登录（`remote-management.secret-key` 或管理密码）。密钥只放在内存，不写 `localStorage`；刷新页面需重新登录。
+
+Key 持有人无需管理密钥，可访问：
+
+```text
+http://<你的-cpa-主机>:<api端口>/v0/resource/plugins/cpa-key-policy/lookup
+```
+
+自助页只使用 `Authorization: Bearer <自己的 key>` 查询当前 key，展示插件计价下的 UTC 自然日/现有 7 日窗口用量、调用/Token 汇总和当前 key 并发。它不接受 URL 中的 key 或 `key_id`，也不会显示账号绑定、auth 文件、hash 或其他 key 的信息。导入的 CPA 原生 key 目前没有模型/价格账本，因此会明确提示不支持用量查询。
 
 | 区域 | 用途 |
 |------|------|
@@ -191,6 +217,8 @@ VITE_CPA_BASE=http://127.0.0.1:8317 npm run dev
 
 **Key：** `GET/POST/PATCH/DELETE …/keys`，以及 `rotate` / `reset-rpm` / `usage` / `status`  
 
+**运行时设置：** `GET/PATCH …/settings`（全局 WRR、auth 并发、亲和 TTL/容量）
+
 **别名：** `GET/POST/DELETE …/aliases`  
 
 **归类：**  
@@ -209,6 +237,8 @@ curl -X POST "$CPA/v0/management/plugins/cpa-key-policy/keys" \
     "id": "team-a",
     "name": "Team A",
     "rpm": 60,
+    "max_concurrent_requests": 4,
+    "session_affinity": true,
     "account_binding": {
       "allow": ["codex-team-*.json"],
       "strategy": "weighted-round-robin"
