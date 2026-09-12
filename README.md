@@ -79,7 +79,7 @@ Each key may define `account_binding.allow`, a case-sensitive list of Go `path.M
 ```yaml
 account_binding:
   allow: ["codex-team-*.json", "openai-compatibility:corp:*"]
-  strategy: weighted-round-robin # weighted-round-robin | round-robin | fill-first
+  strategy: weighted-round-robin # weighted-round-robin | round-robin | fill-first | quota-fill-first
 ```
 
 The scheduler intersects the binding, the uniquely recovered target group, candidate provider/status, positive weight, and highest available Priority. An empty intersection returns `auth_not_bound`; it never returns `Handled:false` or delegates to CPA's global pool. Account-bound requests must present the configured key in a Header. Query-only and conflicting protected credentials are terminated before upstream execution.
@@ -95,6 +95,16 @@ CPA-native keys are untouched unless explicitly imported as `native: true`. Impo
 - If that auth is full, cooling, unavailable, or no longer allowed, selection falls back through the configured WRR/RR/fill-first policy **inside the same allowed pool**. It never delegates to the host's global pool.
 - Slots and affinity are process-local memory. Lowering a limit during hot reconfigure gates new work but does not evict active work.
 - Image/video `per_call` compensation is charged once after concurrency admission. A later upstream failure still cannot be refunded.
+
+### Codex quota-aware Fill First and cycle maintenance
+
+- `quota-fill-first` still applies binding, group, provider, status, Priority, positive weight, and auth concurrency first. It reads quota only inside that final legal pool.
+- Ready accounts are ordered by the earliest weekly/monthly long-window reset. The optional five-hour window is availability-only. A Ready affinity binding is not moved merely because another account resets earlier.
+- If quota evidence is unknown, selection falls back to stable Fill First inside the legal pool. Explicit exhaustion is not cleared by TTL expiry or a local reset timer; newer positive evidence is required.
+- `quota_check_interval` and `quota_cache_ttl` are independent and default to `30m`. Passive signals from normal traffic are primary; background GETs only fill missing, stale, reset-crossed, or verification state.
+- Automatic activation defaults off. `managed-pools` limits activation to quota-aware bindings; `all-codex` also covers valid idle/native-used Codex OAuth auths without expanding any key's business pool.
+- Activation uses strict lazy-window baselines, a tiny `gpt-5.4-mini` compact request, and a verification GET. It shares controlled auth concurrency but never charges a user key's RPM or ledger. Unmanaged native traffic is still outside plugin concurrency accounting.
+- Runtime quota/activation state is stored at `<state_file>.quota-runtime.json`; persist the whole state directory in Docker.
 
 **Operational boundary:** this is a plugin-only control. Keep the plugin enabled and healthy, and do not use CPA Home mode for account-bound traffic because Home selects before the ordinary plugin scheduler. If the plugin is unloaded/fused, a key that still exists in CPA `api-keys` is again governed only by CPA's global pool. For the strongest fail-closed behavior under plugin removal, use plugin-issued keys and never duplicate them in CPA `api-keys`.
 
@@ -167,12 +177,17 @@ plugins:
       session_affinity_max_entries: 10000
       auth_concurrency_limits:
         "codex-team-a.json": 4
+      quota_check_interval: "30m"
+      quota_cache_ttl: "30m"
+      quota_activation_enabled: false
+      quota_activation_scope: "managed-pools" # or all-codex
 ```
 
 Notes:
 
 - If `state_file` exists, it is the source of truth for keys / aliases / classify rules / usage.
 - `global_weighted_round_robin: true` ignores the selected alias target group only for unbound plugin keys. An explicit account binding always remains restrictive. The default is `false`.
+- `quota_activation_enabled` defaults to `false`. Select `all-codex` explicitly in the UI only when host-wide Codex cycle maintenance is intended.
 - Prefer creating keys and aliases in the **Web UI** or Management API; seed YAML `keys` is mainly for first boot.
 - Never commit real key hashes, management secrets, or live host URLs into public docs.
 

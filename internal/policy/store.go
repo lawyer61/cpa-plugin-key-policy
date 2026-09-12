@@ -20,6 +20,10 @@ type Store struct {
 	authConcurrencyLimits         map[string]int
 	sessionAffinityIdleTTLSeconds int
 	sessionAffinityMaxEntries     int
+	quotaCheckInterval            string
+	quotaCacheTTL                 string
+	quotaActivationEnabled        bool
+	quotaActivationScope          string
 	statePath                     string
 	keys                          map[string]*KeyConfig
 	keysByHash                    map[string]*KeyConfig
@@ -81,6 +85,10 @@ func NewStore() *Store {
 		authConcurrencyLimits:         cloneIntMap(defaults.AuthConcurrencyLimits),
 		sessionAffinityIdleTTLSeconds: defaults.SessionAffinityIdleTTLSeconds,
 		sessionAffinityMaxEntries:     defaults.SessionAffinityMaxEntries,
+		quotaCheckInterval:            defaults.QuotaCheckInterval,
+		quotaCacheTTL:                 defaults.QuotaCacheTTL,
+		quotaActivationEnabled:        defaults.QuotaActivationEnabled,
+		quotaActivationScope:          defaults.QuotaActivationScope,
 		keys:                          make(map[string]*KeyConfig),
 		keysByHash:                    make(map[string]*KeyConfig),
 		keysByCallerScope:             make(map[string]*KeyConfig),
@@ -137,6 +145,18 @@ func (s *Store) Configure(cfg Config) error {
 		}
 		if state.SessionAffinityMaxEntries != nil {
 			cfg.SessionAffinityMaxEntries = *state.SessionAffinityMaxEntries
+		}
+		if state.QuotaCheckInterval != nil {
+			cfg.QuotaCheckInterval = *state.QuotaCheckInterval
+		}
+		if state.QuotaCacheTTL != nil {
+			cfg.QuotaCacheTTL = *state.QuotaCacheTTL
+		}
+		if state.QuotaActivationEnabled != nil {
+			cfg.QuotaActivationEnabled = *state.QuotaActivationEnabled
+		}
+		if state.QuotaActivationScope != nil {
+			cfg.QuotaActivationScope = *state.QuotaActivationScope
 		}
 		settings, errSettings := normalizeRuntimeSettings(runtimeSettingsFromConfig(cfg))
 		if errSettings != nil {
@@ -212,6 +232,10 @@ func (s *Store) Configure(cfg Config) error {
 	s.authConcurrencyLimits = cloneIntMap(cfg.AuthConcurrencyLimits)
 	s.sessionAffinityIdleTTLSeconds = cfg.SessionAffinityIdleTTLSeconds
 	s.sessionAffinityMaxEntries = cfg.SessionAffinityMaxEntries
+	s.quotaCheckInterval = cfg.QuotaCheckInterval
+	s.quotaCacheTTL = cfg.QuotaCacheTTL
+	s.quotaActivationEnabled = cfg.QuotaActivationEnabled
+	s.quotaActivationScope = cfg.QuotaActivationScope
 	s.statePath = statePath
 	// Store the global alias table and classify rules for routing/billing.
 	s.aliases = make(map[string]*AliasMapping, len(cfg.Aliases))
@@ -280,6 +304,10 @@ func (s *Store) RuntimeSettings() RuntimeSettings {
 		AuthConcurrencyLimits:         cloneIntMap(s.authConcurrencyLimits),
 		SessionAffinityIdleTTLSeconds: s.sessionAffinityIdleTTLSeconds,
 		SessionAffinityMaxEntries:     s.sessionAffinityMaxEntries,
+		QuotaCheckInterval:            s.quotaCheckInterval,
+		QuotaCacheTTL:                 s.quotaCacheTTL,
+		QuotaActivationEnabled:        s.quotaActivationEnabled,
+		QuotaActivationScope:          s.quotaActivationScope,
 	}
 }
 
@@ -290,11 +318,21 @@ type RuntimeSettingsPatch struct {
 	AuthConcurrencyLimits         *map[string]int
 	SessionAffinityIdleTTLSeconds *int
 	SessionAffinityMaxEntries     *int
+	QuotaCheckInterval            *string
+	QuotaCacheTTL                 *string
+	QuotaActivationEnabled        *bool
+	QuotaActivationScope          *string
 }
 
 func (s *Store) UpdateRuntimeSettings(patch RuntimeSettingsPatch) (RuntimeSettings, error) {
 	s.updateMu.Lock()
 	defer s.updateMu.Unlock()
+	if patch.QuotaCheckInterval != nil && strings.TrimSpace(*patch.QuotaCheckInterval) == "" {
+		return RuntimeSettings{}, fmt.Errorf("%w: quota_check_interval cannot be empty", ErrInvalidRuntimeSettings)
+	}
+	if patch.QuotaCacheTTL != nil && strings.TrimSpace(*patch.QuotaCacheTTL) == "" {
+		return RuntimeSettings{}, fmt.Errorf("%w: quota_cache_ttl cannot be empty", ErrInvalidRuntimeSettings)
+	}
 
 	s.mu.Lock()
 	previous := RuntimeSettings{
@@ -302,6 +340,10 @@ func (s *Store) UpdateRuntimeSettings(patch RuntimeSettingsPatch) (RuntimeSettin
 		AuthConcurrencyLimits:         cloneIntMap(s.authConcurrencyLimits),
 		SessionAffinityIdleTTLSeconds: s.sessionAffinityIdleTTLSeconds,
 		SessionAffinityMaxEntries:     s.sessionAffinityMaxEntries,
+		QuotaCheckInterval:            s.quotaCheckInterval,
+		QuotaCacheTTL:                 s.quotaCacheTTL,
+		QuotaActivationEnabled:        s.quotaActivationEnabled,
+		QuotaActivationScope:          s.quotaActivationScope,
 	}
 	next := previous
 	if patch.GlobalWeightedRoundRobin != nil {
@@ -316,6 +358,18 @@ func (s *Store) UpdateRuntimeSettings(patch RuntimeSettingsPatch) (RuntimeSettin
 	if patch.SessionAffinityMaxEntries != nil {
 		next.SessionAffinityMaxEntries = *patch.SessionAffinityMaxEntries
 	}
+	if patch.QuotaCheckInterval != nil {
+		next.QuotaCheckInterval = *patch.QuotaCheckInterval
+	}
+	if patch.QuotaCacheTTL != nil {
+		next.QuotaCacheTTL = *patch.QuotaCacheTTL
+	}
+	if patch.QuotaActivationEnabled != nil {
+		next.QuotaActivationEnabled = *patch.QuotaActivationEnabled
+	}
+	if patch.QuotaActivationScope != nil {
+		next.QuotaActivationScope = *patch.QuotaActivationScope
+	}
 	next, err := normalizeRuntimeSettings(next)
 	if err != nil {
 		s.mu.Unlock()
@@ -325,6 +379,10 @@ func (s *Store) UpdateRuntimeSettings(patch RuntimeSettingsPatch) (RuntimeSettin
 	s.authConcurrencyLimits = cloneIntMap(next.AuthConcurrencyLimits)
 	s.sessionAffinityIdleTTLSeconds = next.SessionAffinityIdleTTLSeconds
 	s.sessionAffinityMaxEntries = next.SessionAffinityMaxEntries
+	s.quotaCheckInterval = next.QuotaCheckInterval
+	s.quotaCacheTTL = next.QuotaCacheTTL
+	s.quotaActivationEnabled = next.QuotaActivationEnabled
+	s.quotaActivationScope = next.QuotaActivationScope
 	keys := s.keysSnapshotLocked()
 	usage := s.usageSnapshotLocked()
 	aliases := s.aliasesSnapshotLocked()
@@ -338,6 +396,10 @@ func (s *Store) UpdateRuntimeSettings(patch RuntimeSettingsPatch) (RuntimeSettin
 		s.authConcurrencyLimits = cloneIntMap(previous.AuthConcurrencyLimits)
 		s.sessionAffinityIdleTTLSeconds = previous.SessionAffinityIdleTTLSeconds
 		s.sessionAffinityMaxEntries = previous.SessionAffinityMaxEntries
+		s.quotaCheckInterval = previous.QuotaCheckInterval
+		s.quotaCacheTTL = previous.QuotaCacheTTL
+		s.quotaActivationEnabled = previous.QuotaActivationEnabled
+		s.quotaActivationScope = previous.QuotaActivationScope
 		s.mu.Unlock()
 		return RuntimeSettings{}, err
 	}
@@ -1726,6 +1788,10 @@ func (s *Store) Status() map[string]any {
 		"auth_concurrency_limits":           settings.AuthConcurrencyLimits,
 		"session_affinity_idle_ttl_seconds": settings.SessionAffinityIdleTTLSeconds,
 		"session_affinity_max_entries":      settings.SessionAffinityMaxEntries,
+		"quota_check_interval":              settings.QuotaCheckInterval,
+		"quota_cache_ttl":                   settings.QuotaCacheTTL,
+		"quota_activation_enabled":          settings.QuotaActivationEnabled,
+		"quota_activation_scope":            settings.QuotaActivationScope,
 		"state_file":                        statePath,
 		"key_count":                         len(keys),
 		"rpm_usage":                         rpmUsage,

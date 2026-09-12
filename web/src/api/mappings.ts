@@ -6,6 +6,7 @@ import type {
   ClassifyPreviewResponse,
   SchedulerSettings,
   SchedulerSettingsPatch,
+  QuotaStatus,
 } from "../types";
 import { readPlanType } from "./models";
 
@@ -42,6 +43,12 @@ export async function updateSchedulerSettings(
     ? { global_weighted_round_robin: patch }
     : patch;
   const { data } = await c.patch<SchedulerSettings>(pluginPath("/settings"), body);
+  return data;
+}
+
+export async function fetchQuotaStatus(): Promise<QuotaStatus> {
+  const c = apiClient();
+  const { data } = await c.get<QuotaStatus>(pluginPath("/quota"));
   return data;
 }
 

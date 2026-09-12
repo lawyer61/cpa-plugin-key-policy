@@ -25,6 +25,7 @@ type App struct {
 	selectionMu     sync.Mutex
 	concurrency     *concurrencyTracker
 	affinity        *affinityCache
+	quota           *quotaManager
 }
 
 const classifyCacheCapacity = 4096
@@ -33,13 +34,24 @@ func NewApp() *App {
 	store := policy.NewStore()
 	_ = store.Configure(policy.DefaultConfig())
 	settings := store.RuntimeSettings()
-	return &App{
+	concurrency := newConcurrencyTracker()
+	app := &App{
 		store:           store,
 		classifyCache:   make(map[string][]string),
 		schedulerRR:     make(map[string]*smoothWeightedState),
 		schedulerCursor: make(map[string]string),
-		concurrency:     newConcurrencyTracker(),
+		concurrency:     concurrency,
 		affinity:        newAffinityCache(time.Now, time.Duration(settings.SessionAffinityIdleTTLSeconds)*time.Second, settings.SessionAffinityMaxEntries),
+	}
+	app.quota = newQuotaManager(store, concurrency, time.Now)
+	return app
+}
+
+// SetHostClient supplies the narrow host callback bridge used only by quota
+// observation/maintenance. The scheduler hot path never invokes this client.
+func (a *App) SetHostClient(host HostClient) {
+	if a != nil && a.quota != nil {
+		a.quota.setHostClient(host)
 	}
 }
 
@@ -117,12 +129,18 @@ func (a *App) configure(raw []byte) error {
 	a.clearClassifyCache()
 	a.clearSchedulerState()
 	a.store.StartUsageFlusher()
+	if a.quota != nil {
+		a.quota.configure(a.store.StatePath())
+	}
 	return nil
 }
 
 // Shutdown flushes usage. Host calls this on plugin unload.
 func (a *App) Shutdown() {
 	a.concurrency.stopAccepting()
+	if a.quota != nil {
+		a.quota.shutdown()
+	}
 	a.store.StopUsageFlusher()
 }
 
@@ -141,6 +159,10 @@ func (a *App) registration() Registration {
 				{Name: "auth_concurrency_limits", Type: "object", Description: "Exact auth-file ID to maximum controlled in-flight requests; zero or missing means unlimited."},
 				{Name: "session_affinity_idle_ttl_seconds", Type: "integer", Description: "Idle TTL for in-memory session affinity bindings."},
 				{Name: "session_affinity_max_entries", Type: "integer", Description: "Maximum in-memory session affinity bindings."},
+				{Name: "quota_check_interval", Type: "string", Description: "Background Codex quota review interval (duration, default 30m)."},
+				{Name: "quota_cache_ttl", Type: "string", Description: "Freshness TTL for quota evidence (duration, default 30m)."},
+				{Name: "quota_activation_enabled", Type: "boolean", Description: "Allow compact background activation for strictly detected lazy Codex windows."},
+				{Name: "quota_activation_scope", Type: "string", EnumValues: []string{"managed-pools", "all-codex"}, Description: "Auth scope eligible for background activation."},
 				{Name: "keys", Type: "array", Description: "Downstream key policies, including optional fail-closed account_binding allow globs. State file wins after it exists."},
 			},
 		},
@@ -307,6 +329,14 @@ func (a *App) interceptRequestAfter(raw []byte) ([]byte, error) {
 	if key.AccountBinding != nil && !key.AccountBinding.Matches(authID) {
 		a.affinity.resolveProposal(proposalKey, false)
 		return OKEnvelope(requestRejectionWithType(http.StatusForbidden, "permission_error", "auth_not_bound", "cpa-key-policy: selected auth no longer satisfies the key's account binding"))
+	}
+	if key.AccountBinding != nil && key.AccountBinding.Strategy == policy.BindingStrategyQuotaFillFirst &&
+		strings.EqualFold(metadataString(req.Metadata, "target_provider"), "codex") {
+		_, ttl := a.quota.durations()
+		if class, _ := a.quota.cache.classify(authID, ttl, time.Now()); class == quotaAvailabilityExhausted {
+			a.affinity.resolveProposal(proposalKey, false)
+			return OKEnvelope(requestRejectionWithType(http.StatusTooManyRequests, "rate_limit_error", "quota_exhausted", "cpa-key-policy: selected auth became quota-exhausted before execution"))
+		}
 	}
 	limit := a.store.AuthConcurrencyLimit(authID)
 	current, acquired := a.concurrency.acquireAuth(req.RequestID, authID, limit)
@@ -519,12 +549,35 @@ func (a *App) pickScheduler(raw []byte) ([]byte, error) {
 	if binding != nil {
 		strategy = binding.Strategy
 	}
+	quotaReadyPool := false
+	if strategy == policy.BindingStrategyQuotaFillFirst && quotaStrategyApplies(req, available) {
+		_, ttl := a.quota.durations()
+		ready, unknown := quotaCandidateClasses(a.quota.cache, available, ttl, time.Now())
+		switch {
+		case len(ready) > 0:
+			available = ready
+			quotaReadyPool = true
+		case len(unknown) > 0:
+			available = unknown
+		default:
+			return ErrorEnvelope("quota_exhausted", "cpa-key-policy: all eligible Codex auth files have explicit quota exhaustion evidence", http.StatusTooManyRequests), nil
+		}
+		availableIDs = make(map[string]struct{}, len(available))
+		for _, candidate := range available {
+			availableIDs[candidate.ID] = struct{}{}
+		}
+	}
 	pickBase := func() SchedulerAuthCandidate {
 		poolKey := schedulerPoolKey(req, owner, group, maxPriority)
 		switch strategy {
 		case policy.BindingStrategyRoundRobin:
 			return a.pickRoundRobin(poolKey, available)
 		case policy.BindingStrategyFillFirst:
+			return pickFillFirst(req, available)
+		case policy.BindingStrategyQuotaFillFirst:
+			if quotaReadyPool && quotaStrategyApplies(req, available) {
+				return pickQuotaFillFirst(a.quota.cache, req, available)
+			}
 			return pickFillFirst(req, available)
 		default:
 			return a.pickSmoothWeighted(req, owner, group, maxPriority, available)
@@ -824,6 +877,9 @@ func (a *App) handleUsage(raw []byte) ([]byte, error) {
 	if err := json.Unmarshal(raw, &req); err != nil {
 		return OKEnvelope(UsageHandleResponse{})
 	}
+	if a.quota != nil {
+		a.quota.recordUsage(req)
+	}
 	_ = a.store.RecordUsage(req.APIKey, req.Alias, req.Model, req.Failed, policy.UsageDetail{
 		InputTokens:         req.Detail.InputTokens,
 		OutputTokens:        req.Detail.OutputTokens,
@@ -850,6 +906,7 @@ func (a *App) managementRegistration() ManagementRegistrationResponse {
 			{Method: http.MethodGet, Path: base + "/status", Description: "Show cpa-key-policy runtime status."},
 			{Method: http.MethodGet, Path: base + "/settings", Description: "Show scheduler settings."},
 			{Method: http.MethodPatch, Path: base + "/settings", Description: "Update scheduler settings."},
+			{Method: http.MethodGet, Path: base + "/quota", Description: "Show Codex quota observation and maintenance state."},
 			{Method: http.MethodGet, Path: base + "/aliases", Description: "List the global alias mapping table."},
 			{Method: http.MethodPost, Path: base + "/aliases", Description: "Create or update a global alias mapping."},
 			{Method: http.MethodDelete, Path: base + "/aliases", Description: "Delete a global alias mapping by name."},
@@ -920,6 +977,8 @@ func (a *App) handleManagement(raw []byte) ([]byte, error) {
 		return OKEnvelope(a.schedulerSettings())
 	case req.Method == http.MethodPatch && path == base+"/settings":
 		return OKEnvelope(a.updateSchedulerSettings(req.Body))
+	case req.Method == http.MethodGet && path == base+"/quota":
+		return OKEnvelope(jsonResponse(http.StatusOK, a.quota.status()))
 	case req.Method == http.MethodGet && path == base+"/aliases":
 		return OKEnvelope(jsonResponse(http.StatusOK, map[string]any{"aliases": a.store.AliasesSnapshot()}))
 	case req.Method == http.MethodPost && path == base+"/aliases":
@@ -948,6 +1007,10 @@ type schedulerSettingsRequest struct {
 	AuthConcurrencyLimits         *map[string]int `json:"auth_concurrency_limits"`
 	SessionAffinityIdleTTLSeconds *int            `json:"session_affinity_idle_ttl_seconds"`
 	SessionAffinityMaxEntries     *int            `json:"session_affinity_max_entries"`
+	QuotaCheckInterval            *string         `json:"quota_check_interval"`
+	QuotaCacheTTL                 *string         `json:"quota_cache_ttl"`
+	QuotaActivationEnabled        *bool           `json:"quota_activation_enabled"`
+	QuotaActivationScope          *string         `json:"quota_activation_scope"`
 }
 
 func (a *App) schedulerSettings() ManagementResponse {
@@ -958,8 +1021,14 @@ func (a *App) schedulerSettings() ManagementResponse {
 		"auth_concurrency_limits":           settings.AuthConcurrencyLimits,
 		"session_affinity_idle_ttl_seconds": settings.SessionAffinityIdleTTLSeconds,
 		"session_affinity_max_entries":      settings.SessionAffinityMaxEntries,
+		"quota_check_interval":              settings.QuotaCheckInterval,
+		"quota_cache_ttl":                   settings.QuotaCacheTTL,
+		"quota_activation_enabled":          settings.QuotaActivationEnabled,
+		"quota_activation_scope":            settings.QuotaActivationScope,
 		"current_concurrent_requests":       concurrency.Total,
+		"current_activation_requests":       concurrency.ActivationTotal,
 		"auth_concurrency_current":          concurrency.Auths,
+		"auth_activation_current":           concurrency.AuthActivations,
 		"session_affinity_entries":          a.affinity.size(),
 	})
 }
@@ -970,7 +1039,9 @@ func (a *App) updateSchedulerSettings(body []byte) ManagementResponse {
 		return jsonError(http.StatusBadRequest, "invalid_json", err.Error())
 	}
 	if request.GlobalWeightedRoundRobin == nil && request.AuthConcurrencyLimits == nil &&
-		request.SessionAffinityIdleTTLSeconds == nil && request.SessionAffinityMaxEntries == nil {
+		request.SessionAffinityIdleTTLSeconds == nil && request.SessionAffinityMaxEntries == nil &&
+		request.QuotaCheckInterval == nil && request.QuotaCacheTTL == nil &&
+		request.QuotaActivationEnabled == nil && request.QuotaActivationScope == nil {
 		return jsonError(http.StatusBadRequest, "missing_setting", "缺少可更新的调度设置")
 	}
 	settings, err := a.store.UpdateRuntimeSettings(policy.RuntimeSettingsPatch{
@@ -978,6 +1049,10 @@ func (a *App) updateSchedulerSettings(body []byte) ManagementResponse {
 		AuthConcurrencyLimits:         request.AuthConcurrencyLimits,
 		SessionAffinityIdleTTLSeconds: request.SessionAffinityIdleTTLSeconds,
 		SessionAffinityMaxEntries:     request.SessionAffinityMaxEntries,
+		QuotaCheckInterval:            request.QuotaCheckInterval,
+		QuotaCacheTTL:                 request.QuotaCacheTTL,
+		QuotaActivationEnabled:        request.QuotaActivationEnabled,
+		QuotaActivationScope:          request.QuotaActivationScope,
 	})
 	if err != nil {
 		if errors.Is(err, policy.ErrInvalidRuntimeSettings) {
@@ -987,6 +1062,7 @@ func (a *App) updateSchedulerSettings(body []byte) ManagementResponse {
 	}
 	a.affinity.configure(time.Duration(settings.SessionAffinityIdleTTLSeconds)*time.Second, settings.SessionAffinityMaxEntries)
 	a.clearSchedulerState()
+	a.quota.configure(a.store.StatePath())
 	return a.schedulerSettings()
 }
 

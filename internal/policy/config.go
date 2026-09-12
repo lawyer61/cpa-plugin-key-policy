@@ -26,8 +26,19 @@ type Config struct {
 	// retained in memory. It applies only to keys with SessionAffinity enabled.
 	SessionAffinityIdleTTLSeconds int `yaml:"session_affinity_idle_ttl_seconds,omitempty" json:"session_affinity_idle_ttl_seconds,omitempty"`
 	// SessionAffinityMaxEntries bounds the in-memory session-affinity cache.
-	SessionAffinityMaxEntries int         `yaml:"session_affinity_max_entries,omitempty" json:"session_affinity_max_entries,omitempty"`
-	Keys                      []KeyConfig `yaml:"keys" json:"keys"`
+	SessionAffinityMaxEntries int `yaml:"session_affinity_max_entries,omitempty" json:"session_affinity_max_entries,omitempty"`
+	// QuotaCheckInterval controls how often the background quota maintainer
+	// considers stale or incomplete Codex accounts. It is independent of TTL.
+	QuotaCheckInterval string `yaml:"quota_check_interval,omitempty" json:"quota_check_interval,omitempty"`
+	// QuotaCacheTTL controls how long positive quota evidence is considered
+	// fresh by quota-aware scheduling.
+	QuotaCacheTTL string `yaml:"quota_cache_ttl,omitempty" json:"quota_cache_ttl,omitempty"`
+	// QuotaActivationEnabled authorizes compact background activation requests.
+	// It defaults to false so existing installations never start upstream work.
+	QuotaActivationEnabled bool `yaml:"quota_activation_enabled,omitempty" json:"quota_activation_enabled,omitempty"`
+	// QuotaActivationScope is managed-pools or all-codex.
+	QuotaActivationScope string      `yaml:"quota_activation_scope,omitempty" json:"quota_activation_scope,omitempty"`
+	Keys                 []KeyConfig `yaml:"keys" json:"keys"`
 	// Aliases is the global alias mapping table. Each entry maps a downstream
 	// alias name to one or more (provider, model, group) targets with a shared
 	// pricing config. Keys reference aliases by name via KeyAliasRef.
@@ -300,6 +311,10 @@ type State struct {
 	AuthConcurrencyLimits         *map[string]int        `json:"auth_concurrency_limits,omitempty"`
 	SessionAffinityIdleTTLSeconds *int                   `json:"session_affinity_idle_ttl_seconds,omitempty"`
 	SessionAffinityMaxEntries     *int                   `json:"session_affinity_max_entries,omitempty"`
+	QuotaCheckInterval            *string                `json:"quota_check_interval,omitempty"`
+	QuotaCacheTTL                 *string                `json:"quota_cache_ttl,omitempty"`
+	QuotaActivationEnabled        *bool                  `json:"quota_activation_enabled,omitempty"`
+	QuotaActivationScope          *string                `json:"quota_activation_scope,omitempty"`
 	// Aliases is the global alias mapping table, persisted so that key alias
 	// references survive restarts even when config.yaml is not re-read. On
 	// Configure, the config.yaml Aliases take precedence; state Aliases are a
@@ -311,6 +326,10 @@ type State struct {
 const (
 	DefaultSessionAffinityIdleTTLSeconds = 60 * 60
 	DefaultSessionAffinityMaxEntries     = 10_000
+	DefaultQuotaCheckInterval            = "30m"
+	DefaultQuotaCacheTTL                 = "30m"
+	DefaultQuotaActivationScope          = "managed-pools"
+	MinQuotaDuration                     = time.Minute
 )
 
 var ErrInvalidRuntimeSettings = errors.New("invalid runtime settings")
@@ -323,6 +342,10 @@ type RuntimeSettings struct {
 	AuthConcurrencyLimits         map[string]int `json:"auth_concurrency_limits"`
 	SessionAffinityIdleTTLSeconds int            `json:"session_affinity_idle_ttl_seconds"`
 	SessionAffinityMaxEntries     int            `json:"session_affinity_max_entries"`
+	QuotaCheckInterval            string         `json:"quota_check_interval"`
+	QuotaCacheTTL                 string         `json:"quota_cache_ttl"`
+	QuotaActivationEnabled        bool           `json:"quota_activation_enabled"`
+	QuotaActivationScope          string         `json:"quota_activation_scope"`
 }
 
 func runtimeSettingsFromConfig(cfg Config) RuntimeSettings {
@@ -331,6 +354,10 @@ func runtimeSettingsFromConfig(cfg Config) RuntimeSettings {
 		AuthConcurrencyLimits:         cloneIntMap(cfg.AuthConcurrencyLimits),
 		SessionAffinityIdleTTLSeconds: cfg.SessionAffinityIdleTTLSeconds,
 		SessionAffinityMaxEntries:     cfg.SessionAffinityMaxEntries,
+		QuotaCheckInterval:            cfg.QuotaCheckInterval,
+		QuotaCacheTTL:                 cfg.QuotaCacheTTL,
+		QuotaActivationEnabled:        cfg.QuotaActivationEnabled,
+		QuotaActivationScope:          cfg.QuotaActivationScope,
 	}
 }
 
@@ -342,6 +369,10 @@ func applyRuntimeSettings(cfg *Config, settings RuntimeSettings) {
 	cfg.AuthConcurrencyLimits = cloneIntMap(settings.AuthConcurrencyLimits)
 	cfg.SessionAffinityIdleTTLSeconds = settings.SessionAffinityIdleTTLSeconds
 	cfg.SessionAffinityMaxEntries = settings.SessionAffinityMaxEntries
+	cfg.QuotaCheckInterval = settings.QuotaCheckInterval
+	cfg.QuotaCacheTTL = settings.QuotaCacheTTL
+	cfg.QuotaActivationEnabled = settings.QuotaActivationEnabled
+	cfg.QuotaActivationScope = settings.QuotaActivationScope
 }
 
 func normalizeRuntimeSettings(settings RuntimeSettings) (RuntimeSettings, error) {
@@ -351,11 +382,38 @@ func normalizeRuntimeSettings(settings RuntimeSettings) (RuntimeSettings, error)
 	if settings.SessionAffinityMaxEntries == 0 {
 		settings.SessionAffinityMaxEntries = DefaultSessionAffinityMaxEntries
 	}
+	if strings.TrimSpace(settings.QuotaCheckInterval) == "" {
+		settings.QuotaCheckInterval = DefaultQuotaCheckInterval
+	}
+	if strings.TrimSpace(settings.QuotaCacheTTL) == "" {
+		settings.QuotaCacheTTL = DefaultQuotaCacheTTL
+	}
+	if strings.TrimSpace(settings.QuotaActivationScope) == "" {
+		settings.QuotaActivationScope = DefaultQuotaActivationScope
+	}
 	if settings.SessionAffinityIdleTTLSeconds < 0 {
 		return RuntimeSettings{}, errors.New("session_affinity_idle_ttl_seconds cannot be negative")
 	}
 	if settings.SessionAffinityMaxEntries < 0 {
 		return RuntimeSettings{}, errors.New("session_affinity_max_entries cannot be negative")
+	}
+	checkInterval, err := time.ParseDuration(strings.TrimSpace(settings.QuotaCheckInterval))
+	if err != nil || checkInterval < MinQuotaDuration {
+		return RuntimeSettings{}, fmt.Errorf("quota_check_interval must be a duration of at least %s", MinQuotaDuration)
+	}
+	cacheTTL, err := time.ParseDuration(strings.TrimSpace(settings.QuotaCacheTTL))
+	if err != nil || cacheTTL < MinQuotaDuration {
+		return RuntimeSettings{}, fmt.Errorf("quota_cache_ttl must be a duration of at least %s", MinQuotaDuration)
+	}
+	settings.QuotaCheckInterval = strings.TrimSpace(settings.QuotaCheckInterval)
+	settings.QuotaCacheTTL = strings.TrimSpace(settings.QuotaCacheTTL)
+	switch strings.ToLower(strings.TrimSpace(settings.QuotaActivationScope)) {
+	case "managed-pools":
+		settings.QuotaActivationScope = "managed-pools"
+	case "all-codex":
+		settings.QuotaActivationScope = "all-codex"
+	default:
+		return RuntimeSettings{}, errors.New("quota_activation_scope must be managed-pools or all-codex")
 	}
 	normalizedAuthLimits := make(map[string]int, len(settings.AuthConcurrencyLimits))
 	for rawID, limit := range settings.AuthConcurrencyLimits {
@@ -389,6 +447,9 @@ func DefaultConfig() Config {
 		AuthConcurrencyLimits:         map[string]int{},
 		SessionAffinityIdleTTLSeconds: DefaultSessionAffinityIdleTTLSeconds,
 		SessionAffinityMaxEntries:     DefaultSessionAffinityMaxEntries,
+		QuotaCheckInterval:            DefaultQuotaCheckInterval,
+		QuotaCacheTTL:                 DefaultQuotaCacheTTL,
+		QuotaActivationScope:          DefaultQuotaActivationScope,
 	}
 }
 
@@ -396,6 +457,15 @@ func DecodeConfig(raw []byte) (Config, error) {
 	cfg := DefaultConfig()
 	if len(strings.TrimSpace(string(raw))) == 0 {
 		return cfg, nil
+	}
+	var explicit map[string]any
+	if err := yaml.Unmarshal(raw, &explicit); err != nil {
+		return Config{}, err
+	}
+	for _, field := range []string{"quota_check_interval", "quota_cache_ttl"} {
+		if value, exists := explicit[field]; exists && (value == nil || strings.TrimSpace(fmt.Sprint(value)) == "") {
+			return Config{}, fmt.Errorf("%s cannot be empty", field)
+		}
 	}
 	if err := yaml.Unmarshal(raw, &cfg); err != nil {
 		return Config{}, err
@@ -874,10 +944,18 @@ func saveStateDocument(path string, keys []KeyConfig, usage map[string]*UsageSta
 		authConcurrencyLimits := cloneIntMap(settings.AuthConcurrencyLimits)
 		idleTTLSeconds := settings.SessionAffinityIdleTTLSeconds
 		maxEntries := settings.SessionAffinityMaxEntries
+		quotaCheckInterval := settings.QuotaCheckInterval
+		quotaCacheTTL := settings.QuotaCacheTTL
+		quotaActivationEnabled := settings.QuotaActivationEnabled
+		quotaActivationScope := settings.QuotaActivationScope
 		state.GlobalWeightedRoundRobin = &globalWeightedRoundRobin
 		state.AuthConcurrencyLimits = &authConcurrencyLimits
 		state.SessionAffinityIdleTTLSeconds = &idleTTLSeconds
 		state.SessionAffinityMaxEntries = &maxEntries
+		state.QuotaCheckInterval = &quotaCheckInterval
+		state.QuotaCacheTTL = &quotaCacheTTL
+		state.QuotaActivationEnabled = &quotaActivationEnabled
+		state.QuotaActivationScope = &quotaActivationScope
 	}
 	raw, err := json.MarshalIndent(state, "", "  ")
 	if err != nil {
@@ -906,6 +984,10 @@ func SaveUsageOnly(path string, usage map[string]*UsageState) error {
 	var authConcurrencyLimits *map[string]int
 	var sessionAffinityIdleTTLSeconds *int
 	var sessionAffinityMaxEntries *int
+	var quotaCheckInterval *string
+	var quotaCacheTTL *string
+	var quotaActivationEnabled *bool
+	var quotaActivationScope *string
 	if cur, err := LoadState(path); err == nil {
 		keys = cur.Keys
 		aliases = cur.Aliases
@@ -914,6 +996,10 @@ func SaveUsageOnly(path string, usage map[string]*UsageState) error {
 		authConcurrencyLimits = cur.AuthConcurrencyLimits
 		sessionAffinityIdleTTLSeconds = cur.SessionAffinityIdleTTLSeconds
 		sessionAffinityMaxEntries = cur.SessionAffinityMaxEntries
+		quotaCheckInterval = cur.QuotaCheckInterval
+		quotaCacheTTL = cur.QuotaCacheTTL
+		quotaActivationEnabled = cur.QuotaActivationEnabled
+		quotaActivationScope = cur.QuotaActivationScope
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return err
 	}
@@ -932,6 +1018,10 @@ func SaveUsageOnly(path string, usage map[string]*UsageState) error {
 		AuthConcurrencyLimits:         authConcurrencyLimits,
 		SessionAffinityIdleTTLSeconds: sessionAffinityIdleTTLSeconds,
 		SessionAffinityMaxEntries:     sessionAffinityMaxEntries,
+		QuotaCheckInterval:            quotaCheckInterval,
+		QuotaCacheTTL:                 quotaCacheTTL,
+		QuotaActivationEnabled:        quotaActivationEnabled,
+		QuotaActivationScope:          quotaActivationScope,
 		Aliases:                       aliases,
 		ClassifyRules:                 rules,
 	}

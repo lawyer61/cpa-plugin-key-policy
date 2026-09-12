@@ -648,6 +648,7 @@ export default function KeyForm({
                     <option value="weighted-round-robin">weighted-round-robin</option>
                     <option value="round-robin">round-robin</option>
                     <option value="fill-first">fill-first</option>
+                    <option value="quota-fill-first">quota-fill-first</option>
                   </select>
                 </div>
                 <p className="muted kf-hint">{t("keyForm.accountBindingHint")}</p>
@@ -859,6 +860,7 @@ export default function KeyForm({
                 <option value="weighted-round-robin">weighted-round-robin</option>
                 <option value="round-robin">round-robin</option>
                 <option value="fill-first">fill-first</option>
+                <option value="quota-fill-first">quota-fill-first</option>
               </select>
             </div>
           </div>

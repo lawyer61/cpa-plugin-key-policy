@@ -77,7 +77,7 @@ Key 可以**引用**别名，不必重复填目标。多目标别名会展开成
 ```yaml
 account_binding:
   allow: ["codex-team-*.json", "openai-compatibility:corp:*"]
-  strategy: weighted-round-robin # weighted-round-robin | round-robin | fill-first
+  strategy: weighted-round-robin # weighted-round-robin | round-robin | fill-first | quota-fill-first
 ```
 
 调度器依次取账号绑定、唯一目标 group、provider、状态、正权重与最高 Priority 的交集。交集为空返回 `auth_not_bound`，不会 `Handled:false`，也不会委托 CPA 全局池。受绑定请求必须把配置的 key 放在 Header；仅 query 传 key 或 Header 凭证冲突会在访问上游前终止。
@@ -93,6 +93,16 @@ CPA 原生 key 默认完全不受影响；只有显式以 `native: true` 导入�
 - 若亲和 auth 已满、冷却、不可用或已不在绑定内，会按原 WRR/RR/fill-first 策略改选**同一允许池**里的账号；池内全部满载才返回 429，绝不跨池。
 - 并发名额与亲和缓存都是单进程内存状态，不在多 CPA 实例之间共享。热更新降低上限不会驱逐已有请求，只会阻止新请求。
 - image/video 的 `per_call` 补偿计费改为并发准入成功后扣除一次；后续上游失败仍无法退款。
+
+### Codex 额度感知 Fill First 与周期维护
+
+- 选择 `quota-fill-first` 后，插件仍先应用账号绑定、group、provider、状态、Priority、正权重和 auth 并发；只在最终合法池内读取内存额度缓存。
+- 已知可用账号按**周/月长窗口最早重置**优先；5 小时窗口只判断是否可用，不参与排序。Ready 亲和账号不会仅因另一个账号更早重置而迁移。
+- 无有效额度缓存时，在合法池内按原 Fill First 稳定降级；明确耗尽的账号不会因 TTL 或 reset 到点自动恢复，必须看到更新的正面证据。
+- `quota_check_interval` 与 `quota_cache_ttl` 独立，默认均为 `30m`。正常业务响应的额度信号优先，后台只补查缺失、过期、跨 reset 或待验证状态。
+- 自动激活默认关闭。开启后可选 `managed-pools` 或 `all-codex`；后者也覆盖只被 CPA 原生 key 使用和暂未使用的有效 Codex OAuth auth，但**绝不扩大任何 key 的业务允许池**。
+- 激活使用严格的懒窗口基线、很小的 `gpt-5.4-mini` compact 请求和后验 GET 验证；与受控业务共享 auth 并发上限，但不消耗用户 key 的 RPM/账本。未接管的原生请求仍不计入插件并发，因此该上限不是全宿主物理并发硬限制。
+- 额度与激活运行状态保存在 `<state_file>.quota-runtime.json`；Docker 应挂载 `state_file` 所在整个目录。
 
 **运行边界：** 这是纯插件控制。账号绑定流量必须保持插件启用且健康，也不能使用 CPA Home 模式，因为 Home 会在普通插件 scheduler 之前完成选择。若插件被卸载或熔断，仍留在 CPA `api-keys` 中的原生 key 会重新只受宿主全局账号池控制。若要求插件被移除时也尽量失败关闭，请使用插件签发的 key，并且绝不要把它重复放进 CPA `api-keys`。
 
@@ -165,12 +175,17 @@ plugins:
       session_affinity_max_entries: 10000
       auth_concurrency_limits:
         "codex-team-a.json": 4
+      quota_check_interval: "30m"
+      quota_cache_ttl: "30m"
+      quota_activation_enabled: false
+      quota_activation_scope: "managed-pools" # 或 all-codex
 ```
 
 说明：
 
 - 若已有 `state_file`，则以其中的 keys / 别名 / 归类 / 用量为准。
 - `global_weighted_round_robin: true` 只会让未绑定的插件 key 忽略目标 group；显式账号绑定始终保持限制。默认为 `false`。
+- `quota_activation_enabled` 默认为 `false`。若要维护宿主全部有效 Codex OAuth auth，请在面板确认风险后显式选择 `all-codex`。
 - 日常请用**网页**或管理 API 建 key 和别名；YAML 种子数据主要用于首次启动。
 - 公开文档里不要写真实管理密钥、主机名或凭证内容。
 

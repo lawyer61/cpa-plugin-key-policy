@@ -9,6 +9,8 @@ import type {
   CredentialDescriptor,
   SchedulerSettings,
   SchedulerSettingsPatch,
+  QuotaStatus,
+  QuotaWindowStatus,
 } from "../types";
 import {
   fetchAliases,
@@ -22,6 +24,7 @@ import {
   fetchCredentialDescriptors,
   fetchSchedulerSettings,
   updateSchedulerSettings,
+  fetchQuotaStatus,
 } from "../api/mappings";
 
 export default function Mapping() {
@@ -63,21 +66,24 @@ function AliasListTab() {
   const [globalWeighted, setGlobalWeighted] = useState(false);
   const [schedulerSettings, setSchedulerSettings] = useState<SchedulerSettings | null>(null);
   const [credentialDescriptors, setCredentialDescriptors] = useState<CredentialDescriptor[]>([]);
+  const [quotaStatus, setQuotaStatus] = useState<QuotaStatus | null>(null);
   const [settingsSaving, setSettingsSaving] = useState(false);
 
   const load = useCallback(async () => {
     setLoading(true);
     setError("");
     try {
-      const [list, settings, descriptors] = await Promise.all([
+      const [list, settings, descriptors, quota] = await Promise.all([
         fetchAliases(),
         fetchSchedulerSettings(),
         fetchCredentialDescriptors().catch(() => [] as CredentialDescriptor[]),
+        fetchQuotaStatus().catch(() => null as QuotaStatus | null),
       ]);
       setAliases(list);
       setSchedulerSettings(settings);
       setGlobalWeighted(settings.global_weighted_round_robin);
       setCredentialDescriptors(descriptors);
+      setQuotaStatus(quota);
     } catch (e: unknown) {
       setError(String(e));
     } finally {
@@ -120,6 +126,7 @@ function AliasListTab() {
       const settings = await updateSchedulerSettings(patch);
       setSchedulerSettings((prev) => prev ? { ...prev, ...settings } : settings);
       setGlobalWeighted(settings.global_weighted_round_robin ?? globalWeighted);
+      setQuotaStatus(await fetchQuotaStatus().catch(() => quotaStatus));
     } catch (e: unknown) {
       setError(t("mapping.runtimeSaveFailed") + ": " + String(e));
     } finally {
@@ -152,6 +159,7 @@ function AliasListTab() {
       <RuntimeSettingsPanel
         settings={schedulerSettings}
         descriptors={credentialDescriptors}
+        quotaStatus={quotaStatus}
         loading={loading}
         saving={settingsSaving}
         onSave={handleRuntimeSave}
@@ -174,12 +182,14 @@ function AliasListTab() {
 function RuntimeSettingsPanel({
   settings,
   descriptors,
+  quotaStatus,
   loading,
   saving,
   onSave,
 }: {
   settings: SchedulerSettings | null;
   descriptors: CredentialDescriptor[];
+  quotaStatus: QuotaStatus | null;
   loading: boolean;
   saving: boolean;
   onSave: (patch: SchedulerSettingsPatch) => Promise<void>;
@@ -190,12 +200,20 @@ function RuntimeSettingsPanel({
   const [authLimits, setAuthLimits] = useState<Record<string, number>>({});
   const [newAuthId, setNewAuthId] = useState("");
   const [selectedDescriptor, setSelectedDescriptor] = useState("");
+  const [quotaCheckInterval, setQuotaCheckInterval] = useState("30m");
+  const [quotaCacheTtl, setQuotaCacheTtl] = useState("30m");
+  const [quotaActivationEnabled, setQuotaActivationEnabled] = useState(false);
+  const [quotaActivationScope, setQuotaActivationScope] = useState<"managed-pools" | "all-codex">("managed-pools");
 
   useEffect(() => {
     if (!settings) return;
     setTtl(settings.session_affinity_idle_ttl_seconds ?? 0);
     setCacheCap(settings.session_affinity_max_entries ?? 0);
     setAuthLimits({ ...(settings.auth_concurrency_limits ?? {}) });
+    setQuotaCheckInterval(settings.quota_check_interval ?? "30m");
+    setQuotaCacheTtl(settings.quota_cache_ttl ?? "30m");
+    setQuotaActivationEnabled(settings.quota_activation_enabled ?? false);
+    setQuotaActivationScope(settings.quota_activation_scope ?? "managed-pools");
   }, [settings]);
 
   const configuredIds = Object.keys(authLimits).sort((a, b) => a.localeCompare(b));
@@ -224,6 +242,10 @@ function RuntimeSettingsPanel({
       auth_concurrency_limits: limits,
       session_affinity_idle_ttl_seconds: Math.max(0, Math.floor(ttl) || 0),
       session_affinity_max_entries: Math.max(0, Math.floor(cacheCap) || 0),
+      quota_check_interval: quotaCheckInterval.trim(),
+      quota_cache_ttl: quotaCacheTtl.trim(),
+      quota_activation_enabled: quotaActivationEnabled,
+      quota_activation_scope: quotaActivationScope,
     });
   };
 
@@ -338,14 +360,115 @@ function RuntimeSettingsPanel({
           </div>
         )}
       </div>
+      <div className="quota-settings">
+        <div className="runtime-auth-head">
+          <div>
+            <h3>{t("mapping.quotaTitle")}</h3>
+            <p className="muted">{t("mapping.quotaHint")}</p>
+          </div>
+        </div>
+        <div className="runtime-settings-grid">
+          <div className="form-row">
+            <label htmlFor="quota-check-interval">{t("mapping.quotaCheckInterval")}</label>
+            <input id="quota-check-interval" className="input" value={quotaCheckInterval} disabled={loading || !settings} onChange={(event) => setQuotaCheckInterval(event.target.value)} />
+          </div>
+          <div className="form-row">
+            <label htmlFor="quota-cache-ttl">{t("mapping.quotaCacheTtl")}</label>
+            <input id="quota-cache-ttl" className="input" value={quotaCacheTtl} disabled={loading || !settings} onChange={(event) => setQuotaCacheTtl(event.target.value)} />
+          </div>
+          <label className="switch quota-activation-toggle">
+            <input type="checkbox" checked={quotaActivationEnabled} disabled={loading || !settings} onChange={(event) => setQuotaActivationEnabled(event.target.checked)} />
+            <span className="track"><span className="thumb" /></span>
+            <span>{t("mapping.quotaActivationEnabled")}</span>
+          </label>
+          <div className="form-row">
+            <label htmlFor="quota-activation-scope">{t("mapping.quotaActivationScope")}</label>
+            <select id="quota-activation-scope" className="input" value={quotaActivationScope} disabled={loading || !settings || !quotaActivationEnabled} onChange={(event) => setQuotaActivationScope(event.target.value as "managed-pools" | "all-codex")}>
+              <option value="managed-pools">{t("mapping.quotaScopeManaged")}</option>
+              <option value="all-codex">{t("mapping.quotaScopeAll")}</option>
+            </select>
+          </div>
+        </div>
+        <p className="muted quota-warning">{t("mapping.quotaWarning")}</p>
+        {quotaStatus?.persistence_blocked && <div className="error">{t("mapping.quotaPersistenceBlocked")}: {quotaStatus.persistence_error}</div>}
+        {quotaStatus && (
+          <div className="quota-auth-list">
+            {quotaStatus.auths.length === 0 ? <p className="muted">{t("mapping.quotaNoAuths")}</p> : quotaStatus.auths.map((auth) => (
+              <div className="quota-auth-card" key={auth.auth_id}>
+                <div className="quota-auth-card-head">
+                  <span className="mono quota-auth-id" title={auth.auth_id}>{auth.auth_id}</span>
+                  <span className={`quota-state ${auth.availability}`}>{t(`mapping.quotaAvailability.${auth.availability}`)}</span>
+                  <span className={`quota-freshness ${auth.freshness}`}>{t(`mapping.quotaFreshness.${auth.freshness}`)}</span>
+                </div>
+                <div className="quota-scope-grid">
+                  <QuotaScopeFlag label={t("mapping.quotaObservable")} enabled={auth.observable} />
+                  <QuotaScopeFlag label={t("mapping.quotaMaintenance")} enabled={auth.in_maintenance_scope} />
+                  <QuotaScopeFlag label={t("mapping.quotaActivation")} enabled={auth.in_activation_scope} />
+                </div>
+                <div className="quota-window-grid">
+                  <QuotaWindowSummary label={t("mapping.quotaShortWindow")} window={auth.observation?.short} />
+                  <QuotaWindowSummary label={t("mapping.quotaLongWindow")} window={auth.observation?.long} />
+                </div>
+                <dl className="quota-auth-meta">
+                  <QuotaMeta label={t("mapping.quotaSource")} value={auth.observation?.source} />
+                  <QuotaMeta label={t("mapping.quotaObservedAt")} value={formatQuotaTime(auth.observation?.observed_at)} />
+                  <QuotaMeta label={t("mapping.quotaNextCheckAt")} value={formatQuotaTime(auth.next_check_at)} />
+                  <QuotaMeta label={t("mapping.quotaMaintenanceResult")} value={auth.last_result || auth.last_error || auth.exclusion_reason} />
+                  <QuotaMeta label={t("mapping.quotaActivationResult")} value={auth.activation?.status || auth.activation?.last_result || auth.activation?.last_error} />
+                  <QuotaMeta label={t("mapping.quotaControlledConcurrency")} value={`${auth.controlled_in_flight} / ${auth.activation_in_flight}`} />
+                </dl>
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
       {settings && (settings.current_concurrent_requests !== undefined || settings.session_affinity_entries !== undefined) && (
         <div className="runtime-stats muted">
           {settings.current_concurrent_requests !== undefined && <span>{t("mapping.runtimeCurrent", { n: settings.current_concurrent_requests })}</span>}
+          {settings.current_activation_requests !== undefined && <span>{t("mapping.runtimeActivationCurrent", { n: settings.current_activation_requests })}</span>}
           {settings.session_affinity_entries !== undefined && <span>{t("mapping.runtimeEntries", { n: settings.session_affinity_entries })}</span>}
         </div>
       )}
     </section>
   );
+}
+
+function QuotaScopeFlag({ label, enabled }: { label: string; enabled: boolean }) {
+  const t = useT();
+  return (
+    <span className={`quota-scope-flag ${enabled ? "enabled" : "disabled"}`}>
+      <strong>{label}</strong>
+      <span>{enabled ? t("mapping.quotaYes") : t("mapping.quotaNo")}</span>
+    </span>
+  );
+}
+
+function QuotaWindowSummary({ label, window }: { label: string; window?: QuotaWindowStatus }) {
+  const t = useT();
+  const used = typeof window?.used_percent === "number" ? `${window.used_percent}%` : "—";
+  return (
+    <div className="quota-window-card">
+      <strong>{label}</strong>
+      <span>{window?.kind ? t(`mapping.quotaWindowKind.${window.kind}`) : "—"}</span>
+      <span>{t("mapping.quotaUsedPercent")}: {used}</span>
+      <span>{t("mapping.quotaResetAt")}: {formatQuotaTime(window?.reset_at)}</span>
+    </div>
+  );
+}
+
+function QuotaMeta({ label, value }: { label: string; value?: string }) {
+  return (
+    <div>
+      <dt>{label}</dt>
+      <dd>{value || "—"}</dd>
+    </div>
+  );
+}
+
+function formatQuotaTime(value?: string): string {
+  if (!value) return "—";
+  const parsed = new Date(value);
+  return Number.isNaN(parsed.getTime()) ? "—" : parsed.toLocaleString();
 }
 
 function AliasCard({ alias, onDelete, onEdit }: { alias: AliasMapping; onDelete: (n: string) => void; onEdit: (n: string) => void }) {

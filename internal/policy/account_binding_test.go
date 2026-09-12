@@ -30,6 +30,10 @@ func TestAccountBindingNormalizesAndMatchesCaseSensitively(t *testing.T) {
 	if err := normalizeAccountBinding(&AccountBinding{Allow: []string{"["}}); err == nil {
 		t.Fatal("invalid glob was accepted")
 	}
+	quota := &AccountBinding{Allow: []string{"codex-*"}, Strategy: "qff"}
+	if err := normalizeAccountBinding(quota); err != nil || quota.Strategy != BindingStrategyQuotaFillFirst {
+		t.Fatalf("quota strategy = %#v, err=%v", quota, err)
+	}
 }
 
 func TestAccountBindingEmptyAllowIsRestrictive(t *testing.T) {
@@ -45,7 +49,7 @@ func TestAccountBindingEmptyAllowIsRestrictive(t *testing.T) {
 func TestHeaderCredentialsExposeConflicts(t *testing.T) {
 	headers := http.Header{
 		"Authorization": {"Bearer key-a"},
-		"X-Api-Key":    {"key-b"},
+		"X-Api-Key":     {"key-b"},
 	}
 	values := HeaderCredentials(headers)
 	if len(values) != 2 || values[0] != "key-a" || values[1] != "key-b" {

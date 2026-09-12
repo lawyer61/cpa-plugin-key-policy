@@ -14,6 +14,7 @@ const (
 	BindingStrategyWeightedRoundRobin = "weighted-round-robin"
 	BindingStrategyRoundRobin         = "round-robin"
 	BindingStrategyFillFirst          = "fill-first"
+	BindingStrategyQuotaFillFirst     = "quota-fill-first"
 	CallerScopeMetadataKey            = "caller_scope"
 )
 
@@ -53,8 +54,10 @@ func normalizeAccountBinding(binding *AccountBinding) error {
 		binding.Strategy = BindingStrategyRoundRobin
 	case "fill-first", "fillfirst", "ff":
 		binding.Strategy = BindingStrategyFillFirst
+	case "quota-fill-first", "quotafillfirst", "qff":
+		binding.Strategy = BindingStrategyQuotaFillFirst
 	default:
-		return errors.New("strategy must be weighted-round-robin, round-robin, or fill-first")
+		return errors.New("strategy must be weighted-round-robin, round-robin, fill-first, or quota-fill-first")
 	}
 	return nil
 }

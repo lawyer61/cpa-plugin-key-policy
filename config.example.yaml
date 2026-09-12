@@ -19,6 +19,13 @@ plugins:
       # Exact CPA auth candidate IDs only. Missing/zero means unlimited.
       auth_concurrency_limits:
         "codex-team-a.json": 4
+      # Passive quota evidence is primary. Background GET only reviews missing,
+      # stale, reset-crossed, or activation-verification state.
+      quota_check_interval: "30m"
+      quota_cache_ttl: "30m"
+      # Safe default: no compact activation requests until explicitly enabled.
+      quota_activation_enabled: false
+      quota_activation_scope: "managed-pools" # managed-pools | all-codex
 
       # Prefer creating keys/aliases/classify rules via Web UI or Management API.
       # Seed keys below are mainly for first boot when state_file does not exist.
@@ -36,7 +43,7 @@ plugins:
           account_binding:
             allow:
               - "codex-team-*.json"
-            strategy: "weighted-round-robin" # weighted-round-robin | round-robin | fill-first
+            strategy: "quota-fill-first" # weighted-round-robin | round-robin | fill-first | quota-fill-first
           # Either bind models directly…
           models:
             - alias: "fast"

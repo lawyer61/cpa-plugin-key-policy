@@ -48,7 +48,7 @@ export interface UsageSummary {
 
 export interface AccountBinding {
   allow: string[];
-  strategy?: "weighted-round-robin" | "round-robin" | "fill-first";
+  strategy?: "weighted-round-robin" | "round-robin" | "fill-first" | "quota-fill-first";
 }
 
 export interface KeyPublic {
@@ -166,8 +166,13 @@ export interface SchedulerSettings {
   auth_concurrency_limits: Record<string, number>;
   session_affinity_idle_ttl_seconds: number;
   session_affinity_max_entries: number;
+  quota_check_interval: string;
+  quota_cache_ttl: string;
+  quota_activation_enabled: boolean;
+  quota_activation_scope: "managed-pools" | "all-codex";
   // Optional runtime counters returned by newer plugin builds.
   current_concurrent_requests?: number;
+  current_activation_requests?: number;
   session_affinity_entries?: number;
 }
 
@@ -177,7 +182,71 @@ export type SchedulerSettingsPatch = Partial<Pick<
   | "auth_concurrency_limits"
   | "session_affinity_idle_ttl_seconds"
   | "session_affinity_max_entries"
+  | "quota_check_interval"
+  | "quota_cache_ttl"
+  | "quota_activation_enabled"
+  | "quota_activation_scope"
 >>;
+
+export interface QuotaWindowStatus {
+  kind: "five_hour" | "weekly" | "monthly" | "unknown";
+  used_percent?: number;
+  window_seconds?: number;
+  reset_at?: string;
+  exhausted?: boolean;
+}
+
+export interface QuotaAuthStatus {
+  auth_id: string;
+  provider: string;
+  status?: string;
+  observable: boolean;
+  in_managed_pool: boolean;
+  in_maintenance_scope: boolean;
+  in_activation_scope: boolean;
+  exclusion_reason?: string;
+  availability: "ready" | "unknown" | "exhausted";
+  freshness: "fresh" | "stale" | "unknown";
+  observation?: {
+    plan_type?: string;
+    source?: string;
+    observed_at?: string;
+    received_at?: string;
+    short?: QuotaWindowStatus;
+    long?: QuotaWindowStatus;
+    explicit_exhausted?: boolean;
+    explicit_reset_at?: string;
+    explicit_reason?: string;
+  };
+  last_roster_seen_at?: string;
+  last_check_at?: string;
+  next_check_at?: string;
+  last_result?: string;
+  last_error?: string;
+  activation?: {
+    status?: string;
+    attempts?: number;
+    last_result?: string;
+    last_error?: string;
+    total_tokens?: number;
+  };
+  controlled_in_flight: number;
+  activation_in_flight: number;
+}
+
+export interface QuotaStatus {
+  quota_check_interval: string;
+  quota_cache_ttl: string;
+  quota_activation_enabled: boolean;
+  quota_activation_scope: "managed-pools" | "all-codex";
+  persistence_blocked: boolean;
+  persistence_error?: string;
+  last_roster_sync?: string;
+  last_round_at?: string;
+  observed_auth_count: number;
+  controlled_activation_current: number;
+  auths: QuotaAuthStatus[];
+}
 
 export interface LookupLimits {
   rpm: number;

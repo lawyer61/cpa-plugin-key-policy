@@ -10,11 +10,13 @@ import (
 // limit during a hot reconfigure immediately gates new work without forgetting
 // already occupied slots.
 type concurrencyTracker struct {
-	mu         sync.Mutex
-	requests   map[string]*requestConcurrencyLease
-	keyCounts  map[string]int
-	authCounts map[string]int
-	accepting  bool
+	mu                   sync.Mutex
+	requests             map[string]*requestConcurrencyLease
+	activations          map[string]string
+	keyCounts            map[string]int
+	authCounts           map[string]int
+	authActivationCounts map[string]int
+	accepting            bool
 }
 
 type requestConcurrencyLease struct {
@@ -24,17 +26,21 @@ type requestConcurrencyLease struct {
 }
 
 type concurrencySnapshot struct {
-	Total int
-	Keys  map[string]int
-	Auths map[string]int
+	Total           int
+	ActivationTotal int
+	Keys            map[string]int
+	Auths           map[string]int
+	AuthActivations map[string]int
 }
 
 func newConcurrencyTracker() *concurrencyTracker {
 	return &concurrencyTracker{
-		requests:   make(map[string]*requestConcurrencyLease),
-		keyCounts:  make(map[string]int),
-		authCounts: make(map[string]int),
-		accepting:  true,
+		requests:             make(map[string]*requestConcurrencyLease),
+		activations:          make(map[string]string),
+		keyCounts:            make(map[string]int),
+		authCounts:           make(map[string]int),
+		authActivationCounts: make(map[string]int),
+		accepting:            true,
 	}
 }
 
@@ -131,6 +137,59 @@ func (t *concurrencyTracker) authAvailable(authID string, limit int) bool {
 	return t.authCounts[authID] < limit
 }
 
+// acquireActivation reserves an auth-only slot for one internal compact
+// activation request. It shares authCounts with controlled business traffic
+// but never creates a key lease or consumes a key limit.
+func (t *concurrencyTracker) acquireActivation(leaseID, authID string, limit int) (int, bool) {
+	if t == nil {
+		return 0, false
+	}
+	leaseID = strings.TrimSpace(leaseID)
+	authID = strings.TrimSpace(authID)
+	if leaseID == "" || authID == "" {
+		return 0, false
+	}
+	if limit < 0 {
+		limit = 0
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if !t.accepting {
+		return t.authCounts[authID], false
+	}
+	if existing, ok := t.activations[leaseID]; ok {
+		return t.authCounts[authID], existing == authID
+	}
+	current := t.authCounts[authID]
+	if limit > 0 && current >= limit {
+		return current, false
+	}
+	t.activations[leaseID] = authID
+	t.authCounts[authID] = current + 1
+	t.authActivationCounts[authID]++
+	return current + 1, true
+}
+
+func (t *concurrencyTracker) releaseActivation(leaseID string) bool {
+	if t == nil {
+		return false
+	}
+	leaseID = strings.TrimSpace(leaseID)
+	if leaseID == "" {
+		return false
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	authID, ok := t.activations[leaseID]
+	if !ok {
+		return false
+	}
+	delete(t.activations, leaseID)
+	decrementCount(t.authCounts, authID)
+	decrementCount(t.authActivationCounts, authID)
+	return true
+}
+
 func (t *concurrencyTracker) requestKey(requestID string) string {
 	if t == nil {
 		return ""
@@ -200,18 +259,22 @@ func (t *concurrencyTracker) authCurrent(authID string) int {
 }
 
 func (t *concurrencyTracker) snapshot() concurrencySnapshot {
-	out := concurrencySnapshot{Keys: map[string]int{}, Auths: map[string]int{}}
+	out := concurrencySnapshot{Keys: map[string]int{}, Auths: map[string]int{}, AuthActivations: map[string]int{}}
 	if t == nil {
 		return out
 	}
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	out.Total = len(t.requests)
+	out.ActivationTotal = len(t.activations)
 	for key, value := range t.keyCounts {
 		out.Keys[key] = value
 	}
 	for key, value := range t.authCounts {
 		out.Auths[key] = value
+	}
+	for key, value := range t.authActivationCounts {
+		out.AuthActivations[key] = value
 	}
 	return out
 }

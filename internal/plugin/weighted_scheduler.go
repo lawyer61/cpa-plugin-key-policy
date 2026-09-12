@@ -5,6 +5,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 )
 
 const schedulerStateCapacity = 4096
@@ -12,6 +13,62 @@ const maxSchedulerWeight = 1_000_000
 
 type smoothWeightedState struct {
 	current map[string]int64
+}
+
+func quotaStrategyApplies(req SchedulerPickRequest, candidates []SchedulerAuthCandidate) bool {
+	requested := strings.ToLower(strings.TrimSpace(schedulerRequestProvider(req)))
+	if requested != "" && requested != "mixed" {
+		return requested == "codex"
+	}
+	if len(candidates) == 0 {
+		return false
+	}
+	for _, candidate := range candidates {
+		if !strings.EqualFold(strings.TrimSpace(candidate.Provider), "codex") {
+			return false
+		}
+	}
+	return true
+}
+
+func quotaCandidateClasses(cache *quotaCache, candidates []SchedulerAuthCandidate, ttl time.Duration, now time.Time) (ready, unknown []SchedulerAuthCandidate) {
+	for _, candidate := range candidates {
+		class, _ := cache.classify(candidate.ID, ttl, now)
+		switch class {
+		case quotaAvailabilityReady:
+			ready = append(ready, candidate)
+		case quotaAvailabilityUnknown:
+			unknown = append(unknown, candidate)
+		}
+	}
+	return ready, unknown
+}
+
+func pickQuotaFillFirst(cache *quotaCache, req SchedulerPickRequest, candidates []SchedulerAuthCandidate) SchedulerAuthCandidate {
+	ordered := append([]SchedulerAuthCandidate(nil), candidates...)
+	sort.Slice(ordered, func(i, j int) bool {
+		left, leftOK := cache.get(ordered[i].ID)
+		right, rightOK := cache.get(ordered[j].ID)
+		if leftOK && rightOK && left.Long != nil && right.Long != nil {
+			if !left.Long.ResetAt.Equal(right.Long.ResetAt) {
+				if left.Long.ResetAt.IsZero() {
+					return false
+				}
+				if right.Long.ResetAt.IsZero() {
+					return true
+				}
+				return left.Long.ResetAt.Before(right.Long.ResetAt)
+			}
+			if left.Long.remainingPercent() != right.Long.remainingPercent() {
+				return left.Long.remainingPercent() > right.Long.remainingPercent()
+			}
+		}
+		return ordered[i].ID < ordered[j].ID
+	})
+	if len(ordered) == 0 {
+		return pickFillFirst(req, candidates)
+	}
+	return ordered[0]
 }
 
 func (a *App) clearSchedulerState() {

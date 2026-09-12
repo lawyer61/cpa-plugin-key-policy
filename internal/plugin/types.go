@@ -47,7 +47,7 @@ const (
 const (
 	PluginID   = "cpa-key-policy"
 	PluginName = "cpa-key-policy"
-	Version    = "0.6.0"
+	Version    = "0.7.0"
 )
 
 type Envelope struct {
@@ -235,6 +235,16 @@ type ResponseInterceptRequest struct {
 // entry point: the host never invokes response.intercept_after on streaming
 // responses, so the plugin cannot rely on that alone to bill streams.
 type UsageHandleRequest struct {
+	// Provider/AuthID/AuthIndex/ResponseHeaders identify and carry passive
+	// credential-level quota evidence. They are present for native and
+	// plugin-controlled traffic alike on current CPA hosts.
+	Provider        string       `json:"Provider"`
+	Source          string       `json:"Source"`
+	AuthID          string       `json:"AuthID"`
+	AuthIndex       string       `json:"AuthIndex"`
+	RequestedAt     time.Time    `json:"RequestedAt"`
+	Failure         UsageFailure `json:"Failure"`
+	ResponseHeaders http.Header  `json:"ResponseHeaders"`
 	// Model is the resolved upstream model id.
 	Model string `json:"Model"`
 	// Alias is the client-requested model name (what the caller passed in the
@@ -246,6 +256,11 @@ type UsageHandleRequest struct {
 	APIKey string      `json:"APIKey"`
 	Failed bool        `json:"Failed"`
 	Detail UsageDetail `json:"Detail"`
+}
+
+type UsageFailure struct {
+	StatusCode int    `json:"StatusCode"`
+	Body       string `json:"Body"`
 }
 
 // UsageDetail mirrors CPA's usage token breakdown. Only the fields we bill on.

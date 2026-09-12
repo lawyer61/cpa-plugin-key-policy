@@ -165,7 +165,7 @@ func TestBoundRequestInterceptorRejectsQueryOnlyAndConflicts(t *testing.T) {
 		Metadata: metadata,
 		Headers: http.Header{
 			"Authorization": {"Bearer " + plain},
-			"X-Api-Key":    {"different"},
+			"X-Api-Key":     {"different"},
 		},
 	})
 	if !conflict.Terminate || conflict.StatusCode != http.StatusBadRequest || !strings.Contains(string(conflict.ResponseBody), "credential_conflict") {
