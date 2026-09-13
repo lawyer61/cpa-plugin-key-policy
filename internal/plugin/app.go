@@ -910,7 +910,7 @@ func (a *App) managementRegistration() ManagementRegistrationResponse {
 			{Method: http.MethodGet, Path: base + "/status", Description: "Show cpa-key-policy runtime status."},
 			{Method: http.MethodGet, Path: base + "/settings", Description: "Show scheduler settings."},
 			{Method: http.MethodPatch, Path: base + "/settings", Description: "Update scheduler settings."},
-			{Method: http.MethodGet, Path: base + "/quota", Description: "Show Codex quota observation and maintenance state."},
+			{Method: http.MethodGet, Path: base + "/quota-status", Description: "Show Codex quota observation and maintenance state."},
 			{Method: http.MethodGet, Path: base + "/aliases", Description: "List the global alias mapping table."},
 			{Method: http.MethodPost, Path: base + "/aliases", Description: "Create or update a global alias mapping."},
 			{Method: http.MethodDelete, Path: base + "/aliases", Description: "Delete a global alias mapping by name."},
@@ -981,7 +981,7 @@ func (a *App) handleManagement(raw []byte) ([]byte, error) {
 		return OKEnvelope(a.schedulerSettings())
 	case req.Method == http.MethodPatch && path == base+"/settings":
 		return OKEnvelope(a.updateSchedulerSettings(req.Body))
-	case req.Method == http.MethodGet && path == base+"/quota":
+	case req.Method == http.MethodGet && path == base+"/quota-status":
 		return OKEnvelope(jsonResponse(http.StatusOK, a.quota.status()))
 	case req.Method == http.MethodGet && path == base+"/aliases":
 		return OKEnvelope(jsonResponse(http.StatusOK, map[string]any{"aliases": a.store.AliasesSnapshot()}))

@@ -83,7 +83,7 @@ describe("调度设置接口", () => {
     get.mockResolvedValue({ data: quota });
     await expect(fetchQuotaStatus()).resolves.toEqual(quota);
     expect(get).toHaveBeenCalledWith(
-      "/v0/management/plugins/cpa-key-policy/quota",
+      "/v0/management/plugins/cpa-key-policy/quota-status",
     );
   });
 });

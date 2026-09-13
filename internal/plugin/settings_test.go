@@ -37,7 +37,7 @@ func TestSchedulerSettingsManagementAndRestartPersistence(t *testing.T) {
 
 func TestQuotaManagementRouteReturnsRuntimeStatus(t *testing.T) {
 	app := configureSettingsApp(t, filepath.Join(t.TempDir(), "state.json"))
-	response := callManagementForTest(t, app, http.MethodGet, "/v0/management/plugins/cpa-key-policy/quota", nil)
+	response := callManagementForTest(t, app, http.MethodGet, "/v0/management/plugins/cpa-key-policy/quota-status", nil)
 	if response.StatusCode != http.StatusOK {
 		t.Fatalf("quota status = %d, body=%s", response.StatusCode, response.Body)
 	}
@@ -52,6 +52,23 @@ func TestQuotaManagementRouteReturnsRuntimeStatus(t *testing.T) {
 	}
 	if payload.QuotaCheckInterval != "30m" || payload.QuotaCacheTTL != "30m" || payload.QuotaActivationEnabled || payload.QuotaActivationScope != "managed-pools" {
 		t.Fatalf("quota payload = %+v", payload)
+	}
+}
+
+func TestQuotaManagementRegistrationAvoidsCPAReservedQuotaRoute(t *testing.T) {
+	const reservedPath = "/plugins/cpa-key-policy/quota"
+	const statusPath = "/plugins/cpa-key-policy/quota-status"
+	foundStatus := false
+	for _, route := range configureSettingsApp(t, filepath.Join(t.TempDir(), "state.json")).managementRegistration().Routes {
+		if route.Path == reservedPath {
+			t.Fatalf("quota status route conflicts with CPA v7.2.159 reserved path %q", reservedPath)
+		}
+		if route.Method == http.MethodGet && route.Path == statusPath {
+			foundStatus = true
+		}
+	}
+	if !foundStatus {
+		t.Fatalf("quota status route %q is not registered", statusPath)
 	}
 }
 

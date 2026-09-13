@@ -48,7 +48,7 @@ export async function updateSchedulerSettings(
 
 export async function fetchQuotaStatus(): Promise<QuotaStatus> {
   const c = apiClient();
-  const { data } = await c.get<QuotaStatus>(pluginPath("/quota"));
+  const { data } = await c.get<QuotaStatus>(pluginPath("/quota-status"));
   return data;
 }
 
