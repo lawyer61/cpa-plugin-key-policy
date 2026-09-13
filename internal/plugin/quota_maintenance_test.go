@@ -163,6 +163,131 @@ func TestQuotaAllCodexIncludesIdleAuthWithoutQuotaKey(t *testing.T) {
 	}
 }
 
+func TestQuotaLoopReconfigureDoesNotPostponeDueRound(t *testing.T) {
+	app := configuredQuotaTestApp(t)
+	enabled := true
+	scope := "all-codex"
+	if _, err := app.store.UpdateRuntimeSettings(policy.RuntimeSettingsPatch{
+		QuotaActivationEnabled: &enabled,
+		QuotaActivationScope:   &scope,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	host := newFakeQuotaHost(now)
+	host.getResponses = []HostHTTPResponse{
+		{StatusCode: http.StatusOK, Body: quotaBody(now, 0)},
+		{StatusCode: http.StatusOK, Body: quotaBody(now.Add(150*time.Second), 0)},
+		{StatusCode: http.StatusOK, Body: quotaBody(now.Add(150*time.Second), 1)},
+	}
+	app.quota.testDurations = func() (time.Duration, time.Duration) {
+		return 80 * time.Millisecond, 80 * time.Millisecond
+	}
+	app.quota.verifyDelay = 0
+	app.quota.setHostClient(host)
+	t.Cleanup(app.Shutdown)
+
+	deadline := time.Now().Add(225 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		app.quota.configure(app.store.StatePath(), false)
+		time.Sleep(15 * time.Millisecond)
+	}
+	_, get, post := host.counts()
+	if get < 3 || post != 1 {
+		t.Fatalf("continuous reconfigure counts: GET=%d POST=%d, want at least 3 GETs and exactly 1 POST", get, post)
+	}
+	app.quota.mu.Lock()
+	lastRoundAt := app.quota.runtime.LastRoundAt
+	activation := app.quota.runtime.Auths[host.entries[0].ID].Activation
+	app.quota.mu.Unlock()
+	if lastRoundAt.IsZero() {
+		t.Fatal("quota round completed no work after continuous reconfigure")
+	}
+	if activation.Status != "confirmed" {
+		t.Fatalf("activation status = %q, want confirmed", activation.Status)
+	}
+}
+
+func TestQuotaRoundDeadlineOnlyMovesEarlier(t *testing.T) {
+	now := time.Date(2026, 9, 13, 10, 0, 0, 0, time.UTC)
+	original := now.Add(30 * time.Minute)
+	tests := []struct {
+		name             string
+		current          time.Time
+		previousInterval time.Duration
+		nextInterval     time.Duration
+		previouslyNeeded bool
+		needed           bool
+		restart          bool
+		at               time.Time
+		want             time.Time
+	}{
+		{name: "enable waits one interval", nextInterval: 30 * time.Minute, needed: true, at: now, want: original},
+		{name: "same interval keeps deadline", current: original, previousInterval: 30 * time.Minute, nextInterval: 30 * time.Minute, previouslyNeeded: true, needed: true, at: now.Add(10 * time.Minute), want: original},
+		{name: "longer interval cannot postpone", current: original, previousInterval: 30 * time.Minute, nextInterval: time.Hour, previouslyNeeded: true, needed: true, at: now.Add(10 * time.Minute), want: original},
+		{name: "shorter interval may advance", current: original, previousInterval: 30 * time.Minute, nextInterval: 5 * time.Minute, previouslyNeeded: true, needed: true, at: now.Add(10 * time.Minute), want: now.Add(15 * time.Minute)},
+		{name: "due deadline stays due", current: original, previousInterval: 30 * time.Minute, nextInterval: time.Hour, previouslyNeeded: true, needed: true, at: now.Add(31 * time.Minute), want: original},
+		{name: "explicit re-enable restarts full interval", current: original, previousInterval: 30 * time.Minute, nextInterval: 30 * time.Minute, previouslyNeeded: true, needed: true, restart: true, at: now.Add(10 * time.Minute), want: now.Add(40 * time.Minute)},
+		{name: "disable clears deadline", current: original, previousInterval: 30 * time.Minute, nextInterval: 30 * time.Minute, previouslyNeeded: true, at: now.Add(10 * time.Minute)},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			got := quotaRoundDeadline(test.current, test.previousInterval, test.nextInterval, test.previouslyNeeded, test.needed, test.restart, test.at)
+			if !got.Equal(test.want) {
+				t.Fatalf("deadline = %v, want %v", got, test.want)
+			}
+		})
+	}
+}
+
+func TestQuotaConfigureKeepsRestartRequestWhenWakeIsAlreadyQueued(t *testing.T) {
+	app := configuredQuotaTestApp(t)
+	for {
+		select {
+		case <-app.quota.configCh:
+		default:
+			goto drained
+		}
+	}
+drained:
+	app.quota.configure(app.store.StatePath(), false)
+	app.quota.configure(app.store.StatePath(), true)
+	if !app.quota.takeRestartRoundDeadline() {
+		t.Fatal("coalesced config wake dropped the explicit re-enable deadline restart")
+	}
+}
+
+func TestPluginReconfigureRestartsDeadlineOnlyWhenQuotaFeatureBecomesNeeded(t *testing.T) {
+	app := NewApp()
+	configure := func(statePath string, activationEnabled bool) {
+		t.Helper()
+		configYAML := []byte("enabled: true\nstate_file: \"" + filepath.ToSlash(statePath) + "\"\nquota_activation_enabled: " + strconv.FormatBool(activationEnabled) + "\nkeys: []\n")
+		raw, err := json.Marshal(LifecycleRequest{ConfigYAML: configYAML})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := app.HandleMethod(MethodPluginReconfigure, raw); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	configure(filepath.Join(t.TempDir(), "disabled.json"), false)
+	if app.quota.takeRestartRoundDeadline() {
+		t.Fatal("disabled quota feature requested a deadline restart")
+	}
+
+	enabledPath := filepath.Join(t.TempDir(), "enabled.json")
+	configure(enabledPath, true)
+	if !app.quota.takeRestartRoundDeadline() {
+		t.Fatal("false-to-true plugin reconfigure did not request a full deadline restart")
+	}
+
+	configure(enabledPath, true)
+	if app.quota.takeRestartRoundDeadline() {
+		t.Fatal("ordinary enabled reconfigure requested another full deadline restart")
+	}
+}
+
 func TestQuotaRosterRequiresConfirmedCredentialsAndMatchingRouteGroup(t *testing.T) {
 	app, _ := configureBoundApp(t, "quota-fill-first", false)
 	now := time.Date(2026, 9, 12, 10, 0, 0, 0, time.UTC)

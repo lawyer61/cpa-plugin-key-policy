@@ -30,25 +30,27 @@ const (
 )
 
 type quotaManager struct {
-	store       *policy.Store
-	concurrency *concurrencyTracker
-	cache       *quotaCache
-	now         func() time.Time
-	verifyDelay time.Duration
+	store         *policy.Store
+	concurrency   *concurrencyTracker
+	cache         *quotaCache
+	now           func() time.Time
+	verifyDelay   time.Duration
+	testDurations func() (time.Duration, time.Duration)
 
-	mu                 sync.Mutex
-	host               HostClient
-	runtime            quotaRuntimeDocument
-	runtimeStore       *quotaRuntimeStore
-	persistenceBlocked bool
-	persistenceError   string
-	lastError          string
-	configured         bool
-	started            bool
-	stopped            bool
-	stopCh             chan struct{}
-	doneCh             chan struct{}
-	configCh           chan struct{}
+	mu                   sync.Mutex
+	host                 HostClient
+	runtime              quotaRuntimeDocument
+	runtimeStore         *quotaRuntimeStore
+	persistenceBlocked   bool
+	persistenceError     string
+	lastError            string
+	restartRoundDeadline bool
+	configured           bool
+	started              bool
+	stopped              bool
+	stopCh               chan struct{}
+	doneCh               chan struct{}
+	configCh             chan struct{}
 }
 
 func newQuotaManager(store *policy.Store, concurrency *concurrencyTracker, now func() time.Time) *quotaManager {
@@ -82,7 +84,7 @@ func (m *quotaManager) setHostClient(host HostClient) {
 	m.mu.Unlock()
 }
 
-func (m *quotaManager) configure(statePath string) {
+func (m *quotaManager) configure(statePath string, restartDeadline bool) {
 	if m == nil {
 		return
 	}
@@ -90,6 +92,9 @@ func (m *quotaManager) configure(statePath string) {
 	m.mu.Lock()
 	changed := m.runtimeStore == nil || m.runtimeStore.path != path
 	m.configured = true
+	if restartDeadline {
+		m.restartRoundDeadline = true
+	}
 	m.mu.Unlock()
 	if changed {
 		m.loadRuntime(path)
@@ -140,29 +145,104 @@ func (m *quotaManager) loop() {
 	// A local roster sync is allowed at startup, but upstream GET/POST waits for
 	// the first configured interval so an upgrade cannot create a startup burst.
 	m.syncRosterOnly()
+	interval, _ := m.durations()
+	needed := m.featureNeeded()
+	nextRoundAt := time.Time{}
+	if needed {
+		nextRoundAt = m.now().Add(interval)
+	}
 	for {
-		interval, _ := m.durations()
-		timer := time.NewTimer(interval)
+		var timer *time.Timer
+		var timerCh <-chan time.Time
+		if !nextRoundAt.IsZero() {
+			wait := nextRoundAt.Sub(m.now())
+			if wait < 0 {
+				wait = 0
+			}
+			timer = time.NewTimer(wait)
+			timerCh = timer.C
+		}
 		select {
 		case <-m.stopCh:
-			if !timer.Stop() {
-				select {
-				case <-timer.C:
-				default:
-				}
-			}
+			stopQuotaTimer(timer)
 			return
 		case <-m.configCh:
-			if !timer.Stop() {
-				select {
-				case <-timer.C:
-				default:
+			stopQuotaTimer(timer)
+			m.syncRosterOnly()
+			// CPA reconfigures plugins for ordinary auth roster changes. Preserve
+			// the existing absolute deadline so those updates cannot starve the
+			// maintenance round by repeatedly restarting a full interval.
+			nextInterval, _ := m.durations()
+			nextNeeded := m.featureNeeded()
+			now := m.now()
+			restartDeadline := m.takeRestartRoundDeadline()
+			nextRoundAt = quotaRoundDeadline(nextRoundAt, interval, nextInterval, needed, nextNeeded, restartDeadline, now)
+			interval = nextInterval
+			needed = nextNeeded
+			if needed && !now.Before(nextRoundAt) {
+				m.runRound()
+				interval, _ = m.durations()
+				needed = m.featureNeeded()
+				if needed {
+					nextRoundAt = m.now().Add(interval)
+				} else {
+					nextRoundAt = time.Time{}
 				}
 			}
-			m.syncRosterOnly()
-		case <-timer.C:
+		case <-timerCh:
 			m.runRound()
+			interval, _ = m.durations()
+			needed = m.featureNeeded()
+			if needed {
+				nextRoundAt = m.now().Add(interval)
+			} else {
+				nextRoundAt = time.Time{}
+			}
 		}
+	}
+}
+
+func (m *quotaManager) featureNeeded() bool {
+	return quotaFeatureNeeded(m.store.RuntimeSettings(), m.store.Keys())
+}
+
+func (m *quotaManager) takeRestartRoundDeadline() bool {
+	m.mu.Lock()
+	restart := m.restartRoundDeadline
+	m.restartRoundDeadline = false
+	m.mu.Unlock()
+	return restart
+}
+
+func quotaRoundDeadline(current time.Time, previousInterval, nextInterval time.Duration, previouslyNeeded, needed, restart bool, now time.Time) time.Time {
+	if !needed {
+		return time.Time{}
+	}
+	if restart {
+		return now.Add(nextInterval)
+	}
+	if !previouslyNeeded || current.IsZero() {
+		return now.Add(nextInterval)
+	}
+	if !current.After(now) {
+		return current
+	}
+	if nextInterval < previousInterval {
+		candidate := now.Add(nextInterval)
+		if candidate.Before(current) {
+			return candidate
+		}
+	}
+	return current
+}
+
+func stopQuotaTimer(timer *time.Timer) {
+	if timer == nil || timer.Stop() {
+		return
+	}
+	select {
+	case <-timer.C:
+	default:
 	}
 }
 
@@ -190,6 +270,9 @@ func (m *quotaManager) shutdown() {
 }
 
 func (m *quotaManager) durations() (time.Duration, time.Duration) {
+	if m.testDurations != nil {
+		return m.testDurations()
+	}
 	settings := m.store.RuntimeSettings()
 	interval, err := time.ParseDuration(settings.QuotaCheckInterval)
 	if err != nil || interval < time.Minute {

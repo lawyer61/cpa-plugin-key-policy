@@ -465,10 +465,11 @@ function QuotaMeta({ label, value }: { label: string; value?: string }) {
   );
 }
 
-function formatQuotaTime(value?: string): string {
+export function formatQuotaTime(value?: string): string {
   if (!value) return "—";
   const parsed = new Date(value);
-  return Number.isNaN(parsed.getTime()) ? "—" : parsed.toLocaleString();
+  if (Number.isNaN(parsed.getTime()) || parsed.getUTCFullYear() <= 1) return "—";
+  return parsed.toLocaleString();
 }
 
 function AliasCard({ alias, onDelete, onEdit }: { alias: AliasMapping; onDelete: (n: string) => void; onEdit: (n: string) => void }) {

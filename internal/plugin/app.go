@@ -116,10 +116,13 @@ func (a *App) configure(raw []byte) error {
 	if err != nil {
 		return err
 	}
+	previousSettings := a.store.RuntimeSettings()
+	previousKeys := a.store.Keys()
 	if err := a.store.Configure(cfg); err != nil {
 		return err
 	}
 	settings := a.store.RuntimeSettings()
+	keys := a.store.Keys()
 	a.affinity.configure(time.Duration(settings.SessionAffinityIdleTTLSeconds)*time.Second, settings.SessionAffinityMaxEntries)
 	// Register the classify cache clear callback, then clear once for safety.
 	a.store.SetOnClassifyRulesChanged(func() {
@@ -130,7 +133,8 @@ func (a *App) configure(raw []byte) error {
 	a.clearSchedulerState()
 	a.store.StartUsageFlusher()
 	if a.quota != nil {
-		a.quota.configure(a.store.StatePath())
+		restartQuotaDeadline := !quotaFeatureNeeded(previousSettings, previousKeys) && quotaFeatureNeeded(settings, keys)
+		a.quota.configure(a.store.StatePath(), restartQuotaDeadline)
 	}
 	return nil
 }
@@ -1044,6 +1048,8 @@ func (a *App) updateSchedulerSettings(body []byte) ManagementResponse {
 		request.QuotaActivationEnabled == nil && request.QuotaActivationScope == nil {
 		return jsonError(http.StatusBadRequest, "missing_setting", "缺少可更新的调度设置")
 	}
+	previous := a.store.RuntimeSettings()
+	keys := a.store.Keys()
 	settings, err := a.store.UpdateRuntimeSettings(policy.RuntimeSettingsPatch{
 		GlobalWeightedRoundRobin:      request.GlobalWeightedRoundRobin,
 		AuthConcurrencyLimits:         request.AuthConcurrencyLimits,
@@ -1062,7 +1068,8 @@ func (a *App) updateSchedulerSettings(body []byte) ManagementResponse {
 	}
 	a.affinity.configure(time.Duration(settings.SessionAffinityIdleTTLSeconds)*time.Second, settings.SessionAffinityMaxEntries)
 	a.clearSchedulerState()
-	a.quota.configure(a.store.StatePath())
+	restartQuotaDeadline := !quotaFeatureNeeded(previous, keys) && quotaFeatureNeeded(settings, keys)
+	a.quota.configure(a.store.StatePath(), restartQuotaDeadline)
 	return a.schedulerSettings()
 }
 
