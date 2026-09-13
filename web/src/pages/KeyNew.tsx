@@ -19,11 +19,17 @@ export default function KeyNew() {
   // merge it into the form's initial models. Pricing rows for newly-picked
   // aliases start at 0; preserved aliases keep their existing rows via
   // KeyForm's price-map init from `initial.models`.
-  const picked = (loc.state as { pickedModels?: ModelRule[] } | null)?.pickedModels;
+  const pickerState = loc.state as { pickedModels?: ModelRule[]; keyDraft?: KeyPublic } | null;
+  const picked = pickerState?.pickedModels;
   const initial = useMemo<KeyPublic | undefined>(
-    () => (picked ? ({ id: "", name: "", enabled: true, rpm: 0, models: picked, daily_limit_usd: 0, weekly_limit_usd: 0,
-        max_concurrent_requests: 0, current_concurrent_requests: 0, session_affinity: false } as KeyPublic) : undefined),
-    [picked],
+    () => {
+      if (pickerState?.keyDraft) {
+        return { ...pickerState.keyDraft, models: picked ?? pickerState.keyDraft.models };
+      }
+      return picked ? ({ id: "", name: "", enabled: true, rpm: 0, models: picked, daily_limit_usd: 0, weekly_limit_usd: 0,
+        max_concurrent_requests: 0, current_concurrent_requests: 0, session_affinity: false } as KeyPublic) : undefined;
+    },
+    [picked, pickerState?.keyDraft],
   );
 
   return (

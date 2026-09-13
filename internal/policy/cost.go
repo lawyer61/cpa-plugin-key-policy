@@ -32,6 +32,18 @@ func isCacheAdditiveProvider(provider string) bool {
 	}
 }
 
+// hasSeparateReasoningOutput reports providers for which CPA delivers thinking
+// tokens outside Detail.OutputTokens. Those tokens use the configured output
+// price and are included in the lightweight output-token usage total.
+func hasSeparateReasoningOutput(provider string) bool {
+	switch strings.ToLower(strings.TrimSpace(provider)) {
+	case "antigravity", "gemini", "aistudio", "vertex", "interaction", "interactions":
+		return true
+	default:
+		return false
+	}
+}
+
 // UsageDetail is the token breakdown delivered by the host's usage.handle call,
 // already parsed from the upstream response (including the final usage frame of
 // a stream). Only the fields we bill on are tracked here.

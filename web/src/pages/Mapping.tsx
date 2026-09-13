@@ -919,7 +919,7 @@ export function AliasEditForm() {
               <input
                 className="mono"
                 type="number"
-                step="0.01"
+                step="any"
                 value={alias.input_price_per_million ?? 0}
                 onChange={(e) => setAlias({ ...alias, input_price_per_million: parseFloat(e.target.value) || 0 })}
               />
@@ -929,7 +929,7 @@ export function AliasEditForm() {
               <input
                 className="mono"
                 type="number"
-                step="0.01"
+                step="any"
                 value={alias.output_price_per_million ?? 0}
                 onChange={(e) => setAlias({ ...alias, output_price_per_million: parseFloat(e.target.value) || 0 })}
               />
@@ -939,7 +939,7 @@ export function AliasEditForm() {
               <input
                 className="mono"
                 type="number"
-                step="0.01"
+                step="any"
                 value={alias.cache_read_price_per_million ?? 0}
                 onChange={(e) => setAlias({ ...alias, cache_read_price_per_million: parseFloat(e.target.value) || 0 })}
               />
@@ -951,7 +951,7 @@ export function AliasEditForm() {
             <input
               className="mono"
               type="number"
-              step="0.01"
+              step="any"
               value={alias.per_call_usd ?? 0}
               onChange={(e) => setAlias({ ...alias, per_call_usd: parseFloat(e.target.value) || 0 })}
             />

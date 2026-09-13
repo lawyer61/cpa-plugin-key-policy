@@ -822,14 +822,6 @@ func (s *Store) RecordUsage(apiKeyOrID, alias, model string, failed bool, detail
 		return cost
 	}
 
-	usage := TokenUsage{
-		PromptTokens:     int(detail.InputTokens),
-		CompletionTokens: int(detail.OutputTokens),
-		Found:            detail.InputTokens > 0 || detail.OutputTokens > 0,
-	}
-	if !usage.Found {
-		return 0
-	}
 	// Cache-aware billing: the usage.handle detail carries cache-read / cached
 	// token counts. We price cache-hit input tokens at the alias's cache-read
 	// price (falling back to the input price when none is configured), with
@@ -839,24 +831,36 @@ func (s *Store) RecordUsage(apiKeyOrID, alias, model string, failed bool, detail
 	if rule.Alias != "" {
 		provider = rule.Provider
 	}
+	billableDetail := detail
+	if hasSeparateReasoningOutput(provider) && detail.ReasoningTokens > 0 {
+		billableDetail.OutputTokens += detail.ReasoningTokens
+	}
+	usage := TokenUsage{
+		PromptTokens:     int(billableDetail.InputTokens),
+		CompletionTokens: int(billableDetail.OutputTokens),
+		Found:            billableDetail.InputTokens > 0 || billableDetail.OutputTokens > 0,
+	}
+	if !usage.Found {
+		return 0
+	}
 	inputPerMillion, outputPerMillion, cacheReadPerMillion, priced := key.PriceForAlias(resolved)
-	cost, cacheCost, cacheReadTokens := ComputeCacheCostBreakdown(provider, inputPerMillion, outputPerMillion, cacheReadPerMillion, priced, detail)
+	cost, cacheCost, cacheReadTokens := ComputeCacheCostBreakdown(provider, inputPerMillion, outputPerMillion, cacheReadPerMillion, priced, billableDetail)
 	// Non-cache input tokens billed at the input price — the denominator partner
 	// for hit-rate = cacheRead / (cacheRead + input). Must mirror the biller's
 	// internal split so the reported rate matches the actual pricing.
 	var nonCacheInput int64
-	if priced && (detail.InputTokens > 0 || detail.OutputTokens > 0) {
+	if priced && (billableDetail.InputTokens > 0 || billableDetail.OutputTokens > 0) {
 		if isCacheAdditiveProvider(provider) {
-			nonCacheInput = detail.InputTokens + detail.CacheCreationTokens
+			nonCacheInput = billableDetail.InputTokens + billableDetail.CacheCreationTokens
 		} else {
-			cr := detail.CacheReadTokens
+			cr := billableDetail.CacheReadTokens
 			if cr == 0 {
-				cr = detail.CachedTokens
+				cr = billableDetail.CachedTokens
 			}
-			if cr > detail.InputTokens {
-				cr = detail.InputTokens
+			if cr > billableDetail.InputTokens {
+				cr = billableDetail.InputTokens
 			}
-			nonCacheInput = detail.InputTokens - cr
+			nonCacheInput = billableDetail.InputTokens - cr
 		}
 	}
 	if priced && usage.Found && usageLedger != nil {
@@ -865,7 +869,7 @@ func (s *Store) RecordUsage(apiKeyOrID, alias, model string, failed bool, detail
 		// reports usage volume and hit-rate; USD stays 0. Previously `cost > 0`
 		// dropped free-but-priced requests entirely, hiding their volume.
 		// callCount=1: this was a successful, token-billed request.
-		usageLedger.RecordCost(key.ID, resolved, cost, cacheCost, cacheReadTokens, nonCacheInput, int64(detail.OutputTokens), 1)
+		usageLedger.RecordCost(key.ID, resolved, cost, cacheCost, cacheReadTokens, nonCacheInput, billableDetail.OutputTokens, 1)
 	}
 	return cost
 }
@@ -1200,6 +1204,9 @@ func resolveAliasRefsToModels(refs []KeyAliasRef, aliases map[string]*AliasMappi
 				Group:       t.Group,
 				BillingMode: a.BillingMode,
 			}
+			if ref.BillingMode != nil {
+				rule.BillingMode = *ref.BillingMode
+			}
 			// Apply per-key price overrides (nil = use global default).
 			if ref.InputPricePerMillion != nil {
 				rule.InputPricePerMillion = *ref.InputPricePerMillion
@@ -1288,6 +1295,17 @@ func (s *Store) updateAliasesLocked(aliases []AliasMapping) {
 }
 
 func (s *Store) UpsertKey(input KeyConfig, persist bool) error {
+	return s.upsertKey(input, persist, false)
+}
+
+// UpsertKeyWithModelPricing applies model prices submitted by the management
+// UI as per-key alias overrides. The global alias remains unchanged and is
+// still the default for keys without overrides.
+func (s *Store) UpsertKeyWithModelPricing(input KeyConfig, persist bool) error {
+	return s.upsertKey(input, persist, true)
+}
+
+func (s *Store) upsertKey(input KeyConfig, persist bool, modelPricingExplicit bool) error {
 	s.updateMu.Lock()
 	defer s.updateMu.Unlock()
 	// Build a config that includes the store's current global alias table
@@ -1297,6 +1315,9 @@ func (s *Store) UpsertKey(input KeyConfig, persist bool) error {
 	existingAliases := s.aliasesSnapshotLocked()
 	existingRules := s.classifyRulesSnapshotLocked()
 	s.mu.RUnlock()
+	if modelPricingExplicit {
+		input.Aliases = applyModelPricingOverrides(input.Models, input.Aliases, existingAliases)
+	}
 	cfg := Config{Enabled: s.Enabled(), StateFile: s.StatePath(), Keys: []KeyConfig{input}, Aliases: existingAliases, ClassifyRules: existingRules}
 	if err := normalizeConfig(&cfg); err != nil {
 		return err
@@ -1347,6 +1368,58 @@ func (s *Store) UpsertKey(input KeyConfig, persist bool) error {
 		return s.saveState(path, keys, usage, aliases, rules)
 	}
 	return nil
+}
+
+func applyModelPricingOverrides(models []ModelRule, refs []KeyAliasRef, aliases []AliasMapping) []KeyAliasRef {
+	if len(models) == 0 || len(aliases) == 0 {
+		return refs
+	}
+	existingAliases := make(map[string]struct{}, len(aliases))
+	for _, alias := range aliases {
+		existingAliases[strings.ToLower(strings.TrimSpace(alias.Alias))] = struct{}{}
+	}
+	out := append([]KeyAliasRef(nil), refs...)
+	refIndex := make(map[string]int, len(out))
+	for i := range out {
+		refIndex[strings.ToLower(strings.TrimSpace(out[i].Alias))] = i
+	}
+	seen := make(map[string]struct{}, len(models))
+	for _, model := range models {
+		aliasName := strings.TrimSpace(model.Alias)
+		key := strings.ToLower(aliasName)
+		if key == "" {
+			continue
+		}
+		if _, duplicate := seen[key]; duplicate {
+			continue
+		}
+		seen[key] = struct{}{}
+		if _, exists := existingAliases[key]; !exists {
+			// normalizeConfig creates a new global alias from this model,
+			// including its pricing, so no override is needed yet.
+			continue
+		}
+		idx, exists := refIndex[key]
+		if !exists {
+			idx = len(out)
+			out = append(out, KeyAliasRef{Alias: aliasName})
+			refIndex[key] = idx
+		}
+		mode := strings.ToLower(strings.TrimSpace(model.BillingMode))
+		if mode == "" {
+			mode = "tokens"
+		}
+		inputPrice := model.InputPricePerMillion
+		outputPrice := model.OutputPricePerMillion
+		cachePrice := model.CacheReadPricePerMillion
+		perCallPrice := model.PerCallUSD
+		out[idx].BillingMode = &mode
+		out[idx].InputPricePerMillion = &inputPrice
+		out[idx].OutputPricePerMillion = &outputPrice
+		out[idx].CacheReadPricePerMillion = &cachePrice
+		out[idx].PerCallUSD = &perCallPrice
+	}
+	return out
 }
 
 func (s *Store) DeleteKey(id string) error {

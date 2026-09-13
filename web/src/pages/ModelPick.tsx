@@ -2,12 +2,16 @@ import { useEffect, useMemo, useState } from "react";
 import { useNavigate, useParams, useLocation } from "react-router-dom";
 import { fetchCatalog, formatTierLabel, groupByCatalog } from "../api/models";
 import type { CatalogGroup } from "../api/models";
-import type { ModelRule, AliasTarget } from "../types";
+import type { ModelRule, AliasTarget, KeyPublic } from "../types";
 import { useT } from "../i18n";
 
 // Selection key: "provider|group|model" (all lowercased for dedupe matching).
 function keyOf(g: CatalogGroup, model: string): string {
   return g.provider + "|" + (g.group ?? "").toLowerCase() + "|" + model.toLowerCase();
+}
+
+function keyOfRule(rule: ModelRule): string {
+  return rule.provider.toLowerCase() + "|" + (rule.group ?? "").toLowerCase() + "|" + rule.target_model.toLowerCase();
 }
 
 export default function ModelPick() {
@@ -28,6 +32,8 @@ export default function ModelPick() {
     returnTo?: string;
     /** Full alias form draft — forwarded back so name/dispatch/prices survive. */
     draftAlias?: unknown;
+    /** Full key form draft — forwarded back so unsaved fields and prices survive. */
+    keyDraft?: KeyPublic;
   } | null;
   // Context-aware: if a `returnTo` route is supplied (e.g. from the alias
   // editor), we are picking targets for a global alias, not models for a key.
@@ -38,6 +44,12 @@ export default function ModelPick() {
     ? st!.returnTo!
     : (id ? `/keys/${encodeURIComponent(id)}/edit` : "/keys/new");
   const draftAlias = st?.draftAlias;
+  const keyDraft = st?.keyDraft;
+  const initialByKey = useMemo(() => {
+    const byKey = new Map<string, ModelRule>();
+    for (const rule of initialModels) byKey.set(keyOfRule(rule), rule);
+    return byKey;
+  }, [initialModels]);
 
   const [selected, setSelected] = useState<Set<string>>(() => {
     const s = new Set<string>();
@@ -86,14 +98,23 @@ export default function ModelPick() {
         const k = keyOf(g, m);
         covered.add(k);
         if (selected.has(k)) {
-          const rule: ModelRule = { alias: m, provider: g.provider, target_model: m };
+          const prior = initialByKey.get(k);
+          const rule: ModelRule = prior
+            ? { ...prior, provider: g.provider, target_model: m }
+            : { alias: m, provider: g.provider, target_model: m };
           if (g.group) rule.group = g.group;
+          else delete rule.group;
           out.push(rule);
         }
       }
     }
     for (const k of selected) {
       if (covered.has(k)) continue;
+      const prior = initialByKey.get(k);
+      if (prior) {
+        out.push({ ...prior });
+        continue;
+      }
       const [provider, group, ...rest] = k.split("|");
       const model = rest.join("|");
       if (!provider || !model) continue;
@@ -102,7 +123,7 @@ export default function ModelPick() {
       out.push(rule);
     }
     return out;
-  }, [selected, groups]);
+  }, [selected, groups, initialByKey]);
 
   const filtered = useMemo(() => {
     if (!query.trim()) return groups;
@@ -150,7 +171,12 @@ export default function ModelPick() {
       });
       nav(backTo, { state: { pickedTargets: targets, draftAlias } });
     } else {
-      nav(backTo, { state: { pickedModels: rules } });
+      nav(backTo, {
+        state: {
+          pickedModels: rules,
+          ...(keyDraft ? { keyDraft: { ...keyDraft, models: rules } } : {}),
+        },
+      });
     }
   };
 
@@ -164,6 +190,10 @@ export default function ModelPick() {
           pickedTargets: initialTargets,
         },
       });
+      return;
+    }
+    if (keyDraft) {
+      nav(backTo, { state: { pickedModels: initialModels, keyDraft } });
       return;
     }
     nav(backTo);

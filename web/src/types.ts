@@ -58,6 +58,8 @@ export interface KeyPublic {
   native?: boolean;
   key_preview: string;
   account_binding?: AccountBinding;
+  // Client-only draft marker used while the key form visits the model picker.
+  clear_account_binding?: boolean;
   rpm: number;
   models: ModelRule[];
   aliases?: KeyAliasRef[];
@@ -309,6 +311,7 @@ export interface ClassifyRule {
 // price overrides (null = use global default).
 export interface KeyAliasRef {
   alias: string;
+  billing_mode?: "tokens" | "per_call" | null;
   input_price_per_million?: number | null;
   output_price_per_million?: number | null;
   cache_read_price_per_million?: number | null;

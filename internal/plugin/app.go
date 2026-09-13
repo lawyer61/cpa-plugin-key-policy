@@ -1173,8 +1173,14 @@ func (a *App) createKey(body []byte) ManagementResponse {
 		item.CallerScope = policy.CallerScopeForKey(plain)
 		item.KeyPreview = "native"
 	}
-	if err := a.store.UpsertKey(item, true); err != nil {
-		return jsonError(http.StatusBadRequest, "invalid_policy", err.Error())
+	var upsertErr error
+	if req.Models != nil {
+		upsertErr = a.store.UpsertKeyWithModelPricing(item, true)
+	} else {
+		upsertErr = a.store.UpsertKey(item, true)
+	}
+	if upsertErr != nil {
+		return jsonError(http.StatusBadRequest, "invalid_policy", upsertErr.Error())
 	}
 	saved, _ := a.keyConfigByID(item.ID)
 	bodyMap := map[string]any{
@@ -1258,8 +1264,14 @@ func (a *App) patchKey(body []byte) ManagementResponse {
 			current.KeyPreview = "native"
 		}
 	}
-	if err := a.store.UpsertKey(*current, true); err != nil {
-		return jsonError(http.StatusBadRequest, "invalid_policy", err.Error())
+	var upsertErr error
+	if req.Models != nil {
+		upsertErr = a.store.UpsertKeyWithModelPricing(*current, true)
+	} else {
+		upsertErr = a.store.UpsertKey(*current, true)
+	}
+	if upsertErr != nil {
+		return jsonError(http.StatusBadRequest, "invalid_policy", upsertErr.Error())
 	}
 	saved, _ := a.keyConfigByID(current.ID)
 	return jsonResponse(http.StatusOK, map[string]any{"key": a.publicKeyFromConfig(saved)})

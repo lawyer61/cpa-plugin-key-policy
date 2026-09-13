@@ -2,6 +2,7 @@ import { useState } from "react";
 import { fetchLookupData, lookupStatus } from "../api/lookup";
 import { useT } from "../i18n";
 import type { LookupAliasSummary, LookupResponse, UsageWindow } from "../types";
+import { formatUSD } from "../utils/money";
 
 type UsageValue = UsageWindow | number | undefined;
 
@@ -13,12 +14,8 @@ export function usageValue(value: UsageValue): number {
   return typeof candidate === "number" && Number.isFinite(candidate) ? candidate : 0;
 }
 
-function money(value: number): string {
-  return `$${(Number.isFinite(value) ? value : 0).toFixed(2)}`;
-}
-
 function displayLimit(value: number, unlimited: string): string {
-  return value > 0 ? money(value) : unlimited;
+  return value > 0 ? formatUSD(value) : unlimited;
 }
 
 function usagePercent(used: number, limit: number): number {
@@ -48,12 +45,12 @@ function WindowCard({
   return (
     <div className="lookup-window-card">
       <div className="lookup-window-label">{label}</div>
-      <div className="lookup-window-value">{money(used)}</div>
+      <div className="lookup-window-value">{formatUSD(used)}</div>
       <div className="lookup-progress" aria-hidden="true">
         <span style={{ width: `${usagePercent(used, limit)}%` }} />
       </div>
       <div className="lookup-window-caption">
-        {t("lookup.used", { used: money(used).slice(1), limit: displayLimit(limit, t("lookup.unlimited")).replace(/^\$/, "") })}
+        {t("lookup.used", { used: formatUSD(used).replace("$", ""), limit: displayLimit(limit, t("lookup.unlimited")).replace("$", "") })}
       </div>
       {reset && <div className="lookup-window-reset">{t("lookup.resetAt", { at: reset })}</div>}
     </div>
@@ -90,8 +87,8 @@ function AliasTable({ aliases }: { aliases: LookupAliasSummary[] }) {
             <tr key={alias.alias}>
               <td className="mono">{alias.alias}</td>
               <td>{alias.billing_mode === "per_call" ? t("lookup.perCall") : t("lookup.tokens")}</td>
-              <td className="num">{money(usageValue(alias.daily))}</td>
-              <td className="num">{money(usageValue(alias.weekly))}</td>
+              <td className="num">{formatUSD(usageValue(alias.daily))}</td>
+              <td className="num">{formatUSD(usageValue(alias.weekly))}</td>
             </tr>
           ))}
         </tbody>

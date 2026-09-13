@@ -4,15 +4,12 @@ import { fetchKeyUsage } from "../api/keys";
 import type { AliasUsageEntry, KeyUsageResponse, UsageWindow } from "../types";
 import { useT } from "../i18n";
 import { MobileTabBar } from "./KeyList";
+import { formatUSD } from "../utils/money";
 
 // Window switch for the per-alias breakdown table: each alias row has its own
 // daily and rolling-weekly window, and the user toggles which one all rows
 // show at once. Mirrors the KeyList usage column's today/this-week framing.
 type Window = "daily" | "weekly";
-
-function fmtUsd(n: number): string {
-  return "$" + (Number.isFinite(n) ? n.toFixed(2) : "0.00");
-}
 
 // Compact integer formatting with thousands separators. 0 shows as "0".
 function fmtInt(n: number): string {
@@ -134,7 +131,7 @@ export default function KeyUsage() {
         <div className="uhd-tiles">
           <div className="uhd-tile">
             <span className="uhd-tk">{win === "daily" ? t("keyUsage.mobile.todaySpend") : t("keyUsage.mobile.weekSpend")}</span>
-            <span className={"uhd-tv" + (heroLimit > 0 && heroUsd >= heroLimit ? " accent" : "")}>{fmtUsd(heroUsd)}</span>
+            <span className={"uhd-tv" + (heroLimit > 0 && heroUsd >= heroLimit ? " accent" : "")}>{formatUSD(heroUsd)}</span>
           </div>
           <div className="uhd-tile">
             <span className="uhd-tk">{t("keyUsage.colCalls")}</span>
@@ -142,7 +139,7 @@ export default function KeyUsage() {
           </div>
           <div className="uhd-tile">
             <span className="uhd-tk">{t("keyUsage.mobile.limit")}</span>
-            <span className="uhd-tv">{heroLimit > 0 ? fmtUsd(heroLimit) : t("keyUsage.mobile.noLimit")}</span>
+            <span className="uhd-tv">{heroLimit > 0 ? formatUSD(heroLimit) : t("keyUsage.mobile.noLimit")}</span>
           </div>
         </div>
         {heroLimit > 0 && (
@@ -151,7 +148,7 @@ export default function KeyUsage() {
               <span style={{ width: Math.min(100, heroPct) + "%" }} />
             </div>
             <div className="uhd-barcap">
-              <span>{fmtUsd(heroUsd)} / {fmtUsd(heroLimit)}</span>
+              <span>{formatUSD(heroUsd)} / {formatUSD(heroLimit)}</span>
               <span className={heroUsd >= heroLimit ? "over" : ""}>{Math.round(heroPct)}%</span>
             </div>
           </>
@@ -194,7 +191,7 @@ export default function KeyUsage() {
                       <BillingTag mode={a.billing_mode} />
                     </td>
                     <td className="muted">{a.provider || "—"}</td>
-                    <td className="num strong">{fmtUsd(w.total_usd ?? 0)}</td>
+                    <td className="num strong">{formatUSD(w.total_usd ?? 0)}</td>
                     <td className="num mono">{fmtInt(w.call_count ?? 0)}</td>
                     <td className="num mono">{fmtInt(w.input_tokens ?? 0)}</td>
                     <td className="num mono">{fmtInt(w.output_tokens ?? 0)}</td>
@@ -212,7 +209,7 @@ export default function KeyUsage() {
       <div className="mobile-only">
         <div className="usage-hero">
           <div className="uh-label">{win === "daily" ? t("keyUsage.mobile.today") : t("keyUsage.mobile.thisWeek")}</div>
-          <div className="uh-amount">{fmtUsd(heroUsd)}<span className="uh-unit">USD</span></div>
+          <div className="uh-amount">{formatUSD(heroUsd)}<span className="uh-unit">USD</span></div>
           <div className="uh-row">
             <div className="uh-ring">
               <svg width="64" height="64" viewBox="0 0 64 64">
@@ -224,8 +221,8 @@ export default function KeyUsage() {
               <span className="uh-pct">{Math.round(heroPct)}%</span>
             </div>
             <div className="uh-limits">
-              <div><span className="uh-lk">{t("keyUsage.mobile.limit")}</span> <span className="uh-lv">{heroLimit > 0 ? fmtUsd(heroLimit) : t("keyUsage.mobile.noLimit")}</span></div>
-              <div><span className="uh-lk">{t("keyUsage.mobile.remaining")}</span> <span className="uh-lv">{heroLimit > 0 ? fmtUsd(Math.max(0, heroLimit - heroUsd)) : "—"}</span></div>
+              <div><span className="uh-lk">{t("keyUsage.mobile.limit")}</span> <span className="uh-lv">{heroLimit > 0 ? formatUSD(heroLimit) : t("keyUsage.mobile.noLimit")}</span></div>
+              <div><span className="uh-lk">{t("keyUsage.mobile.remaining")}</span> <span className="uh-lv">{heroLimit > 0 ? formatUSD(Math.max(0, heroLimit - heroUsd)) : "—"}</span></div>
             </div>
           </div>
           <div className="uh-stats">
@@ -248,7 +245,7 @@ export default function KeyUsage() {
               <div key={a.alias} className={"br-row" + (a.in_config ? "" : " br-residual")}>
                 <div className="br-top">
                   <span className="br-name">{a.alias}{!a.in_config && <span className="br-badge">!</span>}</span>
-                  <span className="br-usd">{fmtUsd(usd)}</span>
+                  <span className="br-usd">{formatUSD(usd)}</span>
                 </div>
                 <div className="br-bar"><span style={{ width: w2 + "%" }} /></div>
                 <div className="br-cap">

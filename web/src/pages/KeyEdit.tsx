@@ -38,12 +38,16 @@ export default function KeyEdit() {
   // When the model-picker page returns, merge its selection into the loaded
   // key's models, preserving everything else (id/name/limits/prices). The
   // KeyForm price-map init keeps existing rows for aliases that survived.
-  const picked = (loc.state as { pickedModels?: ModelRule[] } | null)?.pickedModels;
+  const pickerState = loc.state as { pickedModels?: ModelRule[]; keyDraft?: KeyPublic } | null;
+  const picked = pickerState?.pickedModels;
   const initial = useMemo<KeyPublic | null>(() => {
     if (!key) return null;
+    if (pickerState?.keyDraft && pickerState.keyDraft.id === key.id) {
+      return { ...pickerState.keyDraft, models: picked ?? pickerState.keyDraft.models };
+    }
     if (!picked) return key;
     return { ...key, models: picked };
-  }, [key, picked]);
+  }, [key, picked, pickerState?.keyDraft]);
 
   if (loading) return <div className="muted">{t("keys.loading")}</div>;
   if (error || !key) return <div className="error">{error || t("edit.notFound")}</div>;

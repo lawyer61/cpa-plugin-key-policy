@@ -4,6 +4,7 @@ import { listKeys, deleteKey, rotateKey, resetRPM } from "../api/keys";
 import type { KeyPublic } from "../types";
 import PlainKeyModal from "../components/PlainKeyModal";
 import { useT } from "../i18n";
+import { formatUSD } from "../utils/money";
 
 // Renders a key's daily/weekly dollar usage against its limits. Empty limits
 // (0) show as "不限"; usage at/over a limit is flagged in the danger color so an
@@ -219,14 +220,14 @@ function KeyCard({
         <>
           <div className="kc-bar"><span style={{ width: pct + "%" }} /></div>
           <div className="kc-meta">
-            <span>${k.usage.daily_usd.toFixed(2)} / ${limit.toFixed(2)}</span>
+            <span>{formatUSD(k.usage.daily_usd)} / {formatUSD(limit)}</span>
             <span>{uniqueAliases.length} {t("keys.mobile.modelsSuffix")}</span>
           </div>
         </>
       )}
       {limit === 0 && (
         <div className="kc-meta">
-          <span>${k.usage.daily_usd.toFixed(2)} · {t("keys.mobile.noLimit")}</span>
+          <span>{formatUSD(k.usage.daily_usd)} · {t("keys.mobile.noLimit")}</span>
           <span>{uniqueAliases.length} {t("keys.mobile.modelsSuffix")}</span>
         </div>
       )}

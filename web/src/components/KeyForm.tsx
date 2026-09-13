@@ -72,6 +72,20 @@ function parseNum(value: string): number {
   return Number.isFinite(n) ? n : 0;
 }
 
+function applyPrices(models: ModelRule[], prices: Record<string, PriceRow>): ModelRule[] {
+  return models.map((model) => {
+    const row = prices[priceKey(model)];
+    return {
+      ...model,
+      input_price_per_million: row?.input_price_per_million ?? 0,
+      output_price_per_million: row?.output_price_per_million ?? 0,
+      cache_read_price_per_million: row?.cache_read_price_per_million ?? 0,
+      billing_mode: row?.billing_mode === "per_call" ? "per_call" : "tokens",
+      per_call_usd: row?.per_call_usd ?? 0,
+    };
+  });
+}
+
 export default function KeyForm({
   initial,
   idReadOnly,
@@ -265,6 +279,45 @@ export default function KeyForm({
     }));
   };
 
+  const currentAccountBinding = (): AccountBinding | undefined => bindingEnabled ? {
+    allow: bindingAllow.split(/\r?\n/).map((value) => value.trim()).filter(Boolean),
+    strategy: bindingStrategy,
+  } : undefined;
+
+  const shouldClearAccountBinding = () =>
+    !bindingEnabled && (initial?.account_binding !== undefined || initial?.clear_account_binding === true);
+
+  const buildPricedModels = () => applyPrices(models, prices);
+
+  const openModelPicker = () => {
+    if (!pickPath) return;
+    const nextModels = buildPricedModels();
+    const keyDraft: KeyPublic = {
+      ...(initial ?? {}),
+      id,
+      name,
+      enabled,
+      key_preview: initial?.key_preview ?? "",
+      rpm,
+      models: nextModels,
+      daily_limit_usd: dailyLimit,
+      weekly_limit_usd: weeklyLimit,
+      max_concurrent_requests: maxConcurrent,
+      current_concurrent_requests: initial?.current_concurrent_requests ?? 0,
+      session_affinity: sessionAffinity,
+      allow_models_endpoint: allowModels,
+      account_binding: currentAccountBinding(),
+      clear_account_binding: shouldClearAccountBinding(),
+      usage: initial?.usage ?? {
+        daily_usd: 0,
+        weekly_usd: 0,
+        daily_limit_usd: dailyLimit,
+        weekly_limit_usd: weeklyLimit,
+      },
+    };
+    nav(pickPath, { state: { models: nextModels, keyDraft } });
+  };
+
   const submit = async (e: React.FormEvent) => {
     e.preventDefault();
     setLocalErr("");
@@ -272,24 +325,10 @@ export default function KeyForm({
       setLocalErr(t("keyForm.idRequired"));
       return;
     }
-    // Stamp the per-alias pricing back onto the model rules before submit.
-    const pricedModels: ModelRule[] = models.map((m) => {
-      const row = prices[priceKey(m)];
-      return {
-        ...m,
-        input_price_per_million: row?.input_price_per_million ?? 0,
-        output_price_per_million: row?.output_price_per_million ?? 0,
-        cache_read_price_per_million: row?.cache_read_price_per_million ?? 0,
-        billing_mode: row?.billing_mode === "per_call" ? "per_call" : "tokens",
-        per_call_usd: row?.per_call_usd ?? 0,
-      };
-    });
+    const pricedModels = buildPricedModels();
     setBusy(true);
     try {
-	  const accountBinding = bindingEnabled ? {
-	    allow: bindingAllow.split(/\r?\n/).map((value) => value.trim()).filter(Boolean),
-	    strategy: bindingStrategy,
-	  } satisfies AccountBinding : undefined;
+	  const accountBinding = currentAccountBinding();
       await onSubmit({
         id: id.trim(),
         name: name.trim(),
@@ -302,7 +341,7 @@ export default function KeyForm({
         session_affinity: sessionAffinity,
         allow_models_endpoint: allowModels,
 		account_binding: accountBinding,
-		clear_account_binding: !isNative && !bindingEnabled && initial?.account_binding !== undefined,
+		clear_account_binding: !isNative && shouldClearAccountBinding(),
       });
     } catch (err) {
       const e = err as { response?: { data?: { error?: { message?: string } } }; message?: string };
@@ -382,7 +421,7 @@ export default function KeyForm({
                   className="input"
                   type="number"
                   min={0}
-                  step="0.01"
+                  step="any"
                   value={row.input_price_per_million}
                   onChange={(e) => setPrice(m, "input_price_per_million", e.target.value)}
                 />
@@ -393,7 +432,7 @@ export default function KeyForm({
                   className="input"
                   type="number"
                   min={0}
-                  step="0.01"
+                  step="any"
                   value={row.output_price_per_million}
                   onChange={(e) => setPrice(m, "output_price_per_million", e.target.value)}
                 />
@@ -404,7 +443,7 @@ export default function KeyForm({
                   className="input"
                   type="number"
                   min={0}
-                  step="0.01"
+                  step="any"
                   value={row.cache_read_price_per_million}
                   onChange={(e) => setPrice(m, "cache_read_price_per_million", e.target.value)}
                 />
@@ -467,7 +506,7 @@ export default function KeyForm({
                   className="input"
                   type="number"
                   min={0}
-                  step="0.01"
+                  step="any"
                   value={row.input_price_per_million}
                   onChange={(e) => setPrice(m, "input_price_per_million", e.target.value)}
                 />
@@ -477,7 +516,7 @@ export default function KeyForm({
                   className="input"
                   type="number"
                   min={0}
-                  step="0.01"
+                  step="any"
                   value={row.output_price_per_million}
                   onChange={(e) => setPrice(m, "output_price_per_million", e.target.value)}
                 />
@@ -487,7 +526,7 @@ export default function KeyForm({
                   className="input"
                   type="number"
                   min={0}
-                  step="0.01"
+                  step="any"
                   value={row.cache_read_price_per_million}
                   onChange={(e) => setPrice(m, "cache_read_price_per_million", e.target.value)}
                 />
@@ -684,7 +723,7 @@ export default function KeyForm({
                     }} aria-label={t("keyForm.removeModel")}>×</button>
                   </span>
                 ))}
-                <button type="button" className="mc-add" onClick={() => nav(pickPath, { state: { models } })}>
+                <button type="button" className="mc-add" onClick={openModelPicker}>
                   + {t("keyForm.addModel")}
                 </button>
               </div>
@@ -902,7 +941,7 @@ export default function KeyForm({
                 }} aria-label={t("keyForm.removeModel")}>×</button>
               </span>
             ))}
-            <button type="button" className="mc-add" onClick={() => nav(pickPath, { state: { models } })}>
+            <button type="button" className="mc-add" onClick={openModelPicker}>
               + {t("keyForm.addModel")}
             </button>
           </div>

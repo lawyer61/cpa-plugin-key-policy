@@ -185,6 +185,8 @@ func (r *ClassifyRule) Compiled() *regexp.Regexp {
 // nil pointer fields mean "use the global default".
 type KeyAliasRef struct {
 	Alias string `yaml:"alias" json:"alias"`
+	// Optional per-key billing-mode override. nil = use global alias pricing.
+	BillingMode *string `yaml:"billing_mode,omitempty" json:"billing_mode,omitempty"`
 	// Optional per-key price overrides. nil = use global alias pricing.
 	InputPricePerMillion     *float64 `yaml:"input_price_per_million,omitempty" json:"input_price_per_million,omitempty"`
 	OutputPricePerMillion    *float64 `yaml:"output_price_per_million,omitempty" json:"output_price_per_million,omitempty"`
@@ -831,6 +833,9 @@ func normalizeConfig(cfg *Config) error {
 			// first, drop later duplicates, no error.
 			if firstIdx, dupLast := refSeen[lk]; dupLast {
 				// Preserve price overrides from the later ref if they exist.
+				if refs[firstIdx].BillingMode == nil && ref.BillingMode != nil {
+					refs[firstIdx].BillingMode = ref.BillingMode
+				}
 				if refs[firstIdx].InputPricePerMillion == nil && ref.InputPricePerMillion != nil {
 					refs[firstIdx].InputPricePerMillion = ref.InputPricePerMillion
 				}
@@ -851,6 +856,17 @@ func normalizeConfig(cfg *Config) error {
 		key.Aliases = refs
 		for k := range key.Aliases {
 			ref := &key.Aliases[k]
+			if ref.BillingMode != nil {
+				mode := strings.ToLower(strings.TrimSpace(*ref.BillingMode))
+				switch mode {
+				case "", "tokens":
+					mode = "tokens"
+				case "per_call":
+				default:
+					return fmt.Errorf("key %q alias %q billing_mode override %q must be \"tokens\" or \"per_call\"", key.ID, ref.Alias, *ref.BillingMode)
+				}
+				ref.BillingMode = &mode
+			}
 			if ref.InputPricePerMillion != nil && *ref.InputPricePerMillion < 0 {
 				return fmt.Errorf("key %q alias %q input_price override cannot be negative", key.ID, ref.Alias)
 			}
