@@ -24,6 +24,20 @@ type fakeQuotaHost struct {
 	requests     []HostHTTPRequest
 }
 
+type advancingQuotaHost struct {
+	*fakeQuotaHost
+	clock *time.Time
+	step  time.Duration
+}
+
+func (h *advancingQuotaHost) Do(request HostHTTPRequest) (HostHTTPResponse, error) {
+	response, err := h.fakeQuotaHost.Do(request)
+	if request.Method == http.MethodGet {
+		*h.clock = h.clock.Add(h.step)
+	}
+	return response, err
+}
+
 func (f *fakeQuotaHost) ListAuths() ([]HostAuthEntry, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -198,18 +212,77 @@ func TestQuotaRoundAdvancesExpiredNextCheckWhenFreshPassiveObservationSkipsProbe
 	}
 }
 
+func TestQuotaRoundAlignsProcessedAuthDeadlinesWithNextGlobalRound(t *testing.T) {
+	app := configuredQuotaTestApp(t)
+	enabled := true
+	scope := "all-codex"
+	if _, err := app.store.UpdateRuntimeSettings(policy.RuntimeSettingsPatch{
+		QuotaActivationEnabled: &enabled,
+		QuotaActivationScope:   &scope,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	clock := time.Date(2026, 9, 13, 18, 24, 51, 0, time.UTC)
+	base := newFakeQuotaHost(clock)
+	for i, id := range []string{"account-b-team", "account-c-team"} {
+		index := "idx-" + string(rune('b'+i))
+		entry := HostAuthEntry{ID: id, AuthIndex: index, Name: id + ".json", Provider: "codex", Status: "active"}
+		base.entries = append(base.entries, entry)
+		base.runtime[index] = entry
+		base.documents[index] = HostAuthDocument{
+			AuthIndex: index,
+			Name:      entry.Name,
+			JSON:      quotaCredentialJSON(clock, "team", "acct-"+id, "access-"+id, "refresh-"+id),
+		}
+	}
+	base.getResponses = []HostHTTPResponse{
+		{StatusCode: http.StatusOK, Body: quotaBody(clock, 10)},
+		{StatusCode: http.StatusOK, Body: quotaBody(clock, 10)},
+		{StatusCode: http.StatusOK, Body: quotaBody(clock, 10)},
+	}
+	host := &advancingQuotaHost{fakeQuotaHost: base, clock: &clock, step: 2 * time.Minute}
+	app.quota.mu.Lock()
+	app.quota.host = host
+	app.quota.mu.Unlock()
+	app.quota.now = func() time.Time { return clock }
+	app.quota.cache.now = func() time.Time { return clock }
+	app.quota.testDurations = func() (time.Duration, time.Duration) {
+		return 30 * time.Minute, 30 * time.Minute
+	}
+
+	app.quota.runRound()
+	nextGlobalRound := clock.Add(30 * time.Minute)
+	status := app.quota.status()
+	auths := status["auths"].([]map[string]any)
+	for _, auth := range auths {
+		next, ok := auth["next_check_at"].(time.Time)
+		if !ok {
+			t.Fatalf("%s next_check_at type = %T, want time.Time", auth["auth_id"], auth["next_check_at"])
+		}
+		if next.Before(nextGlobalRound) {
+			t.Fatalf("%s next_check_at=%s, but the loop cannot start the next global round before %s", auth["auth_id"], next.Format(time.RFC3339), nextGlobalRound.Format(time.RFC3339))
+		}
+	}
+	_, get, post := host.counts()
+	if get != 3 || post != 0 {
+		t.Fatalf("deadline alignment changed upstream work: GET=%d POST=%d", get, post)
+	}
+}
+
 func TestQuotaGetHonorsRetryAfterBeyondCheckInterval(t *testing.T) {
 	app, _ := configureBoundApp(t, "quota-fill-first", false)
 	now := time.Date(2026, 9, 12, 10, 0, 0, 0, time.UTC)
 	host := newFakeQuotaHost(now)
-	host.getResponses = []HostHTTPResponse{{StatusCode: http.StatusTooManyRequests, Headers: http.Header{"Retry-After": []string{"180"}}}}
+	host.getResponses = []HostHTTPResponse{{StatusCode: http.StatusTooManyRequests, Headers: http.Header{"Retry-After": []string{"3600"}}}}
 	attachTestQuotaHost(app, host, now)
 	app.quota.runRound()
 	app.quota.mu.Lock()
 	next := app.quota.runtime.Auths["account-a-team"].NextCheckAt
 	app.quota.mu.Unlock()
-	if next.Before(now.Add(3 * time.Minute)) {
-		t.Fatalf("next check = %v, want Retry-After", next)
+	want := now.Add(time.Hour)
+	if !next.Equal(want) {
+		t.Fatalf("next check = %v, want Retry-After %v", next, want)
 	}
 }
 
@@ -278,6 +351,66 @@ func TestQuotaLoopReconfigureDoesNotPostponeDueRound(t *testing.T) {
 	}
 	if activation.Status != "confirmed" {
 		t.Fatalf("activation status = %q, want confirmed", activation.Status)
+	}
+}
+
+func TestQuotaLoopStartupAlignsPersistedDeadlineWithFirstGlobalRound(t *testing.T) {
+	app := configuredQuotaTestApp(t)
+	enabled := true
+	scope := "all-codex"
+	if _, err := app.store.UpdateRuntimeSettings(policy.RuntimeSettingsPatch{
+		QuotaActivationEnabled: &enabled,
+		QuotaActivationScope:   &scope,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	clock := time.Date(2026, 9, 13, 18, 40, 0, 0, time.UTC)
+	host := newFakeQuotaHost(clock)
+	app.quota.now = func() time.Time { return clock }
+	app.quota.cache.now = func() time.Time { return clock }
+	app.quota.testDurations = func() (time.Duration, time.Duration) {
+		return time.Hour, 30 * time.Minute
+	}
+	app.quota.mu.Lock()
+	app.quota.runtime.Auths["account-a-team"] = quotaAuthRuntime{
+		AuthID:      "account-a-team",
+		AuthIndex:   "idx-a",
+		Provider:    "codex",
+		NextCheckAt: clock.Add(-time.Minute),
+	}
+	app.quota.mu.Unlock()
+	app.quota.setHostClient(host)
+	t.Cleanup(app.Shutdown)
+
+	deadline := time.Now().Add(time.Second)
+	var auth map[string]any
+	for time.Now().Before(deadline) {
+		status := app.quota.status()
+		auths := status["auths"].([]map[string]any)
+		if len(auths) == 1 {
+			seen, _ := auths[0]["last_roster_seen_at"].(time.Time)
+			if seen.Equal(clock) {
+				auth = auths[0]
+				break
+			}
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if auth == nil {
+		t.Fatal("startup roster sync did not complete")
+	}
+	next, ok := auth["next_check_at"].(time.Time)
+	if !ok {
+		t.Fatalf("next_check_at type = %T, want time.Time", auth["next_check_at"])
+	}
+	want := clock.Add(time.Hour)
+	if !next.Equal(want) {
+		t.Fatalf("startup next_check_at=%s, want first global round %s", next.Format(time.RFC3339), want.Format(time.RFC3339))
+	}
+	_, get, post := host.counts()
+	if get != 0 || post != 0 {
+		t.Fatalf("startup performed upstream work: GET=%d POST=%d", get, post)
 	}
 }
 

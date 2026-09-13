@@ -151,6 +151,7 @@ func (m *quotaManager) loop() {
 	if needed {
 		nextRoundAt = m.now().Add(interval)
 	}
+	m.alignMaintenanceDeadlines(nextRoundAt)
 	for {
 		var timer *time.Timer
 		var timerCh <-chan time.Time
@@ -179,6 +180,7 @@ func (m *quotaManager) loop() {
 			nextRoundAt = quotaRoundDeadline(nextRoundAt, interval, nextInterval, needed, nextNeeded, restartDeadline, now)
 			interval = nextInterval
 			needed = nextNeeded
+			m.alignMaintenanceDeadlines(nextRoundAt)
 			if needed && !now.Before(nextRoundAt) {
 				m.runRound()
 				interval, _ = m.durations()
@@ -397,12 +399,9 @@ func (m *quotaManager) runRound() {
 	now := m.now()
 	interval, ttl := m.durations()
 	due := make([]HostAuthEntry, 0, len(eligible))
-	skipped := make([]string, 0, len(eligible))
 	for _, entry := range m.rotateEntries(eligible) {
 		if m.needsReview(entry.ID, ttl, now) {
 			due = append(due, entry)
-		} else {
-			skipped = append(skipped, entry.ID)
 		}
 	}
 	for _, entry := range due {
@@ -416,22 +415,32 @@ func (m *quotaManager) runRound() {
 		m.runtime.RoundCursor = entry.ID
 		m.mu.Unlock()
 	}
-	// A newer passive observation can keep an auth fresh after its previous
-	// per-auth deadline expires. Keep the displayed deadline aligned with the
-	// next global round without issuing an unnecessary upstream probe.
+	// Per-auth deadlines are eligibility gates inside one global maintenance
+	// loop, not independent timers. Align every eligible auth with the next
+	// global round so an early auth in a long sequential sweep cannot advertise
+	// a check time that the loop is unable to honor. Preserve only later
+	// external deadlines such as Retry-After.
 	nextRoundAt := m.now().Add(interval)
+	m.alignMaintenanceDeadlines(nextRoundAt)
 	m.mu.Lock()
-	for _, authID := range skipped {
-		runtime := m.runtime.Auths[authID]
-		if !runtime.InMaintenanceScope || (!runtime.NextCheckAt.IsZero() && runtime.NextCheckAt.After(now)) {
+	m.runtime.LastRoundAt = now
+	m.mu.Unlock()
+	_ = m.persist()
+}
+
+func (m *quotaManager) alignMaintenanceDeadlines(nextRoundAt time.Time) {
+	if nextRoundAt.IsZero() {
+		return
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for authID, runtime := range m.runtime.Auths {
+		if !runtime.InMaintenanceScope || runtime.NextCheckAt.After(nextRoundAt) {
 			continue
 		}
 		runtime.NextCheckAt = nextRoundAt
 		m.runtime.Auths[authID] = runtime
 	}
-	m.runtime.LastRoundAt = now
-	m.mu.Unlock()
-	_ = m.persist()
 }
 
 func quotaFeatureNeeded(settings policy.RuntimeSettings, keys []policy.KeyConfig) bool {
