@@ -395,11 +395,14 @@ func (m *quotaManager) runRound() {
 	}
 	eligible := m.applyRoster(host, entries, settings, keys)
 	now := m.now()
-	_, ttl := m.durations()
+	interval, ttl := m.durations()
 	due := make([]HostAuthEntry, 0, len(eligible))
+	skipped := make([]string, 0, len(eligible))
 	for _, entry := range m.rotateEntries(eligible) {
 		if m.needsReview(entry.ID, ttl, now) {
 			due = append(due, entry)
+		} else {
+			skipped = append(skipped, entry.ID)
 		}
 	}
 	for _, entry := range due {
@@ -413,7 +416,19 @@ func (m *quotaManager) runRound() {
 		m.runtime.RoundCursor = entry.ID
 		m.mu.Unlock()
 	}
+	// A newer passive observation can keep an auth fresh after its previous
+	// per-auth deadline expires. Keep the displayed deadline aligned with the
+	// next global round without issuing an unnecessary upstream probe.
+	nextRoundAt := m.now().Add(interval)
 	m.mu.Lock()
+	for _, authID := range skipped {
+		runtime := m.runtime.Auths[authID]
+		if !runtime.InMaintenanceScope || (!runtime.NextCheckAt.IsZero() && runtime.NextCheckAt.After(now)) {
+			continue
+		}
+		runtime.NextCheckAt = nextRoundAt
+		m.runtime.Auths[authID] = runtime
+	}
 	m.runtime.LastRoundAt = now
 	m.mu.Unlock()
 	_ = m.persist()

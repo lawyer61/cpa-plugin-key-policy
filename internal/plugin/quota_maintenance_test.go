@@ -125,6 +125,79 @@ func TestQuotaManagedPoolRefreshesButDoesNotActivateByDefault(t *testing.T) {
 	}
 }
 
+func TestQuotaRoundAdvancesExpiredNextCheckWhenFreshPassiveObservationSkipsProbe(t *testing.T) {
+	app, _ := configureBoundApp(t, "quota-fill-first", false)
+	clock := time.Date(2026, 9, 13, 16, 54, 24, 0, time.UTC)
+	host := newFakeQuotaHost(clock)
+	host.getResponses = []HostHTTPResponse{
+		{StatusCode: http.StatusOK, Body: quotaBody(clock, 10)},
+		{StatusCode: http.StatusOK, Body: quotaBody(clock.Add(time.Hour), 11)},
+	}
+	attachTestQuotaHost(app, host, clock)
+	app.quota.now = func() time.Time { return clock }
+	app.quota.cache.now = func() time.Time { return clock }
+	app.quota.testDurations = func() (time.Duration, time.Duration) {
+		return 30 * time.Minute, 30 * time.Minute
+	}
+
+	app.quota.runRound()
+	clock = time.Date(2026, 9, 13, 17, 7, 1, 0, time.UTC)
+	app.quota.recordUsage(UsageHandleRequest{
+		Provider:    "codex",
+		AuthID:      "account-a-team",
+		AuthIndex:   "idx-a",
+		RequestedAt: clock,
+		ResponseHeaders: http.Header{
+			"Date":                                  []string{clock.Format(http.TimeFormat)},
+			"X-Codex-Allowed":                       []string{"true"},
+			"X-Codex-Primary-Used-Percent":          []string{"10"},
+			"X-Codex-Primary-Window-Minutes":        []string{"300"},
+			"X-Codex-Primary-Reset-After-Seconds":   []string{"3600"},
+			"X-Codex-Secondary-Used-Percent":        []string{"20"},
+			"X-Codex-Secondary-Window-Minutes":      []string{"10080"},
+			"X-Codex-Secondary-Reset-After-Seconds": []string{"7200"},
+		},
+	})
+
+	clock = time.Date(2026, 9, 13, 17, 24, 25, 0, time.UTC)
+	app.quota.runRound()
+	_, get, post := host.counts()
+	if get != 1 || post != 0 {
+		t.Fatalf("fresh passive evidence caused extra upstream work: GET=%d POST=%d", get, post)
+	}
+
+	status := app.quota.status()
+	auths := status["auths"].([]map[string]any)
+	if len(auths) != 1 {
+		t.Fatalf("auth status count = %d, want 1", len(auths))
+	}
+	next, ok := auths[0]["next_check_at"].(time.Time)
+	if !ok {
+		t.Fatalf("next_check_at type = %T, want time.Time", auths[0]["next_check_at"])
+	}
+	want := time.Date(2026, 9, 13, 17, 54, 25, 0, time.UTC)
+	if !next.Equal(want) {
+		t.Fatalf("next_check_at = %s, want next maintenance round %s", next.Format(time.RFC3339), want.Format(time.RFC3339))
+	}
+	observation := auths[0]["observation"].(map[string]any)
+	if observation["source"] != "passive-http" {
+		t.Fatalf("observation source = %v, want passive-http", observation["source"])
+	}
+
+	clock = time.Date(2026, 9, 13, 17, 54, 26, 0, time.UTC)
+	app.quota.runRound()
+	_, get, post = host.counts()
+	if get != 2 || post != 0 {
+		t.Fatalf("next maintenance round work: GET=%d POST=%d, want GET=2 POST=0", get, post)
+	}
+	status = app.quota.status()
+	auths = status["auths"].([]map[string]any)
+	observation = auths[0]["observation"].(map[string]any)
+	if observation["source"] != "quota-get" {
+		t.Fatalf("observation source after next round = %v, want quota-get", observation["source"])
+	}
+}
+
 func TestQuotaGetHonorsRetryAfterBeyondCheckInterval(t *testing.T) {
 	app, _ := configureBoundApp(t, "quota-fill-first", false)
 	now := time.Date(2026, 9, 12, 10, 0, 0, 0, time.UTC)
@@ -292,6 +365,7 @@ func TestQuotaRosterRequiresConfirmedCredentialsAndMatchingRouteGroup(t *testing
 	app, _ := configureBoundApp(t, "quota-fill-first", false)
 	now := time.Date(2026, 9, 12, 10, 0, 0, 0, time.UTC)
 	host := newFakeQuotaHost(now)
+	attachTestQuotaHost(app, host, now)
 	team := host.entries[0]
 	free := HostAuthEntry{ID: "account-a-free", AuthIndex: "idx-free", Name: "account-a-free.json", Provider: "codex", Status: "active"}
 	unresolved := HostAuthEntry{ID: "account-a-disk", Name: "account-a-disk.json", Provider: "codex", Status: "active"}
