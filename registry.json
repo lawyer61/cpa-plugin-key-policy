@@ -6,7 +6,7 @@
       "name": "CPA Key Policy (lawyer61)",
       "description": "Fail-closed account isolation, concurrency limits, self-service usage, session affinity, and quota-aware Codex scheduling and cycle maintenance.",
       "author": "lawyer61",
-      "version": "0.7.3",
+      "version": "0.7.4",
       "repository": "https://github.com/lawyer61/cpa-plugin-key-policy",
       "homepage": "https://github.com/lawyer61/cpa-plugin-key-policy",
       "license": "MIT",
