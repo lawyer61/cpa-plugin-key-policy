@@ -1,8 +1,6 @@
 package plugin
 
 import (
-	"bufio"
-	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -27,7 +25,7 @@ const (
 	codexQuotaUserAgent     = "codex_cli_rs/0.76.0 (Debian 13.0.0; x86_64) WindowsTerminal"
 	quotaLazyTolerance      = 3 * time.Minute
 	quotaResetShift         = 2 * time.Minute
-	quotaMaxActivationTries = 2
+	quotaMaxActivationTries = 5
 )
 
 type quotaManager struct {
@@ -293,6 +291,14 @@ func (m *quotaManager) recordUsage(req UsageHandleRequest) {
 		return
 	}
 	receivedAt := m.now()
+	// A business observation between the two GETs invalidates the recovery
+	// streak. It must never itself count as evidence of an idle lazy window.
+	m.mu.Lock()
+	if runtime, ok := m.runtime.Auths[req.AuthID]; ok {
+		resetActivationRecovery(&runtime.Activation)
+		m.runtime.Auths[req.AuthID] = runtime
+	}
+	m.mu.Unlock()
 	observedAt := req.RequestedAt
 	if observedAt.IsZero() {
 		observedAt = receivedAt
@@ -436,10 +442,13 @@ func (m *quotaManager) alignMaintenanceDeadlines(nextRoundAt time.Time) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	for authID, runtime := range m.runtime.Auths {
-		if !runtime.InMaintenanceScope || runtime.NextCheckAt.After(nextRoundAt) {
+		if !runtime.InMaintenanceScope {
 			continue
 		}
-		runtime.NextCheckAt = nextRoundAt
+		if runtime.NextCheckAt.Before(nextRoundAt) {
+			runtime.NextCheckAt = nextRoundAt
+		}
+		alignActivationDeadline(&runtime)
 		m.runtime.Auths[authID] = runtime
 	}
 }
@@ -521,6 +530,9 @@ func (m *quotaManager) applyRoster(host HostClient, entries []HostAuthEntry, set
 		runtime.InManagedPool = managed
 		runtime.InMaintenanceScope = maintenance
 		runtime.InActivationScope = activation
+		if !activation || !maintenance || evaluation.reason != "" || entry.Unavailable {
+			resetActivationRecovery(&runtime.Activation)
+		}
 		runtime.LastRosterSeenAt = now
 		runtime.OutOfScopeAt = time.Time{}
 		runtime.ExclusionReason = evaluation.reason
@@ -544,6 +556,7 @@ func (m *quotaManager) applyRoster(host HostClient, entries []HostAuthEntry, set
 		runtime.InManagedPool = false
 		runtime.InMaintenanceScope = false
 		runtime.InActivationScope = false
+		resetActivationRecovery(&runtime.Activation)
 		runtime.ExclusionReason = "removed_or_unlisted"
 		if runtime.OutOfScopeAt.IsZero() {
 			runtime.OutOfScopeAt = now
@@ -847,6 +860,7 @@ func fetchCodexQuota(host HostClient, credentials codexCredentials, now func() t
 
 func (m *quotaManager) processObservation(authID, authIndex, fingerprint string, observation quotaObservation, now time.Time) []quotaWindowKind {
 	activationModel := m.store.RuntimeSettings().QuotaActivationModel
+	interval, _ := m.durations()
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	runtime := m.runtime.Auths[authID]
@@ -891,10 +905,10 @@ func (m *quotaManager) processObservation(authID, authIndex, fingerprint string,
 	}
 	windows := observationWindows(observation)
 	if runtime.Activation.CycleID != "" && runtime.Activation.Status != "confirmed" {
-		confirmed := true
+		confirmed := len(runtime.Activation.Windows) > 0
 		for _, kind := range runtime.Activation.Windows {
 			window, ok := windows[kind]
-			if !ok || window.UsedPercent == nil || (*window.UsedPercent == 0 && strictLazyWindow(now, window)) {
+			if !ok || observation.ExplicitExhausted || !activationWindowConfirmed(window, now) {
 				confirmed = false
 				continue
 			}
@@ -902,15 +916,26 @@ func (m *quotaManager) processObservation(authID, authIndex, fingerprint string,
 		}
 		if confirmed {
 			runtime.Activation.Status = "confirmed"
+			runtime.Activation.LastResult = "verified"
+			runtime.Activation.LastError = ""
 			runtime.Activation.SendIntent = false
 			runtime.Activation.NextCheckAt = time.Time{}
+			resetActivationRecovery(&runtime.Activation)
 			m.runtime.Auths[authID] = runtime
 			return nil
 		}
 		if runtime.Activation.Status == "sending" {
 			runtime.Activation.Status = "verify_pending"
 		}
+		observeActivationRecovery(&runtime.Activation, observation, now, interval)
+		if runtime.Activation.Attempts >= quotaMaxActivationTries {
+			runtime.Activation.Status = "attempts_exhausted"
+			runtime.Activation.NextCheckAt = time.Time{}
+		}
 		m.runtime.Auths[authID] = runtime
+		if !activationWindowsAreLazy(runtime.Activation, observation, now) || runtime.Activation.Attempts >= quotaMaxActivationTries || (runtime.Activation.Attempts > 0 && !runtime.Activation.RetryAllowed) {
+			return nil
+		}
 		return append([]quotaWindowKind(nil), runtime.Activation.Windows...)
 	}
 
@@ -956,7 +981,8 @@ func legacyCompact404Activation(state quotaActivationState) bool {
 }
 
 func rejectedActivationUsesDifferentModel(state quotaActivationState, currentModel string) bool {
-	if state.Protocol != codexActivationProtocol || state.CycleID == "" || state.Attempts == 0 || !state.RetryAllowed || !activationResultDefinitelyRejected(state.LastResult) {
+	streamRejected := state.ResponseOutcome == "failed" && activationErrorDefinitelyRejected(state.ResponseErrorCode) && !activationHasExecutionEvidence(state)
+	if state.Protocol != codexActivationProtocol || state.CycleID == "" || state.Attempts == 0 || !state.RetryAllowed || (!activationResultDefinitelyRejected(state.LastResult) && !streamRejected) {
 		return false
 	}
 	previousModel := strings.TrimSpace(state.Model)
@@ -1099,6 +1125,12 @@ func (m *quotaManager) tryActivate(host HostClient, rosterEntry HostAuthEntry, c
 	runtime.Activation.SendIntent = true
 	runtime.Activation.RetryAllowed = false
 	runtime.Activation.LastError = ""
+	runtime.Activation.LastResult = "outcome_unknown"
+	runtime.Activation.ResponseOutcome = "unknown"
+	runtime.Activation.ResponseErrorCode = ""
+	runtime.Activation.OutputObserved = false
+	runtime.Activation.InputTokens, runtime.Activation.OutputTokens, runtime.Activation.TotalTokens = 0, 0, 0
+	runtime.Activation.RecoveryObservations = nil
 	runtime.Activation.Windows = append([]quotaWindowKind(nil), lazy...)
 	m.runtime.Auths[rosterEntry.ID] = runtime
 	m.mu.Unlock()
@@ -1144,10 +1176,27 @@ func (m *quotaManager) tryActivate(host HostClient, rosterEntry HostAuthEntry, c
 	} else {
 		runtime.Activation.LastResult = "http_" + strconv.Itoa(response.StatusCode)
 		runtime.Activation.RetryAllowed = activationResponseDefinitelyRejected(response.StatusCode)
+		evidence := parseActivationResponse(response.Body)
+		runtime.Activation.ResponseOutcome = evidence.Outcome
+		runtime.Activation.ResponseErrorCode = evidence.ErrorCode
+		runtime.Activation.OutputObserved = evidence.HasOutput
+		runtime.Activation.InputTokens = evidence.InputTokens
+		runtime.Activation.OutputTokens = evidence.OutputTokens
+		runtime.Activation.TotalTokens = evidence.TotalTokens
+		if evidence.ErrorCode != "" {
+			runtime.Activation.LastError = runtime.Activation.LastResult + ": response." + evidence.Outcome + ": " + evidence.ErrorCode
+		} else if evidence.Outcome == "unknown" || evidence.Outcome == "incomplete" {
+			runtime.Activation.LastError = runtime.Activation.LastResult + ": response." + evidence.Outcome
+		}
+		if response.StatusCode >= 200 && response.StatusCode < 300 {
+			runtime.Activation.RetryAllowed = evidence.definitelyRejected()
+		}
+		if activationHasExecutionEvidence(runtime.Activation) || evidence.Outcome == "incomplete" {
+			runtime.Activation.RetryAllowed = false
+		}
 		if runtime.Activation.RetryAllowed {
 			runtime.Activation.SendIntent = false
 		}
-		readActivationUsage(response.Body, &runtime.Activation)
 	}
 	m.runtime.Auths[rosterEntry.ID] = runtime
 	m.mu.Unlock()
@@ -1165,17 +1214,17 @@ func (m *quotaManager) tryActivate(host HostClient, rosterEntry HostAuthEntry, c
 		verified.AuthIndex = rosterEntry.AuthIndex
 		verified.CredentialFingerprint = codexCredentialFingerprint(credentials)
 		m.cache.observe(rosterEntry.ID, rosterEntry.AuthIndex, "quota-get", verified)
-		remaining := m.processObservation(rosterEntry.ID, rosterEntry.AuthIndex, verified.CredentialFingerprint, verified, verifyAt)
+		m.processObservation(rosterEntry.ID, rosterEntry.AuthIndex, verified.CredentialFingerprint, verified, verifyAt)
 		m.mu.Lock()
 		runtime = m.runtime.Auths[rosterEntry.ID]
 		runtime.Activation.SendIntent = false
-		if len(remaining) == 0 {
+		if runtime.Activation.Status == "confirmed" {
 			runtime.Activation.Status = "confirmed"
 			runtime.Activation.LastResult = "verified"
 			runtime.Activation.NextCheckAt = time.Time{}
 		} else if runtime.Activation.Attempts >= quotaMaxActivationTries {
-			runtime.Activation.Status = "deferred"
-			runtime.Activation.NextCheckAt = verifyAt.Add(interval)
+			runtime.Activation.Status = "attempts_exhausted"
+			runtime.Activation.NextCheckAt = time.Time{}
 		} else {
 			runtime.Activation.Status = "verify_pending"
 			runtime.Activation.NextCheckAt = verifyAt.Add(interval)
@@ -1206,21 +1255,8 @@ func readActivationUsage(raw []byte, state *quotaActivationState) {
 	if state == nil || len(raw) == 0 {
 		return
 	}
-	if readActivationUsageJSON(raw, state) {
-		return
-	}
-	scanner := bufio.NewScanner(bytes.NewReader(raw))
-	for scanner.Scan() {
-		line := strings.TrimSpace(scanner.Text())
-		if !strings.HasPrefix(line, "data:") {
-			continue
-		}
-		payload := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
-		if payload == "" || payload == "[DONE]" {
-			continue
-		}
-		_ = readActivationUsageJSON([]byte(payload), state)
-	}
+	evidence := parseActivationResponse(raw)
+	state.InputTokens, state.OutputTokens, state.TotalTokens = evidence.InputTokens, evidence.OutputTokens, evidence.TotalTokens
 }
 
 func readActivationUsageJSON(raw []byte, state *quotaActivationState) bool {
@@ -1295,6 +1331,7 @@ func (m *quotaManager) setNextCheck(authID string, next time.Time) {
 	m.mu.Lock()
 	runtime := m.runtime.Auths[authID]
 	runtime.NextCheckAt = next
+	alignActivationDeadline(&runtime)
 	m.runtime.Auths[authID] = runtime
 	m.mu.Unlock()
 }
@@ -1302,6 +1339,7 @@ func (m *quotaManager) setNextCheck(authID string, next time.Time) {
 func (m *quotaManager) setAuthError(authID, result string, err error) {
 	m.mu.Lock()
 	runtime := m.runtime.Auths[authID]
+	resetActivationRecovery(&runtime.Activation)
 	runtime.LastCheckAt = m.now()
 	runtime.LastResult = result
 	runtime.LastError = safeQuotaError(err)
@@ -1327,7 +1365,11 @@ func (m *quotaManager) setAuthActivationDeferred(authID, result string, next tim
 	m.mu.Lock()
 	runtime := m.runtime.Auths[authID]
 	runtime.Activation.Status = "deferred"
-	runtime.Activation.LastResult = result
+	if runtime.Activation.Attempts == 0 {
+		runtime.Activation.LastResult = result
+	} else {
+		runtime.Activation.LastError = result
+	}
 	runtime.Activation.NextCheckAt = next
 	m.runtime.Auths[authID] = runtime
 	m.mu.Unlock()
@@ -1378,6 +1420,12 @@ func cloneQuotaRuntimeDocument(src quotaRuntimeDocument) quotaRuntimeDocument {
 	for authID, runtime := range src.Auths {
 		copy := runtime
 		copy.Activation.Windows = append([]quotaWindowKind(nil), runtime.Activation.Windows...)
+		if runtime.Activation.RecoveryObservations != nil {
+			copy.Activation.RecoveryObservations = make(map[quotaWindowKind]quotaWindowBaseline, len(runtime.Activation.RecoveryObservations))
+			for kind, baseline := range runtime.Activation.RecoveryObservations {
+				copy.Activation.RecoveryObservations[kind] = baseline
+			}
+		}
 		copy.Baselines = make(map[quotaWindowKind]quotaWindowBaseline, len(runtime.Baselines))
 		for kind, baseline := range runtime.Baselines {
 			copy.Baselines[kind] = baseline
@@ -1449,6 +1497,7 @@ func (m *quotaManager) status() map[string]any {
 		"quota_activation_enabled":      settings.QuotaActivationEnabled,
 		"quota_activation_scope":        settings.QuotaActivationScope,
 		"quota_activation_model":        settings.QuotaActivationModel,
+		"quota_activation_max_attempts": quotaMaxActivationTries,
 		"runtime_path":                  path,
 		"persistence_blocked":           blocked,
 		"persistence_error":             persistErr,

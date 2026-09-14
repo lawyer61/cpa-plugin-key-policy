@@ -103,6 +103,9 @@ CPA 原生 key 默认完全不受影响；只有显式以 `native: true` 导入�
 - 自动激活默认关闭。开启后可选 `managed-pools` 或 `all-codex`；后者也覆盖只被 CPA 原生 key 使用和暂未使用的有效 Codex OAuth auth，但**绝不扩大任何 key 的业务允许池**。
 - 激活使用严格的懒窗口基线、很小且不存储的 response 请求和后验 GET 验证。模型可通过 `quota_activation_model` 修改，默认是 `gpt-5.6-luna`；请求与受控业务共享 auth 并发上限，但不消耗用户 key 的 RPM/账本。未接管的原生请求仍不计入插件并发，因此该上限不是全宿主物理并发硬限制。
 - 额度与激活运行状态保存在 `<state_file>.quota-runtime.json`；Docker 应挂载 `state_file` 所在整个目录。
+- 激活分别记录 HTTP 状态和 JSON/SSE 生成结果。HTTP 200 中的 `response.failed` 会显示脱敏错误码，不再被 `http_200` 掩盖；已有生成完成、输出或正 token 证据的请求不会自动重复。
+- 每个激活序列**总共最多尝试 5 次，包含首次**。未知 200 若没有完成/输出/token 证据，需要至少相隔一个检查周期的两次新鲜额度 GET，均证明零用量且 reset 随观察时间按完整窗口滑动，才恢复下一次尝试。每次恢复重新取证；重启、刷新或 reset 变化不清零次数。达到 `attempts_exhausted` 后继续查额度，不再发送激活请求。上限为固定值，`/quota-status` 的 `quota_activation_max_attempts` 可查看，不是可编辑设置。
+- 待验证激活的 `next_check_at` 与 auth 的真实维护截止时间同步。升级无需删除主状态或 runtime；旧未知 200 的首次观察只建立恢复证据，不会立即重发。
 
 **运行边界：** 这是纯插件控制。账号绑定流量必须保持插件启用且健康，也不能使用 CPA Home 模式，因为 Home 会在普通插件 scheduler 之前完成选择。若插件被卸载或熔断，仍留在 CPA `api-keys` 中的原生 key 会重新只受宿主全局账号池控制。若要求插件被移除时也尽量失败关闭，请使用插件签发的 key，并且绝不要把它重复放进 CPA `api-keys`。
 

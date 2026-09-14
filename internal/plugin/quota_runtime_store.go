@@ -21,21 +21,25 @@ type quotaWindowBaseline struct {
 }
 
 type quotaActivationState struct {
-	Protocol      string            `json:"protocol,omitempty"`
-	Model         string            `json:"model,omitempty"`
-	Status        string            `json:"status,omitempty"`
-	CycleID       string            `json:"cycle_id,omitempty"`
-	Windows       []quotaWindowKind `json:"windows,omitempty"`
-	Attempts      int               `json:"attempts,omitempty"`
-	LastAttemptAt time.Time         `json:"last_attempt_at,omitempty"`
-	NextCheckAt   time.Time         `json:"next_check_at,omitempty"`
-	SendIntent    bool              `json:"send_intent,omitempty"`
-	RetryAllowed  bool              `json:"retry_allowed,omitempty"`
-	LastResult    string            `json:"last_result,omitempty"`
-	LastError     string            `json:"last_error,omitempty"`
-	InputTokens   int64             `json:"input_tokens,omitempty"`
-	OutputTokens  int64             `json:"output_tokens,omitempty"`
-	TotalTokens   int64             `json:"total_tokens,omitempty"`
+	Protocol             string                                  `json:"protocol,omitempty"`
+	Model                string                                  `json:"model,omitempty"`
+	Status               string                                  `json:"status,omitempty"`
+	CycleID              string                                  `json:"cycle_id,omitempty"`
+	Windows              []quotaWindowKind                       `json:"windows,omitempty"`
+	Attempts             int                                     `json:"attempts,omitempty"`
+	LastAttemptAt        time.Time                               `json:"last_attempt_at,omitempty"`
+	NextCheckAt          time.Time                               `json:"next_check_at,omitempty"`
+	SendIntent           bool                                    `json:"send_intent,omitempty"`
+	RetryAllowed         bool                                    `json:"retry_allowed,omitempty"`
+	LastResult           string                                  `json:"last_result,omitempty"`
+	LastError            string                                  `json:"last_error,omitempty"`
+	InputTokens          int64                                   `json:"input_tokens,omitempty"`
+	OutputTokens         int64                                   `json:"output_tokens,omitempty"`
+	TotalTokens          int64                                   `json:"total_tokens,omitempty"`
+	ResponseOutcome      string                                  `json:"response_outcome,omitempty"`
+	ResponseErrorCode    string                                  `json:"response_error_code,omitempty"`
+	OutputObserved       bool                                    `json:"output_observed,omitempty"`
+	RecoveryObservations map[quotaWindowKind]quotaWindowBaseline `json:"recovery_observations,omitempty"`
 }
 
 type quotaAuthRuntime struct {

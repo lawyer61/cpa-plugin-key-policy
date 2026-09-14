@@ -832,7 +832,7 @@ func TestQuotaCurrentProtocol404AtLimitIsNotMigratedAgain(t *testing.T) {
 	app.quota.mu.Lock()
 	activation := app.quota.runtime.Auths["account-a-team"].Activation
 	app.quota.mu.Unlock()
-	if activation.Attempts != quotaMaxActivationTries || activation.Protocol != codexActivationProtocol || activation.Status != "deferred" {
+	if activation.Attempts != quotaMaxActivationTries || activation.Protocol != codexActivationProtocol || activation.Status != "attempts_exhausted" {
 		t.Fatalf("current protocol activation changed unexpectedly: %#v", activation)
 	}
 }
