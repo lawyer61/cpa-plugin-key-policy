@@ -1,6 +1,8 @@
 package plugin
 
 import (
+	"bufio"
+	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -20,10 +22,11 @@ import (
 
 const (
 	codexQuotaEndpoint      = "https://chatgpt.com/backend-api/wham/usage"
-	codexActivationEndpoint = "https://chatgpt.com/backend-api/codex/responses/compact"
+	codexActivationEndpoint = "https://chatgpt.com/backend-api/codex/responses"
+	codexActivationProtocol = "responses-v1"
 	codexActivationModel    = "gpt-5.4-mini"
 	codexQuotaUserAgent     = "codex_cli_rs/0.76.0 (Debian 13.0.0; x86_64) WindowsTerminal"
-	codexActivationPayload  = `{"model":"gpt-5.4-mini","instructions":"","input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"ping"}]}]}`
+	codexActivationPayload  = `{"model":"gpt-5.4-mini","instructions":"","input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"ping"}]}],"stream":true,"store":false}`
 	quotaLazyTolerance      = 3 * time.Minute
 	quotaResetShift         = 2 * time.Minute
 	quotaMaxActivationTries = 2
@@ -862,6 +865,20 @@ func (m *quotaManager) processObservation(authID, authIndex, fingerprint string,
 	if runtime.Baselines == nil {
 		runtime.Baselines = make(map[quotaWindowKind]quotaWindowBaseline)
 	}
+	if legacyCompact404Activation(runtime.Activation) {
+		// The original implementation followed the reference plugin's old
+		// /responses/compact probe. A later reference fix moved lazy-window
+		// activation to /responses after the compact endpoint began returning a
+		// definite 404. That response proves the old request was rejected, so it
+		// is safe to clear only that protocol's attempt budget and retry with the
+		// current protocol. The marker prevents a current-protocol 404 from being
+		// migrated repeatedly.
+		runtime.Activation = quotaActivationState{
+			Protocol:   codexActivationProtocol,
+			Status:     "watching",
+			LastResult: "legacy_compact_404_migrated",
+		}
+	}
 	windows := observationWindows(observation)
 	if runtime.Activation.CycleID != "" && runtime.Activation.Status != "confirmed" {
 		confirmed := true
@@ -916,12 +933,16 @@ func (m *quotaManager) processObservation(authID, authIndex, fingerprint string,
 	if len(lazy) > 0 {
 		sort.Slice(lazy, func(i, j int) bool { return lazy[i] < lazy[j] })
 		cycleID := quotaCycleID(fingerprint, runtime.Baselines, lazy)
-		runtime.Activation = quotaActivationState{Status: "ready", CycleID: cycleID, Windows: append([]quotaWindowKind(nil), lazy...)}
-	} else if runtime.Activation.Status != "anomaly_hold" {
+		runtime.Activation = quotaActivationState{Protocol: codexActivationProtocol, Status: "ready", CycleID: cycleID, Windows: append([]quotaWindowKind(nil), lazy...)}
+	} else if runtime.Activation.Status == "" {
 		runtime.Activation.Status = "watching"
 	}
 	m.runtime.Auths[authID] = runtime
 	return lazy
+}
+
+func legacyCompact404Activation(state quotaActivationState) bool {
+	return state.Protocol == "" && state.CycleID != "" && state.Attempts > 0 && state.RetryAllowed && state.LastResult == "http_404"
 }
 
 func observationWindows(observation quotaObservation) map[quotaWindowKind]quotaWindow {
@@ -1021,6 +1042,7 @@ func (m *quotaManager) tryActivate(host HostClient, rosterEntry HostAuthEntry, c
 	m.mu.Lock()
 	runtime = m.runtime.Auths[rosterEntry.ID]
 	runtime.Activation.Status = "sending"
+	runtime.Activation.Protocol = codexActivationProtocol
 	runtime.Activation.Attempts++
 	runtime.Activation.LastAttemptAt = now
 	runtime.Activation.SendIntent = true
@@ -1133,17 +1155,52 @@ func readActivationUsage(raw []byte, state *quotaActivationState) {
 	if state == nil || len(raw) == 0 {
 		return
 	}
+	if readActivationUsageJSON(raw, state) {
+		return
+	}
+	scanner := bufio.NewScanner(bytes.NewReader(raw))
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if !strings.HasPrefix(line, "data:") {
+			continue
+		}
+		payload := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
+		if payload == "" || payload == "[DONE]" {
+			continue
+		}
+		_ = readActivationUsageJSON([]byte(payload), state)
+	}
+}
+
+func readActivationUsageJSON(raw []byte, state *quotaActivationState) bool {
 	var doc map[string]any
 	if json.Unmarshal(raw, &doc) != nil {
-		return
+		return false
 	}
 	usage, ok := mapChild(doc, "usage")
 	if !ok {
-		return
+		response, hasResponse := mapChild(doc, "response")
+		if !hasResponse {
+			return false
+		}
+		usage, ok = mapChild(response, "usage")
+		if !ok {
+			return false
+		}
 	}
-	state.InputTokens, _ = mapInt64(usage, "input_tokens", "inputTokens")
-	state.OutputTokens, _ = mapInt64(usage, "output_tokens", "outputTokens")
-	state.TotalTokens, _ = mapInt64(usage, "total_tokens", "totalTokens")
+	input, inputOK := mapInt64(usage, "input_tokens", "inputTokens")
+	output, outputOK := mapInt64(usage, "output_tokens", "outputTokens")
+	total, totalOK := mapInt64(usage, "total_tokens", "totalTokens")
+	if inputOK {
+		state.InputTokens = input
+	}
+	if outputOK {
+		state.OutputTokens = output
+	}
+	if totalOK {
+		state.TotalTokens = total
+	}
+	return inputOK || outputOK || totalOK
 }
 
 func (m *quotaManager) waitVerifyDelay() bool {

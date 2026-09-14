@@ -9,6 +9,7 @@ import type {
   CredentialDescriptor,
   SchedulerSettings,
   SchedulerSettingsPatch,
+  QuotaAuthStatus,
   QuotaStatus,
   QuotaWindowStatus,
 } from "../types";
@@ -414,7 +415,7 @@ function RuntimeSettingsPanel({
                   <QuotaMeta label={t("mapping.quotaObservedAt")} value={formatQuotaTime(auth.observation?.observed_at)} />
                   <QuotaMeta label={t("mapping.quotaNextCheckAt")} value={formatQuotaTime(auth.next_check_at)} />
                   <QuotaMeta label={t("mapping.quotaMaintenanceResult")} value={auth.last_result || auth.last_error || auth.exclusion_reason} />
-                  <QuotaMeta label={t("mapping.quotaActivationResult")} value={auth.activation?.status || auth.activation?.last_result || auth.activation?.last_error} />
+                  <QuotaMeta label={t("mapping.quotaActivationResult")} value={formatQuotaActivationResult(auth.activation)} />
                   <QuotaMeta label={t("mapping.quotaControlledConcurrency")} value={`${auth.controlled_in_flight} / ${auth.activation_in_flight}`} />
                 </dl>
               </div>
@@ -470,6 +471,14 @@ export function formatQuotaTime(value?: string): string {
   const parsed = new Date(value);
   if (Number.isNaN(parsed.getTime()) || parsed.getUTCFullYear() <= 1) return "—";
   return parsed.toLocaleString();
+}
+
+export function formatQuotaActivationResult(activation?: QuotaAuthStatus["activation"]): string | undefined {
+  if (!activation) return undefined;
+  const status = activation.status?.trim();
+  const detail = activation.last_error?.trim() || activation.last_result?.trim();
+  if (status && detail && status !== detail) return `${status} · ${detail}`;
+  return detail || status;
 }
 
 function AliasCard({ alias, onDelete, onEdit }: { alias: AliasMapping; onDelete: (n: string) => void; onEdit: (n: string) => void }) {

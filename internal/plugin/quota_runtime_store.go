@@ -21,6 +21,7 @@ type quotaWindowBaseline struct {
 }
 
 type quotaActivationState struct {
+	Protocol      string            `json:"protocol,omitempty"`
 	Status        string            `json:"status,omitempty"`
 	CycleID       string            `json:"cycle_id,omitempty"`
 	Windows       []quotaWindowKind `json:"windows,omitempty"`

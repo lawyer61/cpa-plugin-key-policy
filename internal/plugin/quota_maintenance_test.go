@@ -609,6 +609,208 @@ func TestQuotaLazyWindowRequiresBaselineThenActivatesAndVerifies(t *testing.T) {
 	}
 }
 
+func TestQuotaShortLazyWindowUsesResponsesActivationProtocol(t *testing.T) {
+	app := configuredQuotaTestApp(t)
+	enabled := true
+	scope := "all-codex"
+	if _, err := app.store.UpdateRuntimeSettings(policy.RuntimeSettingsPatch{QuotaActivationEnabled: &enabled, QuotaActivationScope: &scope}); err != nil {
+		t.Fatal(err)
+	}
+	clock := time.Date(2026, 9, 14, 11, 18, 33, 0, time.UTC)
+	host := newFakeQuotaHost(clock)
+	host.getResponses = []HostHTTPResponse{
+		{StatusCode: http.StatusOK, Body: shortQuotaBody(0)},
+		{StatusCode: http.StatusOK, Body: shortQuotaBody(0)},
+		{StatusCode: http.StatusOK, Body: shortQuotaBody(1)},
+	}
+	attachTestQuotaHost(app, host, clock)
+	app.quota.now = func() time.Time { return clock }
+	app.quota.cache.now = func() time.Time { return clock }
+	app.quota.verifyDelay = 0
+
+	app.quota.runRound()
+	if _, _, post := host.counts(); post != 0 {
+		t.Fatalf("first short-window observation posted %d activation(s)", post)
+	}
+	clock = clock.Add(31 * time.Minute)
+	app.quota.runRound()
+
+	host.mu.Lock()
+	requests := append([]HostHTTPRequest(nil), host.requests...)
+	host.mu.Unlock()
+	var activationRequest *HostHTTPRequest
+	for i := range requests {
+		if requests[i].Method == http.MethodPost {
+			copy := requests[i]
+			activationRequest = &copy
+			break
+		}
+	}
+	if activationRequest == nil {
+		t.Fatal("strict moving five-hour reset did not send an activation request")
+	}
+	if activationRequest.URL != "https://chatgpt.com/backend-api/codex/responses" {
+		t.Fatalf("activation URL = %q", activationRequest.URL)
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(activationRequest.Body, &payload); err != nil {
+		t.Fatalf("decode activation payload: %v", err)
+	}
+	if stream, ok := payload["stream"].(bool); !ok || !stream {
+		t.Fatalf("activation stream = %#v, want true", payload["stream"])
+	}
+	if store, ok := payload["store"].(bool); !ok || store {
+		t.Fatalf("activation store = %#v, want false", payload["store"])
+	}
+}
+
+func TestQuotaLegacyCompact404StateRetriesOnceWithCurrentProtocol(t *testing.T) {
+	app := configuredQuotaTestApp(t)
+	enabled := true
+	scope := "all-codex"
+	if _, err := app.store.UpdateRuntimeSettings(policy.RuntimeSettingsPatch{QuotaActivationEnabled: &enabled, QuotaActivationScope: &scope}); err != nil {
+		t.Fatal(err)
+	}
+	clock := time.Date(2026, 9, 14, 11, 48, 40, 0, time.UTC)
+	host := newFakeQuotaHost(clock)
+	host.getResponses = []HostHTTPResponse{
+		{StatusCode: http.StatusOK, Body: shortQuotaBody(0)},
+		{StatusCode: http.StatusOK, Body: shortQuotaBody(1)},
+	}
+	attachTestQuotaHost(app, host, clock)
+	app.quota.now = func() time.Time { return clock }
+	app.quota.cache.now = func() time.Time { return clock }
+	app.quota.verifyDelay = 0
+	app.quota.mu.Lock()
+	app.quota.runtime.Auths["account-a-team"] = quotaAuthRuntime{
+		AuthID:                "account-a-team",
+		AuthIndex:             "idx-a",
+		Provider:              "codex",
+		InMaintenanceScope:    true,
+		InActivationScope:     true,
+		CredentialFingerprint: codexCredentialFingerprint(codexCredentials{AccountID: "acct-a"}),
+		Baselines: map[quotaWindowKind]quotaWindowBaseline{
+			quotaWindowShort: {
+				Kind:          quotaWindowShort,
+				ResetAt:       clock.Add(5*time.Hour - 31*time.Minute),
+				UsedPercent:   0,
+				WindowSeconds: quotaFiveHourSeconds,
+				ObservedAt:    clock.Add(-31 * time.Minute),
+			},
+		},
+		Activation: quotaActivationState{
+			Status:        "watching",
+			CycleID:       "legacy-compact-cycle",
+			Windows:       []quotaWindowKind{quotaWindowShort},
+			Attempts:      quotaMaxActivationTries,
+			LastAttemptAt: clock.Add(-12 * time.Hour),
+			RetryAllowed:  true,
+			LastResult:    "http_404",
+		},
+	}
+	app.quota.mu.Unlock()
+
+	app.quota.runRound()
+	_, get, post := host.counts()
+	if get != 2 || post != 1 {
+		t.Fatalf("legacy compact 404 migration counts: get=%d post=%d", get, post)
+	}
+	app.quota.mu.Lock()
+	activation := app.quota.runtime.Auths["account-a-team"].Activation
+	app.quota.mu.Unlock()
+	if activation.Status != "confirmed" || activation.Attempts != 1 || activation.LastResult != "verified" {
+		t.Fatalf("migrated activation = %#v", activation)
+	}
+}
+
+func TestQuotaCurrentProtocol404AtLimitIsNotMigratedAgain(t *testing.T) {
+	app := configuredQuotaTestApp(t)
+	enabled := true
+	scope := "all-codex"
+	if _, err := app.store.UpdateRuntimeSettings(policy.RuntimeSettingsPatch{QuotaActivationEnabled: &enabled, QuotaActivationScope: &scope}); err != nil {
+		t.Fatal(err)
+	}
+	clock := time.Date(2026, 9, 14, 12, 18, 44, 0, time.UTC)
+	host := newFakeQuotaHost(clock)
+	host.getResponses = []HostHTTPResponse{{StatusCode: http.StatusOK, Body: shortQuotaBody(0)}}
+	attachTestQuotaHost(app, host, clock)
+	app.quota.now = func() time.Time { return clock }
+	app.quota.cache.now = func() time.Time { return clock }
+	app.quota.mu.Lock()
+	app.quota.runtime.Auths["account-a-team"] = quotaAuthRuntime{
+		AuthID:                "account-a-team",
+		AuthIndex:             "idx-a",
+		Provider:              "codex",
+		InMaintenanceScope:    true,
+		InActivationScope:     true,
+		CredentialFingerprint: codexCredentialFingerprint(codexCredentials{AccountID: "acct-a"}),
+		Baselines: map[quotaWindowKind]quotaWindowBaseline{
+			quotaWindowShort: {Kind: quotaWindowShort, ResetAt: clock.Add(5*time.Hour - 31*time.Minute), WindowSeconds: quotaFiveHourSeconds, ObservedAt: clock.Add(-31 * time.Minute)},
+		},
+		Activation: quotaActivationState{
+			Protocol:      codexActivationProtocol,
+			Status:        "deferred",
+			CycleID:       "current-protocol-cycle",
+			Windows:       []quotaWindowKind{quotaWindowShort},
+			Attempts:      quotaMaxActivationTries,
+			LastAttemptAt: clock.Add(-31 * time.Minute),
+			RetryAllowed:  true,
+			LastResult:    "http_404",
+		},
+	}
+	app.quota.mu.Unlock()
+
+	app.quota.runRound()
+	_, get, post := host.counts()
+	if get != 1 || post != 0 {
+		t.Fatalf("current protocol attempt budget was reset: get=%d post=%d", get, post)
+	}
+	app.quota.mu.Lock()
+	activation := app.quota.runtime.Auths["account-a-team"].Activation
+	app.quota.mu.Unlock()
+	if activation.Attempts != quotaMaxActivationTries || activation.Protocol != codexActivationProtocol || activation.Status != "deferred" {
+		t.Fatalf("current protocol activation changed unexpectedly: %#v", activation)
+	}
+}
+
+func TestQuotaConfirmedActivationIsNotOverwrittenByWatching(t *testing.T) {
+	app := configuredQuotaTestApp(t)
+	now := time.Date(2026, 9, 14, 12, 30, 0, 0, time.UTC)
+	used := 1.0
+	app.quota.mu.Lock()
+	app.quota.runtime.Auths["account-a-team"] = quotaAuthRuntime{
+		AuthID: "account-a-team",
+		Baselines: map[quotaWindowKind]quotaWindowBaseline{
+			quotaWindowShort: {Kind: quotaWindowShort, ResetAt: now.Add(4 * time.Hour), UsedPercent: 1, WindowSeconds: quotaFiveHourSeconds, ObservedAt: now.Add(-time.Minute)},
+		},
+		Activation: quotaActivationState{Status: "confirmed", CycleID: "confirmed-cycle", Windows: []quotaWindowKind{quotaWindowShort}, Attempts: 1, LastResult: "verified"},
+	}
+	app.quota.mu.Unlock()
+
+	lazy := app.quota.processObservation("account-a-team", "idx-a", "fingerprint-a", quotaObservation{
+		Provider:   "codex",
+		ObservedAt: now,
+		Short:      &quotaWindow{Kind: quotaWindowShort, UsedPercent: &used, WindowSeconds: quotaFiveHourSeconds, ResetAt: now.Add(4 * time.Hour)},
+	}, now)
+	if len(lazy) != 0 {
+		t.Fatalf("active window classified lazy: %v", lazy)
+	}
+	app.quota.mu.Lock()
+	activation := app.quota.runtime.Auths["account-a-team"].Activation
+	app.quota.mu.Unlock()
+	if activation.Status != "confirmed" || activation.LastResult != "verified" {
+		t.Fatalf("confirmed activation was overwritten: %#v", activation)
+	}
+}
+
+func TestReadActivationUsageFromResponsesSSE(t *testing.T) {
+	var state quotaActivationState
+	readActivationUsage([]byte("event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":3,\"output_tokens\":2,\"total_tokens\":5}}}\n\n"), &state)
+	if state.InputTokens != 3 || state.OutputTokens != 2 || state.TotalTokens != 5 {
+		t.Fatalf("SSE activation usage = %#v", state)
+	}
+}
+
 func TestQuotaUncertainSuccessfulPOSTIsVerifiedWithoutAutomaticResend(t *testing.T) {
 	app := configuredQuotaTestApp(t)
 	enabled := true
@@ -756,6 +958,10 @@ func quotaCredentialJSON(now time.Time, planType, accountID, accessToken, refres
 func quotaBody(observedAt time.Time, used float64) []byte {
 	resetAt := observedAt.Add(7 * 24 * time.Hour).Format(time.RFC3339)
 	return []byte(`{"plan_type":"team","rate_limit":{"allowed":true,"primary_window":{"used_percent":10,"limit_window_seconds":18000,"reset_after_seconds":3600},"secondary_window":{"used_percent":` + formatFloat(used) + `,"limit_window_seconds":604800,"reset_at":"` + resetAt + `"}}}`)
+}
+
+func shortQuotaBody(used float64) []byte {
+	return []byte(`{"plan_type":"team","rate_limit":{"allowed":true,"primary_window":{"used_percent":` + formatFloat(used) + `,"limit_window_seconds":18000,"reset_after_seconds":18000},"secondary_window":{"used_percent":10,"limit_window_seconds":604800,"reset_after_seconds":604800}}}`)
 }
 
 func formatFloat(value float64) string {
