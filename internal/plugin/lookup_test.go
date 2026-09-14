@@ -27,6 +27,15 @@ func lookupRequestForTest(t *testing.T, app *App, headers http.Header, query url
 
 func TestLookupReturnsOnlyOwnLightweightUsageAndConcurrency(t *testing.T) {
 	app, plain := configurePricedApp(t)
+	if err := app.store.UpsertKey(policy.KeyConfig{
+		ID:      "other",
+		Name:    "Other Key",
+		Enabled: true,
+		KeyHash: hashForTest(t, "cpa_other"),
+		Models:  []policy.ModelRule{{Alias: "fast", Provider: "codex", TargetModel: "gpt-5-codex"}},
+	}, false); err != nil {
+		t.Fatal(err)
+	}
 	app.store.RecordUsage("priced", "fast", "gpt-5-codex", false, policy.UsageDetail{InputTokens: 250_000, OutputTokens: 100_000})
 	request := controlledInterceptRequest("lookup-current", "priced", plain)
 	request.Metadata["caller_scope"] = policy.CallerScopeForKey("priced")
@@ -52,7 +61,7 @@ func TestLookupReturnsOnlyOwnLightweightUsageAndConcurrency(t *testing.T) {
 		t.Fatalf("usage payload = %+v", payload)
 	}
 	body := string(response.Body)
-	for _, forbidden := range []string{"key_hash", "caller_scope", "account_binding", "selected_auth_id", "auth_concurrency_limits", "target_model", "provider"} {
+	for _, forbidden := range []string{"key_hash", "caller_scope", "account_binding", "selected_auth_id", "auth_concurrency_limits", "target_model", "provider", "Other Key", `"key_id":"other"`} {
 		if strings.Contains(body, forbidden) {
 			t.Fatalf("lookup leaked %q: %s", forbidden, body)
 		}
@@ -100,15 +109,49 @@ func TestLookupDisabledAndUnknownKeysUseUniformUnauthorizedResponse(t *testing.T
 	}
 }
 
-func TestLookupNativeKeyIsExplicitlyUnsupported(t *testing.T) {
-	app, _ := configureTestApp(t)
+func TestLookupNativeKeyReturnsAllDerivedKeyUsage(t *testing.T) {
+	app, _ := configurePricedApp(t)
+	secondSecret := "cpa_second"
+	secondHash := hashForTest(t, secondSecret)
+	if err := app.store.UpsertKeyWithModelPricing(policy.KeyConfig{
+		ID:      "second",
+		Name:    "Second Key",
+		Enabled: true,
+		KeyHash: secondHash,
+		Models: []policy.ModelRule{{
+			Alias:                "fast",
+			Provider:             "codex",
+			TargetModel:          "gpt-5-codex",
+			InputPricePerMillion: 2,
+		}},
+	}, false); err != nil {
+		t.Fatal(err)
+	}
+	app.store.RecordUsage("priced", "fast", "gpt-5-codex", false, policy.UsageDetail{InputTokens: 250_000})
+	app.store.RecordUsage("second", "fast", "gpt-5-codex", false, policy.UsageDetail{InputTokens: 500_000})
 	response := app.createKey([]byte(`{"id":"native-lookup","native":true,"key":"native-lookup-secret","account_binding":{"allow":["auth-a.json"]}}`))
 	if response.StatusCode != http.StatusCreated {
 		t.Fatalf("create native = %d %s", response.StatusCode, response.Body)
 	}
 	lookup := lookupRequestForTest(t, app, http.Header{"Authorization": {"Bearer native-lookup-secret"}}, nil)
-	if lookup.StatusCode != http.StatusNotImplemented || !strings.Contains(string(lookup.Body), "native_usage_unsupported") {
+	if lookup.StatusCode != http.StatusOK {
 		t.Fatalf("native lookup = %d %s", lookup.StatusCode, lookup.Body)
+	}
+	var payload lookupAllDerivedResponse
+	if err := json.Unmarshal(lookup.Body, &payload); err != nil {
+		t.Fatal(err)
+	}
+	if payload.Scope != "all-derived" || len(payload.Keys) != 2 {
+		t.Fatalf("native lookup payload = %#v", payload)
+	}
+	if payload.Keys[0].KeyID != "priced" || payload.Keys[0].Usage.DailyUSD <= 0 || payload.Keys[1].KeyID != "second" || payload.Keys[1].Usage.DailyUSD <= 0 {
+		t.Fatalf("derived usage = %#v", payload.Keys)
+	}
+	body := string(lookup.Body)
+	for _, forbidden := range []string{"key_hash", "caller_scope", "account_binding", "selected_auth_id", "native-lookup"} {
+		if strings.Contains(body, forbidden) {
+			t.Fatalf("native lookup leaked %q: %s", forbidden, body)
+		}
 	}
 }
 

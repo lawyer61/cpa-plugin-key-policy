@@ -167,6 +167,7 @@ func (a *App) registration() Registration {
 				{Name: "quota_cache_ttl", Type: "string", Description: "Freshness TTL for quota evidence (duration, default 30m)."},
 				{Name: "quota_activation_enabled", Type: "boolean", Description: "Allow small background response requests for strictly detected lazy Codex windows."},
 				{Name: "quota_activation_scope", Type: "string", EnumValues: []string{"managed-pools", "all-codex"}, Description: "Auth scope eligible for background activation."},
+				{Name: "quota_activation_model", Type: "string", Description: "Codex model used by the small background activation request (default gpt-5.6-luna)."},
 				{Name: "keys", Type: "array", Description: "Downstream key policies, including optional fail-closed account_binding allow globs. State file wins after it exists."},
 			},
 		},
@@ -923,8 +924,8 @@ func (a *App) managementRegistration() ManagementRegistrationResponse {
 		},
 		Resources: []ResourceRoute{
 			{Path: web.IndexPath, Menu: "Key Policy", Description: "Web UI for managing downstream CPA key policies (create keys, pick models)."},
-			{Path: web.LookupPath, Menu: "Key Usage", Description: "Read-only self-service usage lookup for one downstream key."},
-			{Path: web.LookupDataPath, Description: "Bearer-authenticated self-service usage data."},
+			{Path: web.LookupPath, Menu: "Key Usage", Description: "Read-only usage lookup for one derived key or all derived keys via an imported CPA-native key."},
+			{Path: web.LookupDataPath, Description: "Bearer-authenticated derived-key usage data."},
 		},
 	}
 }
@@ -1015,6 +1016,7 @@ type schedulerSettingsRequest struct {
 	QuotaCacheTTL                 *string         `json:"quota_cache_ttl"`
 	QuotaActivationEnabled        *bool           `json:"quota_activation_enabled"`
 	QuotaActivationScope          *string         `json:"quota_activation_scope"`
+	QuotaActivationModel          *string         `json:"quota_activation_model"`
 }
 
 func (a *App) schedulerSettings() ManagementResponse {
@@ -1029,6 +1031,7 @@ func (a *App) schedulerSettings() ManagementResponse {
 		"quota_cache_ttl":                   settings.QuotaCacheTTL,
 		"quota_activation_enabled":          settings.QuotaActivationEnabled,
 		"quota_activation_scope":            settings.QuotaActivationScope,
+		"quota_activation_model":            settings.QuotaActivationModel,
 		"current_concurrent_requests":       concurrency.Total,
 		"current_activation_requests":       concurrency.ActivationTotal,
 		"auth_concurrency_current":          concurrency.Auths,
@@ -1045,7 +1048,7 @@ func (a *App) updateSchedulerSettings(body []byte) ManagementResponse {
 	if request.GlobalWeightedRoundRobin == nil && request.AuthConcurrencyLimits == nil &&
 		request.SessionAffinityIdleTTLSeconds == nil && request.SessionAffinityMaxEntries == nil &&
 		request.QuotaCheckInterval == nil && request.QuotaCacheTTL == nil &&
-		request.QuotaActivationEnabled == nil && request.QuotaActivationScope == nil {
+		request.QuotaActivationEnabled == nil && request.QuotaActivationScope == nil && request.QuotaActivationModel == nil {
 		return jsonError(http.StatusBadRequest, "missing_setting", "缺少可更新的调度设置")
 	}
 	previous := a.store.RuntimeSettings()
@@ -1059,6 +1062,7 @@ func (a *App) updateSchedulerSettings(body []byte) ManagementResponse {
 		QuotaCacheTTL:                 request.QuotaCacheTTL,
 		QuotaActivationEnabled:        request.QuotaActivationEnabled,
 		QuotaActivationScope:          request.QuotaActivationScope,
+		QuotaActivationModel:          request.QuotaActivationModel,
 	})
 	if err != nil {
 		if errors.Is(err, policy.ErrInvalidRuntimeSettings) {

@@ -16,12 +16,12 @@ In plain words: you issue your own `cpa_…` keys to clients. Each key only sees
 ## What it does (human version)
 
 1. **Issue keys** — create many downstream keys; each has an allow-list of models (or shared aliases).
-2. **Route** — client calls with alias name `fast`; plugin rewrites to e.g. `codex` + `gpt-5.4-mini`.
+2. **Route** — client calls with alias name `fast`; plugin rewrites to e.g. `codex` + `gpt-5.6-luna`.
 3. **Limit** — per-key RPM and in-flight concurrency, optional daily/weekly USD caps, plus exact auth-ID concurrency limits.
 4. **Isolate credentials (tiers / groups)** — pin a request to Codex free/team/… or to a **custom classify group** so it never lands on the wrong auth file.
 5. **Multi-target aliases** — one alias can point at several backends (priority or round-robin).
 6. **Session affinity** — prefer a previous auth, but fail over only inside the allowed account pool.
-7. **Web UI + self-service lookup** — manage policies and let each key holder inspect only their own usage.
+7. **Web UI + self-service lookup** — plugin keys inspect only their own usage; an explicitly imported CPA-native key can inspect every plugin-derived key.
 
 ---
 
@@ -103,7 +103,7 @@ CPA-native keys are untouched unless explicitly imported as `native: true`. Impo
 - If quota evidence is unknown, selection falls back to stable Fill First inside the legal pool. Explicit exhaustion is not cleared by TTL expiry or a local reset timer; newer positive evidence is required.
 - `quota_check_interval` and `quota_cache_ttl` are independent and default to `30m`. Passive signals from normal traffic are primary; background GETs only fill missing, stale, reset-crossed, or verification state.
 - Automatic activation defaults off. `managed-pools` limits activation to quota-aware bindings; `all-codex` also covers valid idle/native-used Codex OAuth auths without expanding any key's business pool.
-- Activation uses strict lazy-window baselines, a tiny non-stored `gpt-5.4-mini` response request, and a verification GET. It shares controlled auth concurrency but never charges a user key's RPM or ledger. Unmanaged native traffic is still outside plugin concurrency accounting.
+- Activation uses strict lazy-window baselines, a tiny non-stored response request, and a verification GET. The model is configurable through `quota_activation_model` and defaults to `gpt-5.6-luna`. It shares controlled auth concurrency but never charges a user key's RPM or ledger. Unmanaged native traffic is still outside plugin concurrency accounting.
 - Runtime quota/activation state is stored at `<state_file>.quota-runtime.json`; persist the whole state directory in Docker.
 
 **Operational boundary:** this is a plugin-only control. Keep the plugin enabled and healthy, and do not use CPA Home mode for account-bound traffic because Home selects before the ordinary plugin scheduler. If the plugin is unloaded/fused, a key that still exists in CPA `api-keys` is again governed only by CPA's global pool. For the strongest fail-closed behavior under plugin removal, use plugin-issued keys and never duplicate them in CPA `api-keys`.
@@ -209,7 +209,7 @@ Key holders can open the read-only self-service page without a management secret
 http://<your-cpa-host>:<api-port>/v0/resource/plugins/cpa-key-policy/lookup
 ```
 
-It submits the current secret only as `Authorization: Bearer <own-key>` and shows plugin-priced UTC-day/current 7-day-window usage, call/token summaries, and current key concurrency. URL keys and arbitrary `key_id` lookups are rejected; bindings, auth IDs, hashes, and other keys are never returned. Imported CPA-native keys currently have no model/pricing ledger and receive an explicit unsupported response.
+It submits the current secret only as `Authorization: Bearer <key>` and shows plugin-priced UTC-day/current 7-day-window usage, call/token summaries, and current key concurrency. A plugin-derived key sees only itself. An enabled CPA-native key explicitly imported into key-policy acts as a privileged lookup credential and sees every plugin-derived key; unimported host keys remain unknown to this pure plugin. URL keys and arbitrary `key_id` lookups are rejected, and no bindings, auth IDs, hashes, caller scopes, or plaintext keys are returned.
 
 UI areas:
 
@@ -271,7 +271,7 @@ curl -X POST "$CPA/v0/management/plugins/cpa-key-policy/keys" \
       "strategy": "weighted-round-robin"
     },
     "models": [
-      {"alias":"fast","provider":"codex","target_model":"gpt-5.4-mini","group":"free"}
+      {"alias":"fast","provider":"codex","target_model":"gpt-5.6-luna","group":"free"}
     ]
   }'
 ```
@@ -305,7 +305,7 @@ curl -X POST "$CPA/v0/management/plugins/cpa-key-policy/aliases" \
     "billing_mode": "tokens",
     "targets": [
       {"provider":"cerebras","target_model":"gpt-oss-120b"},
-      {"provider":"codex","target_model":"gpt-5.4-mini","group":"free"}
+      {"provider":"codex","target_model":"gpt-5.6-luna","group":"free"}
     ]
   }'
 ```

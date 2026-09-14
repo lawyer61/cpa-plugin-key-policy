@@ -16,12 +16,12 @@
 ## 它能干什么
 
 1. **发钥匙** — 批量创建下游 key，每把绑定可用模型 / 别名。  
-2. **做映射** — 客户端写 `model: fast`，插件转到例如 `codex` + `gpt-5.4-mini`。  
+2. **做映射** — 客户端写 `model: fast`，插件转到例如 `codex` + `gpt-5.6-luna`。
 3. **做限制** — 单 key 的 RPM、最大在途请求并发、可选每日/每周美元额度，并可限制某个 auth 文件的全局受控并发。
 4. **凭证分档 / 归类** — 请求可以钉死在 Codex free/team 等内置档，或你自定义的归类组，**不会串到别的凭证文件**。  
 5. **多目标别名** — 一个别名挂多个后端（优先 或 轮询）。  
 6. **会话亲和** — 同一会话优先复用同一 auth；满载时只在允许账号池内切换。
-7. **网页管理与自助查询** — 管理员配置策略，key 持有人只读查看自己的用量。
+7. **网页管理与自助查询** — 插件派生 Key 只能查看自己；显式导入的 CPA 原生 Key 可以查看全部插件派生 Key。
 
 ---
 
@@ -101,7 +101,7 @@ CPA 原生 key 默认完全不受影响；只有显式以 `native: true` 导入�
 - 无有效额度缓存时，在合法池内按原 Fill First 稳定降级；明确耗尽的账号不会因 TTL 或 reset 到点自动恢复，必须看到更新的正面证据。
 - `quota_check_interval` 与 `quota_cache_ttl` 独立，默认均为 `30m`。正常业务响应的额度信号优先，后台只补查缺失、过期、跨 reset 或待验证状态。
 - 自动激活默认关闭。开启后可选 `managed-pools` 或 `all-codex`；后者也覆盖只被 CPA 原生 key 使用和暂未使用的有效 Codex OAuth auth，但**绝不扩大任何 key 的业务允许池**。
-- 激活使用严格的懒窗口基线、很小且不存储的 `gpt-5.4-mini` response 请求和后验 GET 验证；与受控业务共享 auth 并发上限，但不消耗用户 key 的 RPM/账本。未接管的原生请求仍不计入插件并发，因此该上限不是全宿主物理并发硬限制。
+- 激活使用严格的懒窗口基线、很小且不存储的 response 请求和后验 GET 验证。模型可通过 `quota_activation_model` 修改，默认是 `gpt-5.6-luna`；请求与受控业务共享 auth 并发上限，但不消耗用户 key 的 RPM/账本。未接管的原生请求仍不计入插件并发，因此该上限不是全宿主物理并发硬限制。
 - 额度与激活运行状态保存在 `<state_file>.quota-runtime.json`；Docker 应挂载 `state_file` 所在整个目录。
 
 **运行边界：** 这是纯插件控制。账号绑定流量必须保持插件启用且健康，也不能使用 CPA Home 模式，因为 Home 会在普通插件 scheduler 之前完成选择。若插件被卸载或熔断，仍留在 CPA `api-keys` 中的原生 key 会重新只受宿主全局账号池控制。若要求插件被移除时也尽量失败关闭，请使用插件签发的 key，并且绝不要把它重复放进 CPA `api-keys`。
@@ -207,7 +207,7 @@ Key 持有人无需管理密钥，可访问：
 http://<你的-cpa-主机>:<api端口>/v0/resource/plugins/cpa-key-policy/lookup
 ```
 
-自助页只使用 `Authorization: Bearer <自己的 key>` 查询当前 key，展示插件计价下的 UTC 自然日/现有 7 日窗口用量、调用/Token 汇总和当前 key 并发。它不接受 URL 中的 key 或 `key_id`，也不会显示账号绑定、auth 文件、hash 或其他 key 的信息。导入的 CPA 原生 key 目前没有模型/价格账本，因此会明确提示不支持用量查询。
+自助页只使用 `Authorization: Bearer <key>`。插件派生 Key 仍只显示自己的 UTC 自然日/现有 7 日窗口用量、调用/Token 汇总和当前并发；显式导入 key-policy 且已启用的 CPA 原生 Key 作为特权查询凭证，会列出全部插件派生 Key 的相同用量信息。纯插件无法识别未导入的宿主 `api-keys`。接口不接受 URL 中的 key 或 `key_id`，也不会返回账号绑定、auth 文件、hash、caller scope 或任何明文 Key。
 
 | 区域 | 用途 |
 |------|------|
@@ -259,7 +259,7 @@ curl -X POST "$CPA/v0/management/plugins/cpa-key-policy/keys" \
       "strategy": "weighted-round-robin"
     },
     "models": [
-      {"alias":"fast","provider":"codex","target_model":"gpt-5.4-mini","group":"free"}
+      {"alias":"fast","provider":"codex","target_model":"gpt-5.6-luna","group":"free"}
     ]
   }'
 ```
@@ -293,7 +293,7 @@ curl -X POST "$CPA/v0/management/plugins/cpa-key-policy/aliases" \
     "billing_mode": "tokens",
     "targets": [
       {"provider":"cerebras","target_model":"gpt-oss-120b"},
-      {"provider":"codex","target_model":"gpt-5.4-mini","group":"free"}
+      {"provider":"codex","target_model":"gpt-5.6-luna","group":"free"}
     ]
   }'
 ```

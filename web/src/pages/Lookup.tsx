@@ -1,7 +1,7 @@
 import { useState } from "react";
-import { fetchLookupData, lookupStatus } from "../api/lookup";
+import { fetchLookupData } from "../api/lookup";
 import { useT } from "../i18n";
-import type { LookupAliasSummary, LookupResponse, UsageWindow } from "../types";
+import type { LookupAliasSummary, LookupAllDerivedResponse, LookupKeyUsage, LookupResponse, UsageWindow } from "../types";
 import { formatUSD } from "../utils/money";
 
 type UsageValue = UsageWindow | number | undefined;
@@ -97,6 +97,65 @@ function AliasTable({ aliases }: { aliases: LookupAliasSummary[] }) {
   );
 }
 
+function isAllDerivedLookup(data: LookupResponse): data is LookupAllDerivedResponse {
+  return "scope" in data && data.scope === "all-derived";
+}
+
+function LookupKeyDetails({ data }: { data: LookupKeyUsage }) {
+  const t = useT();
+  const { limits, usage, concurrency } = data;
+  return (
+    <>
+      <section className="lookup-section">
+        <h3>{t("lookup.limitsTitle")}</h3>
+        <div className="lookup-limit-grid">
+          <LimitCard label={t("lookup.rpm")} value={limits.rpm > 0 ? String(limits.rpm) : t("lookup.unlimited")} />
+          <LimitCard label={t("lookup.dailyLimit")} value={displayLimit(limits.daily_usd, t("lookup.unlimited"))} />
+          <LimitCard label={t("lookup.weeklyLimit")} value={displayLimit(limits.weekly_usd, t("lookup.unlimited"))} />
+          <LimitCard label={t("lookup.maxConcurrent")} value={limits.max_concurrent_requests > 0 ? String(limits.max_concurrent_requests) : t("lookup.unlimited")} />
+        </div>
+      </section>
+
+      <section className="lookup-section">
+        <h3>{t("lookup.usageTitle")}</h3>
+        <div className="lookup-window-grid">
+          <WindowCard
+            label={t("lookup.dailyWindow")}
+            used={usage.daily_usd ?? 0}
+            limit={limits.daily_usd}
+            resetAt={usage.daily_reset_at}
+          />
+          <WindowCard
+            label={t("lookup.weeklyWindow")}
+            used={usage.weekly_usd ?? 0}
+            limit={limits.weekly_usd}
+            resetAt={usage.weekly_reset_at}
+          />
+        </div>
+      </section>
+
+      <section className="lookup-section">
+        <h3>{t("lookup.concurrencyTitle")}</h3>
+        <div className="lookup-concurrency-card">
+          <div>
+            <div className="lookup-concurrency-label">{t("lookup.current")}</div>
+            <div className="lookup-concurrency-value">{concurrency.current}</div>
+          </div>
+          <div>
+            <div className="lookup-concurrency-label">{t("lookup.maximum")}</div>
+            <div className="lookup-concurrency-value">{concurrency.maximum > 0 ? concurrency.maximum : t("lookup.unlimited")}</div>
+          </div>
+        </div>
+      </section>
+
+      <section className="lookup-section">
+        <h3>{t("lookup.aliasesTitle")}</h3>
+        <AliasTable aliases={data.aliases ?? []} />
+      </section>
+    </>
+  );
+}
+
 export default function Lookup() {
   const t = useT();
   const [secret, setSecret] = useState("");
@@ -116,9 +175,9 @@ export default function Lookup() {
     try {
       const result = await fetchLookupData(value);
       setData(result);
-    } catch (err: unknown) {
+    } catch {
       setData(null);
-      setError(lookupStatus(err) === 501 ? t("lookup.nativeUnsupported") : t("lookup.invalidKey"));
+      setError(t("lookup.invalidKey"));
     } finally {
       setLoading(false);
     }
@@ -129,10 +188,6 @@ export default function Lookup() {
     setData(null);
     setError("");
   };
-
-  const usage = data?.usage;
-  const limits = data?.limits;
-  const concurrency = data?.concurrency;
 
   return (
     <div className="lookup-page">
@@ -166,64 +221,37 @@ export default function Lookup() {
         </form>
       </section>
       {error && <div className="error lookup-error" role="alert">{error}</div>}
-      {data && limits && usage && concurrency && (
+      {data && (
         <main className="lookup-results">
           <div className="lookup-result-head">
             <div>
-              <div className="lookup-result-kicker">{t("lookup.keyLabel")}</div>
-              <h2>{data.name}</h2>
+              <div className="lookup-result-kicker">{isAllDerivedLookup(data) ? t("lookup.allDerivedHint") : t("lookup.keyLabel")}</div>
+              <h2>{isAllDerivedLookup(data) ? t("lookup.allDerivedTitle") : data.name}</h2>
             </div>
             <button className="btn" type="button" disabled={loading} onClick={() => void query()}>
               {loading ? t("lookup.loading") : t("lookup.refresh")}
             </button>
           </div>
-
-          <section className="lookup-section">
-            <h3>{t("lookup.limitsTitle")}</h3>
-            <div className="lookup-limit-grid">
-              <LimitCard label={t("lookup.rpm")} value={limits.rpm > 0 ? String(limits.rpm) : t("lookup.unlimited")} />
-              <LimitCard label={t("lookup.dailyLimit")} value={displayLimit(limits.daily_usd, t("lookup.unlimited"))} />
-              <LimitCard label={t("lookup.weeklyLimit")} value={displayLimit(limits.weekly_usd, t("lookup.unlimited"))} />
-              <LimitCard label={t("lookup.maxConcurrent")} value={limits.max_concurrent_requests > 0 ? String(limits.max_concurrent_requests) : t("lookup.unlimited")} />
-            </div>
-          </section>
-
-          <section className="lookup-section">
-            <h3>{t("lookup.usageTitle")}</h3>
-            <div className="lookup-window-grid">
-              <WindowCard
-                label={t("lookup.dailyWindow")}
-                used={usage.daily_usd ?? 0}
-                limit={limits.daily_usd}
-                resetAt={usage.daily_reset_at}
-              />
-              <WindowCard
-                label={t("lookup.weeklyWindow")}
-                used={usage.weekly_usd ?? 0}
-                limit={limits.weekly_usd}
-                resetAt={usage.weekly_reset_at}
-              />
-            </div>
-          </section>
-
-          <section className="lookup-section">
-            <h3>{t("lookup.concurrencyTitle")}</h3>
-            <div className="lookup-concurrency-card">
-              <div>
-                <div className="lookup-concurrency-label">{t("lookup.current")}</div>
-                <div className="lookup-concurrency-value">{concurrency.current}</div>
+          {isAllDerivedLookup(data) ? (
+            data.keys.length === 0 ? <p className="muted lookup-empty">{t("lookup.emptyDerived")}</p> : (
+              <div className="lookup-derived-list">
+                {data.keys.map((key) => (
+                  <article className="lookup-derived-card" key={key.key_id}>
+                    <div className="lookup-derived-head">
+                      <div>
+                        <div className="lookup-result-kicker">{t("lookup.keyId")}: <span className="mono">{key.key_id}</span></div>
+                        <h2>{key.name}</h2>
+                      </div>
+                      <span className={`lookup-key-status ${key.enabled ? "enabled" : "disabled"}`}>
+                        {key.enabled ? t("lookup.enabled") : t("lookup.disabled")}
+                      </span>
+                    </div>
+                    <LookupKeyDetails data={key} />
+                  </article>
+                ))}
               </div>
-              <div>
-                <div className="lookup-concurrency-label">{t("lookup.maximum")}</div>
-                <div className="lookup-concurrency-value">{concurrency.maximum > 0 ? concurrency.maximum : t("lookup.unlimited")}</div>
-              </div>
-            </div>
-          </section>
-
-          <section className="lookup-section">
-            <h3>{t("lookup.aliasesTitle")}</h3>
-            <AliasTable aliases={data.aliases ?? []} />
-          </section>
+            )
+          ) : <LookupKeyDetails data={data} />}
         </main>
       )}
     </div>

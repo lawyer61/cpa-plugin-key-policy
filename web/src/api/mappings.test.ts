@@ -69,6 +69,7 @@ describe("调度设置接口", () => {
       quota_cache_ttl: "43m",
       quota_activation_enabled: true,
       quota_activation_scope: "all-codex" as const,
+      quota_activation_model: "custom-activation-model",
     };
     patch.mockResolvedValue({ data: quota });
     await expect(updateSchedulerSettings(quota)).resolves.toEqual(quota);

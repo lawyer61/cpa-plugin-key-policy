@@ -42,7 +42,9 @@ describe("public lookup page", () => {
 
   it("queries with the in-memory key and clears the rendered secret state", async () => {
     vi.mocked(fetchLookupData).mockResolvedValue({
+      key_id: "team-a",
       name: "Team A",
+      enabled: true,
       limits: { rpm: 10, daily_usd: 2, weekly_usd: 5, max_concurrent_requests: 4 },
       usage: { daily_usd: 0.5, weekly_usd: 1, daily_limit_usd: 2, weekly_limit_usd: 5 },
       concurrency: { current: 1, maximum: 4 },
@@ -72,5 +74,49 @@ describe("public lookup page", () => {
     });
     expect(input.value).toBe("");
     expect(host.textContent).not.toContain("Team A");
+  });
+
+  it("renders every derived key returned for an imported CPA-native key", async () => {
+    vi.mocked(fetchLookupData).mockResolvedValue({
+      scope: "all-derived",
+      keys: [
+        {
+          key_id: "team-a",
+          name: "Team A",
+          enabled: true,
+          limits: { rpm: 10, daily_usd: 2, weekly_usd: 5, max_concurrent_requests: 4 },
+          usage: { daily_usd: 0.5, weekly_usd: 1, daily_limit_usd: 2, weekly_limit_usd: 5 },
+          concurrency: { current: 1, maximum: 4 },
+          aliases: [],
+        },
+        {
+          key_id: "team-b",
+          name: "Team B",
+          enabled: false,
+          limits: { rpm: 0, daily_usd: 0, weekly_usd: 0, max_concurrent_requests: 0 },
+          usage: { daily_usd: 0.25, weekly_usd: 0.75, daily_limit_usd: 0, weekly_limit_usd: 0 },
+          concurrency: { current: 0, maximum: 0 },
+          aliases: [],
+        },
+      ],
+    });
+    host = document.createElement("div");
+    document.body.appendChild(host);
+    root = createRoot(host);
+    await act(async () => {
+      root?.render(<Lookup />);
+    });
+    const input = host.querySelector<HTMLInputElement>("#lookup-secret")!;
+    await act(async () => {
+      const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")?.set;
+      setter?.call(input, "native-secret");
+      input.dispatchEvent(new Event("input", { bubbles: true }));
+    });
+    await act(async () => {
+      host?.querySelector<HTMLFormElement>("form")?.dispatchEvent(new Event("submit", { bubbles: true, cancelable: true }));
+    });
+    expect(host.textContent).toContain("Team A");
+    expect(host.textContent).toContain("Team B");
+    expect(host.textContent).toContain("所有派生 Key");
   });
 });

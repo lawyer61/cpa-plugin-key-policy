@@ -16,8 +16,3 @@ export async function fetchLookupData(secret: string): Promise<LookupResponse> {
   });
   return data;
 }
-
-export function lookupStatus(error: unknown): number | undefined {
-  const response = (error as { response?: { status?: unknown } } | null)?.response;
-  return typeof response?.status === "number" ? response.status : undefined;
-}

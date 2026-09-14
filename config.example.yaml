@@ -26,6 +26,7 @@ plugins:
       # Safe default: no response activation requests until explicitly enabled.
       quota_activation_enabled: false
       quota_activation_scope: "managed-pools" # managed-pools | all-codex
+      quota_activation_model: "gpt-5.6-luna"
 
       # Prefer creating keys/aliases/classify rules via Web UI or Management API.
       # Seed keys below are mainly for first boot when state_file does not exist.
@@ -48,7 +49,7 @@ plugins:
           models:
             - alias: "fast"
               provider: "codex"
-              target_model: "gpt-5.4-mini"
+              target_model: "gpt-5.6-luna"
               group: "free" # built-in tier; custom groups use classify:name
             - alias: "compat-demo"
               provider: "cerebras" # openai-compatibility channel name

@@ -37,7 +37,10 @@ type Config struct {
 	// It defaults to false so existing installations never start upstream work.
 	QuotaActivationEnabled bool `yaml:"quota_activation_enabled,omitempty" json:"quota_activation_enabled,omitempty"`
 	// QuotaActivationScope is managed-pools or all-codex.
-	QuotaActivationScope string      `yaml:"quota_activation_scope,omitempty" json:"quota_activation_scope,omitempty"`
+	QuotaActivationScope string `yaml:"quota_activation_scope,omitempty" json:"quota_activation_scope,omitempty"`
+	// QuotaActivationModel is the small Codex model used by background lazy
+	// window activation requests.
+	QuotaActivationModel string      `yaml:"quota_activation_model,omitempty" json:"quota_activation_model,omitempty"`
 	Keys                 []KeyConfig `yaml:"keys" json:"keys"`
 	// Aliases is the global alias mapping table. Each entry maps a downstream
 	// alias name to one or more (provider, model, group) targets with a shared
@@ -317,6 +320,7 @@ type State struct {
 	QuotaCacheTTL                 *string                `json:"quota_cache_ttl,omitempty"`
 	QuotaActivationEnabled        *bool                  `json:"quota_activation_enabled,omitempty"`
 	QuotaActivationScope          *string                `json:"quota_activation_scope,omitempty"`
+	QuotaActivationModel          *string                `json:"quota_activation_model,omitempty"`
 	// Aliases is the global alias mapping table, persisted so that key alias
 	// references survive restarts even when config.yaml is not re-read. On
 	// Configure, the config.yaml Aliases take precedence; state Aliases are a
@@ -331,6 +335,7 @@ const (
 	DefaultQuotaCheckInterval            = "30m"
 	DefaultQuotaCacheTTL                 = "30m"
 	DefaultQuotaActivationScope          = "managed-pools"
+	DefaultQuotaActivationModel          = "gpt-5.6-luna"
 	MinQuotaDuration                     = time.Minute
 )
 
@@ -348,6 +353,7 @@ type RuntimeSettings struct {
 	QuotaCacheTTL                 string         `json:"quota_cache_ttl"`
 	QuotaActivationEnabled        bool           `json:"quota_activation_enabled"`
 	QuotaActivationScope          string         `json:"quota_activation_scope"`
+	QuotaActivationModel          string         `json:"quota_activation_model"`
 }
 
 func runtimeSettingsFromConfig(cfg Config) RuntimeSettings {
@@ -360,6 +366,7 @@ func runtimeSettingsFromConfig(cfg Config) RuntimeSettings {
 		QuotaCacheTTL:                 cfg.QuotaCacheTTL,
 		QuotaActivationEnabled:        cfg.QuotaActivationEnabled,
 		QuotaActivationScope:          cfg.QuotaActivationScope,
+		QuotaActivationModel:          cfg.QuotaActivationModel,
 	}
 }
 
@@ -375,6 +382,7 @@ func applyRuntimeSettings(cfg *Config, settings RuntimeSettings) {
 	cfg.QuotaCacheTTL = settings.QuotaCacheTTL
 	cfg.QuotaActivationEnabled = settings.QuotaActivationEnabled
 	cfg.QuotaActivationScope = settings.QuotaActivationScope
+	cfg.QuotaActivationModel = settings.QuotaActivationModel
 }
 
 func normalizeRuntimeSettings(settings RuntimeSettings) (RuntimeSettings, error) {
@@ -392,6 +400,9 @@ func normalizeRuntimeSettings(settings RuntimeSettings) (RuntimeSettings, error)
 	}
 	if strings.TrimSpace(settings.QuotaActivationScope) == "" {
 		settings.QuotaActivationScope = DefaultQuotaActivationScope
+	}
+	if strings.TrimSpace(settings.QuotaActivationModel) == "" {
+		settings.QuotaActivationModel = DefaultQuotaActivationModel
 	}
 	if settings.SessionAffinityIdleTTLSeconds < 0 {
 		return RuntimeSettings{}, errors.New("session_affinity_idle_ttl_seconds cannot be negative")
@@ -417,6 +428,7 @@ func normalizeRuntimeSettings(settings RuntimeSettings) (RuntimeSettings, error)
 	default:
 		return RuntimeSettings{}, errors.New("quota_activation_scope must be managed-pools or all-codex")
 	}
+	settings.QuotaActivationModel = strings.TrimSpace(settings.QuotaActivationModel)
 	normalizedAuthLimits := make(map[string]int, len(settings.AuthConcurrencyLimits))
 	for rawID, limit := range settings.AuthConcurrencyLimits {
 		id := strings.TrimSpace(rawID)
@@ -452,6 +464,7 @@ func DefaultConfig() Config {
 		QuotaCheckInterval:            DefaultQuotaCheckInterval,
 		QuotaCacheTTL:                 DefaultQuotaCacheTTL,
 		QuotaActivationScope:          DefaultQuotaActivationScope,
+		QuotaActivationModel:          DefaultQuotaActivationModel,
 	}
 }
 
@@ -464,7 +477,7 @@ func DecodeConfig(raw []byte) (Config, error) {
 	if err := yaml.Unmarshal(raw, &explicit); err != nil {
 		return Config{}, err
 	}
-	for _, field := range []string{"quota_check_interval", "quota_cache_ttl"} {
+	for _, field := range []string{"quota_check_interval", "quota_cache_ttl", "quota_activation_model"} {
 		if value, exists := explicit[field]; exists && (value == nil || strings.TrimSpace(fmt.Sprint(value)) == "") {
 			return Config{}, fmt.Errorf("%s cannot be empty", field)
 		}
@@ -964,6 +977,7 @@ func saveStateDocument(path string, keys []KeyConfig, usage map[string]*UsageSta
 		quotaCacheTTL := settings.QuotaCacheTTL
 		quotaActivationEnabled := settings.QuotaActivationEnabled
 		quotaActivationScope := settings.QuotaActivationScope
+		quotaActivationModel := settings.QuotaActivationModel
 		state.GlobalWeightedRoundRobin = &globalWeightedRoundRobin
 		state.AuthConcurrencyLimits = &authConcurrencyLimits
 		state.SessionAffinityIdleTTLSeconds = &idleTTLSeconds
@@ -972,6 +986,7 @@ func saveStateDocument(path string, keys []KeyConfig, usage map[string]*UsageSta
 		state.QuotaCacheTTL = &quotaCacheTTL
 		state.QuotaActivationEnabled = &quotaActivationEnabled
 		state.QuotaActivationScope = &quotaActivationScope
+		state.QuotaActivationModel = &quotaActivationModel
 	}
 	raw, err := json.MarshalIndent(state, "", "  ")
 	if err != nil {
@@ -1004,6 +1019,7 @@ func SaveUsageOnly(path string, usage map[string]*UsageState) error {
 	var quotaCacheTTL *string
 	var quotaActivationEnabled *bool
 	var quotaActivationScope *string
+	var quotaActivationModel *string
 	if cur, err := LoadState(path); err == nil {
 		keys = cur.Keys
 		aliases = cur.Aliases
@@ -1016,6 +1032,7 @@ func SaveUsageOnly(path string, usage map[string]*UsageState) error {
 		quotaCacheTTL = cur.QuotaCacheTTL
 		quotaActivationEnabled = cur.QuotaActivationEnabled
 		quotaActivationScope = cur.QuotaActivationScope
+		quotaActivationModel = cur.QuotaActivationModel
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return err
 	}
@@ -1038,6 +1055,7 @@ func SaveUsageOnly(path string, usage map[string]*UsageState) error {
 		QuotaCacheTTL:                 quotaCacheTTL,
 		QuotaActivationEnabled:        quotaActivationEnabled,
 		QuotaActivationScope:          quotaActivationScope,
+		QuotaActivationModel:          quotaActivationModel,
 		Aliases:                       aliases,
 		ClassifyRules:                 rules,
 	}

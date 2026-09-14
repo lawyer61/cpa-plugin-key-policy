@@ -24,6 +24,7 @@ type Store struct {
 	quotaCacheTTL                 string
 	quotaActivationEnabled        bool
 	quotaActivationScope          string
+	quotaActivationModel          string
 	statePath                     string
 	keys                          map[string]*KeyConfig
 	keysByHash                    map[string]*KeyConfig
@@ -89,6 +90,7 @@ func NewStore() *Store {
 		quotaCacheTTL:                 defaults.QuotaCacheTTL,
 		quotaActivationEnabled:        defaults.QuotaActivationEnabled,
 		quotaActivationScope:          defaults.QuotaActivationScope,
+		quotaActivationModel:          defaults.QuotaActivationModel,
 		keys:                          make(map[string]*KeyConfig),
 		keysByHash:                    make(map[string]*KeyConfig),
 		keysByCallerScope:             make(map[string]*KeyConfig),
@@ -157,6 +159,9 @@ func (s *Store) Configure(cfg Config) error {
 		}
 		if state.QuotaActivationScope != nil {
 			cfg.QuotaActivationScope = *state.QuotaActivationScope
+		}
+		if state.QuotaActivationModel != nil {
+			cfg.QuotaActivationModel = *state.QuotaActivationModel
 		}
 		settings, errSettings := normalizeRuntimeSettings(runtimeSettingsFromConfig(cfg))
 		if errSettings != nil {
@@ -236,6 +241,7 @@ func (s *Store) Configure(cfg Config) error {
 	s.quotaCacheTTL = cfg.QuotaCacheTTL
 	s.quotaActivationEnabled = cfg.QuotaActivationEnabled
 	s.quotaActivationScope = cfg.QuotaActivationScope
+	s.quotaActivationModel = cfg.QuotaActivationModel
 	s.statePath = statePath
 	// Store the global alias table and classify rules for routing/billing.
 	s.aliases = make(map[string]*AliasMapping, len(cfg.Aliases))
@@ -308,6 +314,7 @@ func (s *Store) RuntimeSettings() RuntimeSettings {
 		QuotaCacheTTL:                 s.quotaCacheTTL,
 		QuotaActivationEnabled:        s.quotaActivationEnabled,
 		QuotaActivationScope:          s.quotaActivationScope,
+		QuotaActivationModel:          s.quotaActivationModel,
 	}
 }
 
@@ -322,6 +329,7 @@ type RuntimeSettingsPatch struct {
 	QuotaCacheTTL                 *string
 	QuotaActivationEnabled        *bool
 	QuotaActivationScope          *string
+	QuotaActivationModel          *string
 }
 
 func (s *Store) UpdateRuntimeSettings(patch RuntimeSettingsPatch) (RuntimeSettings, error) {
@@ -332,6 +340,9 @@ func (s *Store) UpdateRuntimeSettings(patch RuntimeSettingsPatch) (RuntimeSettin
 	}
 	if patch.QuotaCacheTTL != nil && strings.TrimSpace(*patch.QuotaCacheTTL) == "" {
 		return RuntimeSettings{}, fmt.Errorf("%w: quota_cache_ttl cannot be empty", ErrInvalidRuntimeSettings)
+	}
+	if patch.QuotaActivationModel != nil && strings.TrimSpace(*patch.QuotaActivationModel) == "" {
+		return RuntimeSettings{}, fmt.Errorf("%w: quota_activation_model cannot be empty", ErrInvalidRuntimeSettings)
 	}
 
 	s.mu.Lock()
@@ -344,6 +355,7 @@ func (s *Store) UpdateRuntimeSettings(patch RuntimeSettingsPatch) (RuntimeSettin
 		QuotaCacheTTL:                 s.quotaCacheTTL,
 		QuotaActivationEnabled:        s.quotaActivationEnabled,
 		QuotaActivationScope:          s.quotaActivationScope,
+		QuotaActivationModel:          s.quotaActivationModel,
 	}
 	next := previous
 	if patch.GlobalWeightedRoundRobin != nil {
@@ -370,6 +382,9 @@ func (s *Store) UpdateRuntimeSettings(patch RuntimeSettingsPatch) (RuntimeSettin
 	if patch.QuotaActivationScope != nil {
 		next.QuotaActivationScope = *patch.QuotaActivationScope
 	}
+	if patch.QuotaActivationModel != nil {
+		next.QuotaActivationModel = *patch.QuotaActivationModel
+	}
 	next, err := normalizeRuntimeSettings(next)
 	if err != nil {
 		s.mu.Unlock()
@@ -383,6 +398,7 @@ func (s *Store) UpdateRuntimeSettings(patch RuntimeSettingsPatch) (RuntimeSettin
 	s.quotaCacheTTL = next.QuotaCacheTTL
 	s.quotaActivationEnabled = next.QuotaActivationEnabled
 	s.quotaActivationScope = next.QuotaActivationScope
+	s.quotaActivationModel = next.QuotaActivationModel
 	keys := s.keysSnapshotLocked()
 	usage := s.usageSnapshotLocked()
 	aliases := s.aliasesSnapshotLocked()
@@ -400,6 +416,7 @@ func (s *Store) UpdateRuntimeSettings(patch RuntimeSettingsPatch) (RuntimeSettin
 		s.quotaCacheTTL = previous.QuotaCacheTTL
 		s.quotaActivationEnabled = previous.QuotaActivationEnabled
 		s.quotaActivationScope = previous.QuotaActivationScope
+		s.quotaActivationModel = previous.QuotaActivationModel
 		s.mu.Unlock()
 		return RuntimeSettings{}, err
 	}

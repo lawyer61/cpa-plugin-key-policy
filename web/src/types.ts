@@ -172,6 +172,7 @@ export interface SchedulerSettings {
   quota_cache_ttl: string;
   quota_activation_enabled: boolean;
   quota_activation_scope: "managed-pools" | "all-codex";
+  quota_activation_model: string;
   // Optional runtime counters returned by newer plugin builds.
   current_concurrent_requests?: number;
   current_activation_requests?: number;
@@ -188,6 +189,7 @@ export type SchedulerSettingsPatch = Partial<Pick<
   | "quota_cache_ttl"
   | "quota_activation_enabled"
   | "quota_activation_scope"
+  | "quota_activation_model"
 >>;
 
 export interface QuotaWindowStatus {
@@ -226,6 +228,7 @@ export interface QuotaAuthStatus {
   last_result?: string;
   last_error?: string;
   activation?: {
+    model?: string;
     status?: string;
     attempts?: number;
     last_result?: string;
@@ -241,6 +244,7 @@ export interface QuotaStatus {
   quota_cache_ttl: string;
   quota_activation_enabled: boolean;
   quota_activation_scope: "managed-pools" | "all-codex";
+  quota_activation_model: string;
   persistence_blocked: boolean;
   persistence_error?: string;
   last_roster_sync?: string;
@@ -269,13 +273,22 @@ export interface LookupAliasSummary {
   weekly: UsageWindow | number;
 }
 
-export interface LookupResponse {
+export interface LookupKeyUsage {
+  key_id: string;
   name: string;
+  enabled: boolean;
   limits: LookupLimits;
   usage: UsageSummary;
   concurrency: LookupConcurrency;
   aliases: LookupAliasSummary[];
 }
+
+export interface LookupAllDerivedResponse {
+  scope: "all-derived";
+  keys: LookupKeyUsage[];
+}
+
+export type LookupResponse = LookupKeyUsage | LookupAllDerivedResponse;
 
 // --- Advanced Mapping types ---
 

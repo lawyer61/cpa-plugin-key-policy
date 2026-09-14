@@ -91,6 +91,7 @@ func TestSaveUsageOnlyPreservesRuntimeSettings(t *testing.T) {
 		AuthConcurrencyLimits:         map[string]int{"auth-a.json": 3},
 		SessionAffinityIdleTTLSeconds: 123,
 		SessionAffinityMaxEntries:     456,
+		QuotaActivationModel:          "preserved-model",
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -103,7 +104,8 @@ func TestSaveUsageOnlyPreservesRuntimeSettings(t *testing.T) {
 	}
 	if state.AuthConcurrencyLimits == nil || (*state.AuthConcurrencyLimits)["auth-a.json"] != 3 ||
 		state.SessionAffinityIdleTTLSeconds == nil || *state.SessionAffinityIdleTTLSeconds != 123 ||
-		state.SessionAffinityMaxEntries == nil || *state.SessionAffinityMaxEntries != 456 {
+		state.SessionAffinityMaxEntries == nil || *state.SessionAffinityMaxEntries != 456 ||
+		state.QuotaActivationModel == nil || *state.QuotaActivationModel != "preserved-model" {
 		raw, _ := os.ReadFile(path)
 		t.Fatalf("settings not preserved: %s", raw)
 	}

@@ -27,11 +27,18 @@ type lookupAliasUsage struct {
 }
 
 type lookupResponse struct {
+	KeyID       string              `json:"key_id,omitempty"`
 	Name        string              `json:"name"`
+	Enabled     bool                `json:"enabled"`
 	Limits      lookupLimits        `json:"limits"`
 	Usage       policy.UsageSummary `json:"usage"`
 	Concurrency lookupConcurrency   `json:"concurrency"`
 	Aliases     []lookupAliasUsage  `json:"aliases"`
+}
+
+type lookupAllDerivedResponse struct {
+	Scope string           `json:"scope"`
+	Keys  []lookupResponse `json:"keys"`
 }
 
 func (a *App) lookupData(headers http.Header) ManagementResponse {
@@ -44,14 +51,36 @@ func (a *App) lookupData(headers http.Header) ManagementResponse {
 		return lookupUnauthorized()
 	}
 	if key.Native {
-		response := jsonError(http.StatusNotImplemented, "native_usage_unsupported", "usage lookup is not available for imported CPA-native keys")
+		keys := a.store.Keys()
+		derived := make([]lookupResponse, 0, len(keys))
+		for i := range keys {
+			if keys[i].Native {
+				continue
+			}
+			item, found := a.lookupResponseForKey(keys[i])
+			if found {
+				derived = append(derived, item)
+			}
+		}
+		response := jsonResponse(http.StatusOK, lookupAllDerivedResponse{Scope: "all-derived", Keys: derived})
 		setLookupHeaders(&response)
 		return response
 	}
-	_, aliases, found := a.store.AliasUsageFor(key.ID)
+	payload, found := a.lookupResponseForKey(*key)
 	if !found {
 		return lookupUnauthorized()
 	}
+	response := jsonResponse(http.StatusOK, payload)
+	setLookupHeaders(&response)
+	return response
+}
+
+func (a *App) lookupResponseForKey(key policy.KeyConfig) (lookupResponse, bool) {
+	current, aliases, found := a.store.AliasUsageFor(key.ID)
+	if !found {
+		return lookupResponse{}, false
+	}
+	key = current
 	aliasUsage := make([]lookupAliasUsage, 0, len(aliases))
 	for _, item := range aliases {
 		aliasUsage = append(aliasUsage, lookupAliasUsage{
@@ -61,23 +90,23 @@ func (a *App) lookupData(headers http.Header) ManagementResponse {
 			Weekly:      item.Weekly,
 		})
 	}
-	response := jsonResponse(http.StatusOK, lookupResponse{
-		Name: key.Name,
+	return lookupResponse{
+		KeyID:   key.ID,
+		Name:    key.Name,
+		Enabled: key.Enabled,
 		Limits: lookupLimits{
 			RPM:                   key.RPM,
 			DailyUSD:              key.DailyLimitUSD,
 			WeeklyUSD:             key.WeeklyLimitUSD,
 			MaxConcurrentRequests: key.MaxConcurrentRequests,
 		},
-		Usage: a.store.UsageSummaryFor(*key),
+		Usage: a.store.UsageSummaryFor(key),
 		Concurrency: lookupConcurrency{
 			Current: a.concurrency.keyCurrent(key.ID),
 			Maximum: key.MaxConcurrentRequests,
 		},
 		Aliases: aliasUsage,
-	})
-	setLookupHeaders(&response)
-	return response
+	}, true
 }
 
 func strictBearerToken(headers http.Header) (string, bool) {

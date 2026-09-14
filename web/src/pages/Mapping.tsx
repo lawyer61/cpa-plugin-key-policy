@@ -205,6 +205,7 @@ function RuntimeSettingsPanel({
   const [quotaCacheTtl, setQuotaCacheTtl] = useState("30m");
   const [quotaActivationEnabled, setQuotaActivationEnabled] = useState(false);
   const [quotaActivationScope, setQuotaActivationScope] = useState<"managed-pools" | "all-codex">("managed-pools");
+  const [quotaActivationModel, setQuotaActivationModel] = useState("gpt-5.6-luna");
 
   useEffect(() => {
     if (!settings) return;
@@ -215,6 +216,7 @@ function RuntimeSettingsPanel({
     setQuotaCacheTtl(settings.quota_cache_ttl ?? "30m");
     setQuotaActivationEnabled(settings.quota_activation_enabled ?? false);
     setQuotaActivationScope(settings.quota_activation_scope ?? "managed-pools");
+    setQuotaActivationModel(settings.quota_activation_model ?? "gpt-5.6-luna");
   }, [settings]);
 
   const configuredIds = Object.keys(authLimits).sort((a, b) => a.localeCompare(b));
@@ -247,6 +249,7 @@ function RuntimeSettingsPanel({
       quota_cache_ttl: quotaCacheTtl.trim(),
       quota_activation_enabled: quotaActivationEnabled,
       quota_activation_scope: quotaActivationScope,
+      quota_activation_model: quotaActivationModel.trim(),
     });
   };
 
@@ -388,6 +391,18 @@ function RuntimeSettingsPanel({
               <option value="managed-pools">{t("mapping.quotaScopeManaged")}</option>
               <option value="all-codex">{t("mapping.quotaScopeAll")}</option>
             </select>
+          </div>
+          <div className="form-row">
+            <label htmlFor="quota-activation-model">{t("mapping.quotaActivationModel")}</label>
+            <input
+              id="quota-activation-model"
+              className="input mono"
+              value={quotaActivationModel}
+              disabled={loading || !settings}
+              onChange={(event) => setQuotaActivationModel(event.target.value)}
+              placeholder="gpt-5.6-luna"
+              spellCheck={false}
+            />
           </div>
         </div>
         <p className="muted quota-warning">{t("mapping.quotaWarning")}</p>

@@ -16,6 +16,9 @@ func TestQuotaRuntimeSettingsDefaultsArePassive(t *testing.T) {
 	if settings.QuotaActivationEnabled || settings.QuotaActivationScope != DefaultQuotaActivationScope {
 		t.Fatalf("activation defaults = enabled:%v scope:%q", settings.QuotaActivationEnabled, settings.QuotaActivationScope)
 	}
+	if settings.QuotaActivationModel != "gpt-5.6-luna" {
+		t.Fatalf("activation model = %q", settings.QuotaActivationModel)
+	}
 }
 
 func TestQuotaRuntimeSettingsValidateDurationsAndScope(t *testing.T) {
@@ -34,6 +37,7 @@ func TestQuotaRuntimeSettingsRejectExplicitEmptyValues(t *testing.T) {
 	for _, raw := range [][]byte{
 		[]byte("quota_check_interval: ''\n"),
 		[]byte("quota_cache_ttl: null\n"),
+		[]byte("quota_activation_model: '  '\n"),
 	} {
 		if _, err := DecodeConfig(raw); err == nil {
 			t.Fatalf("explicit empty setting accepted: %q", raw)
@@ -50,6 +54,12 @@ func TestQuotaRuntimeSettingsRejectExplicitEmptyValues(t *testing.T) {
 	if got := store.RuntimeSettings().QuotaCheckInterval; got != DefaultQuotaCheckInterval {
 		t.Fatalf("invalid patch changed setting to %q", got)
 	}
+	if _, err := store.UpdateRuntimeSettings(RuntimeSettingsPatch{QuotaActivationModel: &empty}); err == nil {
+		t.Fatal("empty quota_activation_model patch accepted")
+	}
+	if got := store.RuntimeSettings().QuotaActivationModel; got != DefaultQuotaActivationModel {
+		t.Fatalf("invalid patch changed activation model to %q", got)
+	}
 }
 
 func TestQuotaRuntimeSettingsPersistAndReload(t *testing.T) {
@@ -62,11 +72,13 @@ func TestQuotaRuntimeSettingsPersistAndReload(t *testing.T) {
 	ttl := "43m"
 	enabled := true
 	scope := "all-codex"
+	model := "custom-activation-model"
 	if _, err := store.UpdateRuntimeSettings(RuntimeSettingsPatch{
 		QuotaCheckInterval:     &check,
 		QuotaCacheTTL:          &ttl,
 		QuotaActivationEnabled: &enabled,
 		QuotaActivationScope:   &scope,
+		QuotaActivationModel:   &model,
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -75,7 +87,7 @@ func TestQuotaRuntimeSettingsPersistAndReload(t *testing.T) {
 		t.Fatal(err)
 	}
 	settings := reloaded.RuntimeSettings()
-	if settings.QuotaCheckInterval != "17m" || settings.QuotaCacheTTL != "43m" || !settings.QuotaActivationEnabled || settings.QuotaActivationScope != scope {
+	if settings.QuotaCheckInterval != "17m" || settings.QuotaCacheTTL != "43m" || !settings.QuotaActivationEnabled || settings.QuotaActivationScope != scope || settings.QuotaActivationModel != model {
 		t.Fatalf("reloaded settings = %#v", settings)
 	}
 }

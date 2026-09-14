@@ -19,11 +19,12 @@ func TestSchedulerSettingsManagementAndRestartPersistence(t *testing.T) {
 		"quota_check_interval": "17m",
 		"quota_cache_ttl": "43m",
 		"quota_activation_enabled": true,
-		"quota_activation_scope": "all-codex"
+		"quota_activation_scope": "all-codex",
+		"quota_activation_model": "custom-activation-model"
 	}`))
 	assertGlobalWeightedSetting(t, patchResponse, http.StatusOK, true)
 	assertRuntimeSettings(t, patchResponse, 4, 900, 321)
-	assertQuotaSettings(t, patchResponse, "17m", "43m", true, "all-codex")
+	assertQuotaSettings(t, patchResponse, "17m", "43m", true, "all-codex", "custom-activation-model")
 
 	getResponse := callManagementForTest(t, app, http.MethodGet, "/v0/management/plugins/cpa-key-policy/settings", nil)
 	assertGlobalWeightedSetting(t, getResponse, http.StatusOK, true)
@@ -32,7 +33,7 @@ func TestSchedulerSettingsManagementAndRestartPersistence(t *testing.T) {
 	restartedResponse := callManagementForTest(t, restarted, http.MethodGet, "/v0/management/plugins/cpa-key-policy/settings", nil)
 	assertGlobalWeightedSetting(t, restartedResponse, http.StatusOK, true)
 	assertRuntimeSettings(t, restartedResponse, 4, 900, 321)
-	assertQuotaSettings(t, restartedResponse, "17m", "43m", true, "all-codex")
+	assertQuotaSettings(t, restartedResponse, "17m", "43m", true, "all-codex", "custom-activation-model")
 }
 
 func TestQuotaManagementRouteReturnsRuntimeStatus(t *testing.T) {
@@ -46,11 +47,12 @@ func TestQuotaManagementRouteReturnsRuntimeStatus(t *testing.T) {
 		QuotaCacheTTL          string `json:"quota_cache_ttl"`
 		QuotaActivationEnabled bool   `json:"quota_activation_enabled"`
 		QuotaActivationScope   string `json:"quota_activation_scope"`
+		QuotaActivationModel   string `json:"quota_activation_model"`
 	}
 	if err := json.Unmarshal(response.Body, &payload); err != nil {
 		t.Fatal(err)
 	}
-	if payload.QuotaCheckInterval != "30m" || payload.QuotaCacheTTL != "30m" || payload.QuotaActivationEnabled || payload.QuotaActivationScope != "managed-pools" {
+	if payload.QuotaCheckInterval != "30m" || payload.QuotaCacheTTL != "30m" || payload.QuotaActivationEnabled || payload.QuotaActivationScope != "managed-pools" || payload.QuotaActivationModel != "gpt-5.6-luna" {
 		t.Fatalf("quota payload = %+v", payload)
 	}
 }
@@ -148,18 +150,19 @@ func assertRuntimeSettings(t *testing.T, response ManagementResponse, authLimit,
 	}
 }
 
-func assertQuotaSettings(t *testing.T, response ManagementResponse, interval, ttl string, enabled bool, scope string) {
+func assertQuotaSettings(t *testing.T, response ManagementResponse, interval, ttl string, enabled bool, scope, model string) {
 	t.Helper()
 	var payload struct {
 		QuotaCheckInterval     string `json:"quota_check_interval"`
 		QuotaCacheTTL          string `json:"quota_cache_ttl"`
 		QuotaActivationEnabled bool   `json:"quota_activation_enabled"`
 		QuotaActivationScope   string `json:"quota_activation_scope"`
+		QuotaActivationModel   string `json:"quota_activation_model"`
 	}
 	if err := json.Unmarshal(response.Body, &payload); err != nil {
 		t.Fatal(err)
 	}
-	if payload.QuotaCheckInterval != interval || payload.QuotaCacheTTL != ttl || payload.QuotaActivationEnabled != enabled || payload.QuotaActivationScope != scope {
+	if payload.QuotaCheckInterval != interval || payload.QuotaCacheTTL != ttl || payload.QuotaActivationEnabled != enabled || payload.QuotaActivationScope != scope || payload.QuotaActivationModel != model {
 		t.Fatalf("quota settings = %+v", payload)
 	}
 }

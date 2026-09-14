@@ -24,9 +24,7 @@ const (
 	codexQuotaEndpoint      = "https://chatgpt.com/backend-api/wham/usage"
 	codexActivationEndpoint = "https://chatgpt.com/backend-api/codex/responses"
 	codexActivationProtocol = "responses-v1"
-	codexActivationModel    = "gpt-5.4-mini"
 	codexQuotaUserAgent     = "codex_cli_rs/0.76.0 (Debian 13.0.0; x86_64) WindowsTerminal"
-	codexActivationPayload  = `{"model":"` + codexActivationModel + `","instructions":"","input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"ping"}]}],"stream":true,"store":false}`
 	quotaLazyTolerance      = 3 * time.Minute
 	quotaResetShift         = 2 * time.Minute
 	quotaMaxActivationTries = 2
@@ -848,6 +846,7 @@ func fetchCodexQuota(host HostClient, credentials codexCredentials, now func() t
 }
 
 func (m *quotaManager) processObservation(authID, authIndex, fingerprint string, observation quotaObservation, now time.Time) []quotaWindowKind {
+	activationModel := m.store.RuntimeSettings().QuotaActivationModel
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	runtime := m.runtime.Auths[authID]
@@ -875,8 +874,19 @@ func (m *quotaManager) processObservation(authID, authIndex, fingerprint string,
 		// migrated repeatedly.
 		runtime.Activation = quotaActivationState{
 			Protocol:   codexActivationProtocol,
+			Model:      activationModel,
 			Status:     "watching",
 			LastResult: "legacy_compact_404_migrated",
+		}
+	} else if rejectedActivationUsesDifferentModel(runtime.Activation, activationModel) {
+		// A completed 4xx proves the old-model request did not execute. Changing
+		// the configured model can therefore safely clear that model's attempt
+		// budget. Ambiguous transport, 2xx and 5xx outcomes are never replayed.
+		runtime.Activation = quotaActivationState{
+			Protocol:   codexActivationProtocol,
+			Model:      activationModel,
+			Status:     "watching",
+			LastResult: "activation_model_changed_after_rejection",
 		}
 	}
 	windows := observationWindows(observation)
@@ -933,7 +943,7 @@ func (m *quotaManager) processObservation(authID, authIndex, fingerprint string,
 	if len(lazy) > 0 {
 		sort.Slice(lazy, func(i, j int) bool { return lazy[i] < lazy[j] })
 		cycleID := quotaCycleID(fingerprint, runtime.Baselines, lazy)
-		runtime.Activation = quotaActivationState{Protocol: codexActivationProtocol, Status: "ready", CycleID: cycleID, Windows: append([]quotaWindowKind(nil), lazy...)}
+		runtime.Activation = quotaActivationState{Protocol: codexActivationProtocol, Model: activationModel, Status: "ready", CycleID: cycleID, Windows: append([]quotaWindowKind(nil), lazy...)}
 	} else if runtime.Activation.Status == "" {
 		runtime.Activation.Status = "watching"
 	}
@@ -943,6 +953,40 @@ func (m *quotaManager) processObservation(authID, authIndex, fingerprint string,
 
 func legacyCompact404Activation(state quotaActivationState) bool {
 	return state.Protocol == "" && state.CycleID != "" && state.Attempts > 0 && state.RetryAllowed && state.LastResult == "http_404"
+}
+
+func rejectedActivationUsesDifferentModel(state quotaActivationState, currentModel string) bool {
+	if state.Protocol != codexActivationProtocol || state.CycleID == "" || state.Attempts == 0 || !state.RetryAllowed || !activationResultDefinitelyRejected(state.LastResult) {
+		return false
+	}
+	previousModel := strings.TrimSpace(state.Model)
+	if previousModel == "" {
+		// v0.7.6 did not persist the model and always sent gpt-5.4-mini.
+		previousModel = "gpt-5.4-mini"
+	}
+	return previousModel != strings.TrimSpace(currentModel)
+}
+
+func activationResultDefinitelyRejected(result string) bool {
+	status, err := strconv.Atoi(strings.TrimPrefix(strings.TrimSpace(result), "http_"))
+	return err == nil && activationResponseDefinitelyRejected(status)
+}
+
+func buildCodexActivationPayload(model string) ([]byte, error) {
+	return json.Marshal(map[string]any{
+		"model":        strings.TrimSpace(model),
+		"instructions": "",
+		"input": []map[string]any{{
+			"type": "message",
+			"role": "user",
+			"content": []map[string]string{{
+				"type": "input_text",
+				"text": "ping",
+			}},
+		}},
+		"stream": true,
+		"store":  false,
+	})
 }
 
 func observationWindows(observation quotaObservation) map[quotaWindowKind]quotaWindow {
@@ -1013,6 +1057,12 @@ func (m *quotaManager) tryActivate(host HostClient, rosterEntry HostAuthEntry, c
 		return
 	}
 	credentials = currentCredentials
+	activationModel := m.store.RuntimeSettings().QuotaActivationModel
+	activationPayload, err := buildCodexActivationPayload(activationModel)
+	if err != nil {
+		m.setAuthActivationDeferred(rosterEntry.ID, "activation_payload_invalid", now.Add(30*time.Minute))
+		return
+	}
 	interval, _ := m.durations()
 	m.mu.Lock()
 	runtime := m.runtime.Auths[rosterEntry.ID]
@@ -1043,6 +1093,7 @@ func (m *quotaManager) tryActivate(host HostClient, rosterEntry HostAuthEntry, c
 	runtime = m.runtime.Auths[rosterEntry.ID]
 	runtime.Activation.Status = "sending"
 	runtime.Activation.Protocol = codexActivationProtocol
+	runtime.Activation.Model = activationModel
 	runtime.Activation.Attempts++
 	runtime.Activation.LastAttemptAt = now
 	runtime.Activation.SendIntent = true
@@ -1081,7 +1132,7 @@ func (m *quotaManager) tryActivate(host HostClient, rosterEntry HostAuthEntry, c
 			"Content-Type":       []string{"application/json"},
 			"User-Agent":         []string{codexQuotaUserAgent},
 		},
-		Body: []byte(codexActivationPayload),
+		Body: activationPayload,
 	})
 	release()
 	m.mu.Lock()
@@ -1397,6 +1448,7 @@ func (m *quotaManager) status() map[string]any {
 		"quota_cache_ttl":               settings.QuotaCacheTTL,
 		"quota_activation_enabled":      settings.QuotaActivationEnabled,
 		"quota_activation_scope":        settings.QuotaActivationScope,
+		"quota_activation_model":        settings.QuotaActivationModel,
 		"runtime_path":                  path,
 		"persistence_blocked":           blocked,
 		"persistence_error":             persistErr,

@@ -613,7 +613,8 @@ func TestQuotaShortLazyWindowUsesResponsesActivationProtocol(t *testing.T) {
 	app := configuredQuotaTestApp(t)
 	enabled := true
 	scope := "all-codex"
-	if _, err := app.store.UpdateRuntimeSettings(policy.RuntimeSettingsPatch{QuotaActivationEnabled: &enabled, QuotaActivationScope: &scope}); err != nil {
+	model := "custom-activation-model"
+	if _, err := app.store.UpdateRuntimeSettings(policy.RuntimeSettingsPatch{QuotaActivationEnabled: &enabled, QuotaActivationScope: &scope, QuotaActivationModel: &model}); err != nil {
 		t.Fatal(err)
 	}
 	clock := time.Date(2026, 9, 14, 11, 18, 33, 0, time.UTC)
@@ -662,8 +663,67 @@ func TestQuotaShortLazyWindowUsesResponsesActivationProtocol(t *testing.T) {
 	if store, ok := payload["store"].(bool); !ok || store {
 		t.Fatalf("activation store = %#v, want false", payload["store"])
 	}
-	if payload["model"] != codexActivationModel {
+	if payload["model"] != model {
 		t.Fatalf("activation model = %#v", payload["model"])
+	}
+}
+
+func TestQuotaRejectedActivationRetriesAfterActivationModelChanges(t *testing.T) {
+	app := configuredQuotaTestApp(t)
+	enabled := true
+	scope := "all-codex"
+	model := "gpt-5.6-luna"
+	if _, err := app.store.UpdateRuntimeSettings(policy.RuntimeSettingsPatch{
+		QuotaActivationEnabled: &enabled,
+		QuotaActivationScope:   &scope,
+		QuotaActivationModel:   &model,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	clock := time.Date(2026, 9, 14, 12, 18, 44, 0, time.UTC)
+	host := newFakeQuotaHost(clock)
+	host.getResponses = []HostHTTPResponse{
+		{StatusCode: http.StatusOK, Body: shortQuotaBody(0)},
+		{StatusCode: http.StatusOK, Body: shortQuotaBody(1)},
+	}
+	attachTestQuotaHost(app, host, clock)
+	app.quota.now = func() time.Time { return clock }
+	app.quota.cache.now = func() time.Time { return clock }
+	app.quota.verifyDelay = 0
+	app.quota.mu.Lock()
+	app.quota.runtime.Auths["account-a-team"] = quotaAuthRuntime{
+		AuthID:                "account-a-team",
+		AuthIndex:             "idx-a",
+		Provider:              "codex",
+		InMaintenanceScope:    true,
+		InActivationScope:     true,
+		CredentialFingerprint: codexCredentialFingerprint(codexCredentials{AccountID: "acct-a"}),
+		Baselines: map[quotaWindowKind]quotaWindowBaseline{
+			quotaWindowShort: {Kind: quotaWindowShort, ResetAt: clock.Add(5*time.Hour - 31*time.Minute), WindowSeconds: quotaFiveHourSeconds, ObservedAt: clock.Add(-31 * time.Minute)},
+		},
+		Activation: quotaActivationState{
+			Protocol:      codexActivationProtocol,
+			Status:        "deferred",
+			CycleID:       "old-model-cycle",
+			Windows:       []quotaWindowKind{quotaWindowShort},
+			Attempts:      quotaMaxActivationTries,
+			LastAttemptAt: clock.Add(-31 * time.Minute),
+			RetryAllowed:  true,
+			LastResult:    "http_404",
+		},
+	}
+	app.quota.mu.Unlock()
+
+	app.quota.runRound()
+	_, get, post := host.counts()
+	if get != 2 || post != 1 {
+		t.Fatalf("activation model migration counts: get=%d post=%d", get, post)
+	}
+	app.quota.mu.Lock()
+	activation := app.quota.runtime.Auths["account-a-team"].Activation
+	app.quota.mu.Unlock()
+	if activation.Model != model || activation.Status != "confirmed" || activation.Attempts != 1 || activation.LastResult != "verified" {
+		t.Fatalf("migrated activation = %#v", activation)
 	}
 }
 
@@ -752,6 +812,7 @@ func TestQuotaCurrentProtocol404AtLimitIsNotMigratedAgain(t *testing.T) {
 		},
 		Activation: quotaActivationState{
 			Protocol:      codexActivationProtocol,
+			Model:         "gpt-5.6-luna",
 			Status:        "deferred",
 			CycleID:       "current-protocol-cycle",
 			Windows:       []quotaWindowKind{quotaWindowShort},
