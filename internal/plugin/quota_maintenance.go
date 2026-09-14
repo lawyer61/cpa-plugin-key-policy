@@ -26,7 +26,7 @@ const (
 	codexActivationProtocol = "responses-v1"
 	codexActivationModel    = "gpt-5.4-mini"
 	codexQuotaUserAgent     = "codex_cli_rs/0.76.0 (Debian 13.0.0; x86_64) WindowsTerminal"
-	codexActivationPayload  = `{"model":"gpt-5.4-mini","instructions":"","input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"ping"}]}],"stream":true,"store":false}`
+	codexActivationPayload  = `{"model":"` + codexActivationModel + `","instructions":"","input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"ping"}]}],"stream":true,"store":false}`
 	quotaLazyTolerance      = 3 * time.Minute
 	quotaResetShift         = 2 * time.Minute
 	quotaMaxActivationTries = 2

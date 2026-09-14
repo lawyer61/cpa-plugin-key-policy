@@ -23,7 +23,7 @@ plugins:
       # stale, reset-crossed, or activation-verification state.
       quota_check_interval: "30m"
       quota_cache_ttl: "30m"
-      # Safe default: no compact activation requests until explicitly enabled.
+      # Safe default: no response activation requests until explicitly enabled.
       quota_activation_enabled: false
       quota_activation_scope: "managed-pools" # managed-pools | all-codex
 

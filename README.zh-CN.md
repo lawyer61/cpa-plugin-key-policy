@@ -101,7 +101,7 @@ CPA 原生 key 默认完全不受影响；只有显式以 `native: true` 导入�
 - 无有效额度缓存时，在合法池内按原 Fill First 稳定降级；明确耗尽的账号不会因 TTL 或 reset 到点自动恢复，必须看到更新的正面证据。
 - `quota_check_interval` 与 `quota_cache_ttl` 独立，默认均为 `30m`。正常业务响应的额度信号优先，后台只补查缺失、过期、跨 reset 或待验证状态。
 - 自动激活默认关闭。开启后可选 `managed-pools` 或 `all-codex`；后者也覆盖只被 CPA 原生 key 使用和暂未使用的有效 Codex OAuth auth，但**绝不扩大任何 key 的业务允许池**。
-- 激活使用严格的懒窗口基线、很小的 `gpt-5.4-mini` compact 请求和后验 GET 验证；与受控业务共享 auth 并发上限，但不消耗用户 key 的 RPM/账本。未接管的原生请求仍不计入插件并发，因此该上限不是全宿主物理并发硬限制。
+- 激活使用严格的懒窗口基线、很小且不存储的 `gpt-5.4-mini` response 请求和后验 GET 验证；与受控业务共享 auth 并发上限，但不消耗用户 key 的 RPM/账本。未接管的原生请求仍不计入插件并发，因此该上限不是全宿主物理并发硬限制。
 - 额度与激活运行状态保存在 `<state_file>.quota-runtime.json`；Docker 应挂载 `state_file` 所在整个目录。
 
 **运行边界：** 这是纯插件控制。账号绑定流量必须保持插件启用且健康，也不能使用 CPA Home 模式，因为 Home 会在普通插件 scheduler 之前完成选择。若插件被卸载或熔断，仍留在 CPA `api-keys` 中的原生 key 会重新只受宿主全局账号池控制。若要求插件被移除时也尽量失败关闭，请使用插件签发的 key，并且绝不要把它重复放进 CPA `api-keys`。

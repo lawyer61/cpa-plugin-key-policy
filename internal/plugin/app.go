@@ -165,7 +165,7 @@ func (a *App) registration() Registration {
 				{Name: "session_affinity_max_entries", Type: "integer", Description: "Maximum in-memory session affinity bindings."},
 				{Name: "quota_check_interval", Type: "string", Description: "Background Codex quota review interval (duration, default 30m)."},
 				{Name: "quota_cache_ttl", Type: "string", Description: "Freshness TTL for quota evidence (duration, default 30m)."},
-				{Name: "quota_activation_enabled", Type: "boolean", Description: "Allow compact background activation for strictly detected lazy Codex windows."},
+				{Name: "quota_activation_enabled", Type: "boolean", Description: "Allow small background response requests for strictly detected lazy Codex windows."},
 				{Name: "quota_activation_scope", Type: "string", EnumValues: []string{"managed-pools", "all-codex"}, Description: "Auth scope eligible for background activation."},
 				{Name: "keys", Type: "array", Description: "Downstream key policies, including optional fail-closed account_binding allow globs. State file wins after it exists."},
 			},

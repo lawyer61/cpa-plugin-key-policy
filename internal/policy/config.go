@@ -33,7 +33,7 @@ type Config struct {
 	// QuotaCacheTTL controls how long positive quota evidence is considered
 	// fresh by quota-aware scheduling.
 	QuotaCacheTTL string `yaml:"quota_cache_ttl,omitempty" json:"quota_cache_ttl,omitempty"`
-	// QuotaActivationEnabled authorizes compact background activation requests.
+	// QuotaActivationEnabled authorizes small background response requests.
 	// It defaults to false so existing installations never start upstream work.
 	QuotaActivationEnabled bool `yaml:"quota_activation_enabled,omitempty" json:"quota_activation_enabled,omitempty"`
 	// QuotaActivationScope is managed-pools or all-codex.

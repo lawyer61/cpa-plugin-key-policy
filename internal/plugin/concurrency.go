@@ -137,7 +137,7 @@ func (t *concurrencyTracker) authAvailable(authID string, limit int) bool {
 	return t.authCounts[authID] < limit
 }
 
-// acquireActivation reserves an auth-only slot for one internal compact
+// acquireActivation reserves an auth-only slot for one internal response
 // activation request. It shares authCounts with controlled business traffic
 // but never creates a key lease or consumes a key limit.
 func (t *concurrencyTracker) acquireActivation(leaseID, authID string, limit int) (int, bool) {

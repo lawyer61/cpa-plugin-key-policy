@@ -662,6 +662,9 @@ func TestQuotaShortLazyWindowUsesResponsesActivationProtocol(t *testing.T) {
 	if store, ok := payload["store"].(bool); !ok || store {
 		t.Fatalf("activation store = %#v, want false", payload["store"])
 	}
+	if payload["model"] != codexActivationModel {
+		t.Fatalf("activation model = %#v", payload["model"])
+	}
 }
 
 func TestQuotaLegacyCompact404StateRetriesOnceWithCurrentProtocol(t *testing.T) {
