@@ -57,6 +57,7 @@ describe("KeyForm pricing draft", () => {
                     max_concurrent_requests: 4,
                     current_concurrent_requests: 0,
                     session_affinity: true,
+					allow_quota_refresh: true,
                     usage: { daily_usd: 0, weekly_usd: 0, daily_limit_usd: 1, weekly_limit_usd: 5 },
                   }}
                   pickPath="/pick"
@@ -103,6 +104,7 @@ describe("KeyForm pricing draft", () => {
     expect(state.keyDraft.rpm).toBe(3);
     expect(state.keyDraft.max_concurrent_requests).toBe(4);
     expect(state.keyDraft.session_affinity).toBe(true);
+		expect(state.keyDraft.allow_quota_refresh).toBe(true);
     expect(state.models[0].input_price_per_million).toBe(0.025);
     expect(state.keyDraft.models[0].input_price_per_million).toBe(0.025);
   });

@@ -42,6 +42,7 @@ func (a *App) upsertAlias(raw []byte) ManagementResponse {
 	if err := a.store.UpsertAlias(alias); err != nil {
 		return jsonError(http.StatusBadRequest, "validation_error", err.Error())
 	}
+	a.notifyQuotaPolicyChanged()
 	return jsonResponse(http.StatusOK, map[string]any{"alias": alias})
 }
 
@@ -58,6 +59,7 @@ func (a *App) deleteAlias(raw []byte) ManagementResponse {
 	if err := a.store.DeleteAlias(req.Alias); err != nil {
 		return jsonError(http.StatusBadRequest, "delete_failed", err.Error())
 	}
+	a.notifyQuotaPolicyChanged()
 	return jsonResponse(http.StatusOK, map[string]any{"deleted": true})
 }
 
@@ -87,6 +89,7 @@ func (a *App) upsertClassifyRule(raw []byte) ManagementResponse {
 	if err := a.store.UpsertClassifyRule(rule); err != nil {
 		return jsonError(http.StatusBadRequest, "validation_error", err.Error())
 	}
+	a.notifyQuotaPolicyChanged()
 	return jsonResponse(http.StatusOK, map[string]any{"rule": rule})
 }
 
@@ -103,6 +106,7 @@ func (a *App) deleteClassifyRule(raw []byte) ManagementResponse {
 	if err := a.store.DeleteClassifyRule(req.Name); err != nil {
 		return jsonError(http.StatusBadRequest, "delete_failed", err.Error())
 	}
+	a.notifyQuotaPolicyChanged()
 	return jsonResponse(http.StatusOK, map[string]any{"deleted": true})
 }
 
@@ -119,6 +123,7 @@ func (a *App) reorderClassifyRules(raw []byte) ManagementResponse {
 	if err := a.store.ReorderClassifyRules(req.Names); err != nil {
 		return jsonError(http.StatusBadRequest, "reorder_failed", err.Error())
 	}
+	a.notifyQuotaPolicyChanged()
 	return jsonResponse(http.StatusOK, map[string]any{"reordered": true})
 }
 

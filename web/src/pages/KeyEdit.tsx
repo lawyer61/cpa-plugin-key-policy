@@ -116,6 +116,7 @@ export default function KeyEdit() {
             max_concurrent_requests: v.max_concurrent_requests,
             session_affinity: v.session_affinity,
             allow_models_endpoint: v.allow_models_endpoint,
+            allow_quota_refresh: v.allow_quota_refresh,
             account_binding: v.account_binding,
             clear_account_binding: v.clear_account_binding,
           });

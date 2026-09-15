@@ -133,7 +133,8 @@ func (a *App) configure(raw []byte) error {
 	a.clearSchedulerState()
 	a.store.StartUsageFlusher()
 	if a.quota != nil {
-		restartQuotaDeadline := !quotaFeatureNeeded(previousSettings, previousKeys) && quotaFeatureNeeded(settings, keys)
+		a.quota.invalidateRoster()
+		restartQuotaDeadline := !quotaScheduleNeeded(previousSettings, previousKeys) && quotaScheduleNeeded(settings, keys)
 		a.quota.configure(a.store.StatePath(), restartQuotaDeadline)
 	}
 	return nil
@@ -926,6 +927,7 @@ func (a *App) managementRegistration() ManagementRegistrationResponse {
 			{Path: web.IndexPath, Menu: "Key Policy", Description: "Web UI for managing downstream CPA key policies (create keys, pick models)."},
 			{Path: web.LookupPath, Menu: "Key Usage", Description: "Read-only usage lookup for one derived key or all derived keys via an imported CPA-native key."},
 			{Path: web.LookupDataPath, Description: "Bearer-authenticated derived-key usage data."},
+			{Path: web.LookupQuotaRefreshPath, Description: "Explicitly authorized single-account Codex quota refresh."},
 		},
 	}
 }
@@ -942,10 +944,10 @@ func (a *App) handleManagement(raw []byte) ([]byte, error) {
 	resourcePrefix := "/v0/resource/plugins/" + PluginID
 	if req.Method == http.MethodGet && strings.HasPrefix(path, resourcePrefix) {
 		resourcePath := strings.TrimPrefix(path, resourcePrefix)
-		if resourcePath == web.LookupDataPath {
+		if resourcePath == web.LookupDataPath || resourcePath == web.LookupQuotaRefreshPath {
 			for name, values := range req.Query {
 				switch strings.ToLower(strings.TrimSpace(name)) {
-				case "key", "api_key", "key_id", "id":
+				case "key", "api_key", "key_id", "id", "auth_id", "auth_index", "auth_ref", "provider", "group", "url", "target_url", "refresh":
 					if len(values) == 0 {
 						continue
 					}
@@ -954,7 +956,10 @@ func (a *App) handleManagement(raw []byte) ([]byte, error) {
 					return OKEnvelope(response)
 				}
 			}
-			return OKEnvelope(a.lookupData(req.Headers))
+			if resourcePath == web.LookupQuotaRefreshPath {
+				return OKEnvelope(a.lookupQuotaRefresh(req.Headers, req.HostCallbackID))
+			}
+			return OKEnvelope(a.lookupData(req.Headers, req.HostCallbackID))
 		}
 		status, headers, body := web.Serve(resourcePath)
 		return OKEnvelope(ManagementResponse{StatusCode: status, Headers: headers, Body: body})
@@ -1072,7 +1077,7 @@ func (a *App) updateSchedulerSettings(body []byte) ManagementResponse {
 	}
 	a.affinity.configure(time.Duration(settings.SessionAffinityIdleTTLSeconds)*time.Second, settings.SessionAffinityMaxEntries)
 	a.clearSchedulerState()
-	restartQuotaDeadline := !quotaFeatureNeeded(previous, keys) && quotaFeatureNeeded(settings, keys)
+	restartQuotaDeadline := !quotaScheduleNeeded(previous, keys) && quotaScheduleNeeded(settings, keys)
 	a.quota.configure(a.store.StatePath(), restartQuotaDeadline)
 	return a.schedulerSettings()
 }
@@ -1093,6 +1098,7 @@ type keyWriteRequest struct {
 	DailyLimitUSD         *float64               `json:"daily_limit_usd,omitempty"`
 	WeeklyLimitUSD        *float64               `json:"weekly_limit_usd,omitempty"`
 	AllowModelsEndpoint   *bool                  `json:"allow_models_endpoint,omitempty"`
+	AllowQuotaRefresh     *bool                  `json:"allow_quota_refresh,omitempty"`
 }
 
 type publicKey struct {
@@ -1111,6 +1117,7 @@ type publicKey struct {
 	DailyLimitUSD             float64                `json:"daily_limit_usd"`
 	WeeklyLimitUSD            float64                `json:"weekly_limit_usd"`
 	AllowModelsEndpoint       bool                   `json:"allow_models_endpoint,omitempty"`
+	AllowQuotaRefresh         bool                   `json:"allow_quota_refresh"`
 	Usage                     policy.UsageSummary    `json:"usage"`
 	CreatedAt                 string                 `json:"created_at,omitempty"`
 	UpdatedAt                 string                 `json:"updated_at,omitempty"`
@@ -1172,6 +1179,7 @@ func (a *App) createKey(body []byte) ManagementResponse {
 		DailyLimitUSD:         applyFloat64(req.DailyLimitUSD, 0),
 		WeeklyLimitUSD:        applyFloat64(req.WeeklyLimitUSD, 0),
 		AllowModelsEndpoint:   applyBool(req.AllowModelsEndpoint, false),
+		AllowQuotaRefresh:     applyBool(req.AllowQuotaRefresh, false),
 	}
 	if native {
 		item.CallerScope = policy.CallerScopeForKey(plain)
@@ -1186,6 +1194,7 @@ func (a *App) createKey(body []byte) ManagementResponse {
 	if upsertErr != nil {
 		return jsonError(http.StatusBadRequest, "invalid_policy", upsertErr.Error())
 	}
+	a.notifyQuotaPolicyChanged()
 	saved, _ := a.keyConfigByID(item.ID)
 	bodyMap := map[string]any{
 		"key":       a.publicKeyFromConfig(saved),
@@ -1245,6 +1254,9 @@ func (a *App) patchKey(body []byte) ManagementResponse {
 	if req.AllowModelsEndpoint != nil {
 		current.AllowModelsEndpoint = *req.AllowModelsEndpoint
 	}
+	if req.AllowQuotaRefresh != nil {
+		current.AllowQuotaRefresh = *req.AllowQuotaRefresh
+	}
 	if req.Models != nil {
 		current.Models = req.Models
 	}
@@ -1277,6 +1289,7 @@ func (a *App) patchKey(body []byte) ManagementResponse {
 	if upsertErr != nil {
 		return jsonError(http.StatusBadRequest, "invalid_policy", upsertErr.Error())
 	}
+	a.notifyQuotaPolicyChanged()
 	saved, _ := a.keyConfigByID(current.ID)
 	return jsonResponse(http.StatusOK, map[string]any{"key": a.publicKeyFromConfig(saved)})
 }
@@ -1294,6 +1307,7 @@ func (a *App) deleteKey(id string) ManagementResponse {
 	if err := a.store.DeleteKey(id); err != nil {
 		return storeError(err)
 	}
+	a.notifyQuotaPolicyChanged()
 	return jsonResponse(http.StatusOK, map[string]any{"deleted": true, "id": strings.TrimSpace(id)})
 }
 
@@ -1400,6 +1414,7 @@ func (a *App) publicKeyFromConfig(key policy.KeyConfig) publicKey {
 		DailyLimitUSD:       key.DailyLimitUSD,
 		WeeklyLimitUSD:      key.WeeklyLimitUSD,
 		AllowModelsEndpoint: key.AllowModelsEndpoint,
+		AllowQuotaRefresh:   key.AllowQuotaRefresh,
 		Usage:               a.store.UsageSummaryFor(key),
 	}
 	if !key.CreatedAt.IsZero() {
@@ -1430,6 +1445,14 @@ func applyBool(v *bool, def bool) bool {
 		return def
 	}
 	return *v
+}
+
+func (a *App) notifyQuotaPolicyChanged() {
+	if a == nil || a.quota == nil {
+		return
+	}
+	a.quota.invalidateRoster()
+	a.quota.configure(a.store.StatePath(), false)
 }
 
 func jsonResponse(status int, payload any) ManagementResponse {

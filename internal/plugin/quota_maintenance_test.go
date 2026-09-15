@@ -284,6 +284,9 @@ func TestQuotaGetHonorsRetryAfterBeyondCheckInterval(t *testing.T) {
 	if !next.Equal(want) {
 		t.Fatalf("next check = %v, want Retry-After %v", next, want)
 	}
+	if observation, ok := app.quota.cache.get("account-a-team"); ok && observation.ExplicitExhausted {
+		t.Fatalf("quota GET 429 was misclassified as model exhaustion: %#v", observation)
+	}
 }
 
 func TestQuotaAllCodexIncludesIdleAuthWithoutQuotaKey(t *testing.T) {

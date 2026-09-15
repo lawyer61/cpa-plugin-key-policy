@@ -54,10 +54,11 @@ type HostAuthDocument struct {
 }
 
 type HostHTTPRequest struct {
-	Method  string      `json:"method"`
-	URL     string      `json:"url"`
-	Headers http.Header `json:"headers,omitempty"`
-	Body    []byte      `json:"body,omitempty"`
+	Method         string      `json:"method"`
+	URL            string      `json:"url"`
+	Headers        http.Header `json:"headers,omitempty"`
+	Body           []byte      `json:"body,omitempty"`
+	HostCallbackID string      `json:"host_callback_id,omitempty"`
 }
 
 type HostHTTPResponse struct {

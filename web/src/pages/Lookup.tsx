@@ -1,7 +1,16 @@
 import { useState } from "react";
-import { fetchLookupData } from "../api/lookup";
+import { fetchLookupData, fetchLookupQuota } from "../api/lookup";
 import { useT } from "../i18n";
-import type { LookupAliasSummary, LookupAllDerivedResponse, LookupKeyUsage, LookupResponse, UsageWindow } from "../types";
+import type {
+  LookupAliasSummary,
+  LookupAllDerivedResponse,
+  LookupAuthQuotaAccount,
+  LookupAuthQuotaWindow,
+  LookupAuthQuotas,
+  LookupKeyUsage,
+  LookupResponse,
+  UsageWindow,
+} from "../types";
 import { formatUSD } from "../utils/money";
 
 type UsageValue = UsageWindow | number | undefined;
@@ -26,7 +35,143 @@ function usagePercent(used: number, limit: number): number {
 function formatReset(value: string | undefined): string | null {
   if (!value) return null;
   const date = new Date(value);
-  return Number.isNaN(date.getTime()) ? value : date.toLocaleString();
+  if (Number.isNaN(date.getTime()) || date.getUTCFullYear() <= 1) return null;
+  return date.toLocaleString();
+}
+
+function formatPercent(value: number | undefined): string {
+  if (typeof value !== "number" || !Number.isFinite(value)) return "—";
+  return `${Number.isInteger(value) ? value : value.toFixed(1)}%`;
+}
+
+function quotaWindowKindLabel(kind: string, t: ReturnType<typeof useT>): string {
+  if (kind === "five_hour") return t("lookup.quotaFiveHour");
+  if (kind === "weekly") return t("lookup.quotaWeekly");
+  if (kind === "monthly") return t("lookup.quotaMonthly");
+  return t("lookup.quotaUnknown");
+}
+
+function formatQuotaWindow(window: LookupAuthQuotaWindow | undefined, t: ReturnType<typeof useT>) {
+  if (!window) return null;
+  const reset = formatReset(window.reset_at);
+  return (
+    <div className="lookup-quota-window" key={window.kind}>
+      <div className="lookup-quota-window-title">{quotaWindowKindLabel(window.kind, t)}</div>
+      <div className="lookup-quota-stats">
+        <span><b>{t("lookup.quotaUsed")}</b> {formatPercent(window.used_percent)}</span>
+        <span><b>{t("lookup.quotaRemaining")}</b> {formatPercent(window.remaining_percent)}</span>
+      </div>
+      <div className="lookup-quota-window-meta">
+        {reset ? t("lookup.quotaResetAt", { at: reset }) : t("lookup.quotaNotAvailable")}
+        {window.exhausted ? ` · ${t("lookup.quotaExhausted")}` : ""}
+      </div>
+    </div>
+  );
+}
+
+function quotaStatusLabel(account: LookupAuthQuotaAccount, t: ReturnType<typeof useT>): string {
+  const status = account.status;
+  if (status === "active") return t("lookup.quotaActive");
+  if (status === "disabled") return t("lookup.quotaDisabled");
+  if (status === "unavailable") return t("lookup.quotaUnavailable");
+  if (status === "expired") return t("lookup.quotaExpired");
+  if (status === "unqueryable") return t("lookup.quotaUnqueryable");
+  return t("lookup.quotaUnknown");
+}
+
+function quotaRefreshStatusLabel(account: LookupAuthQuotaAccount, manualRefreshAllowed: boolean, t: ReturnType<typeof useT>): string | null {
+  if (manualRefreshAllowed && account.can_refresh && account.refresh_status === "ready") return null;
+  if (account.refresh_status === "permission_disabled") return t("lookup.quotaRefreshPermissionDisabled");
+  if (account.refresh_status === "cooldown") return t("lookup.quotaRefreshCooldown");
+  if (account.refresh_status === "busy") return t("lookup.quotaRefreshBusy");
+  if (account.refresh_status === "transport_unavailable") return t("lookup.quotaRefreshTransportUnavailable");
+  return t("lookup.quotaRefreshUnavailable");
+}
+
+function quotaScopeMessage(quotas: LookupAuthQuotas, t: ReturnType<typeof useT>): string | null {
+  if (quotas.status === "binding_required") return t("lookup.quotaBindingRequired");
+  if (quotas.status === "route_unproven") {
+    const route = t("lookup.quotaRouteUnproven");
+    return quotas.unsupported_providers.length > 0
+      ? `${route} ${t("lookup.quotaUnsupportedProviders", { providers: quotas.unsupported_providers.join(", ") })}`
+      : route;
+  }
+  if (quotas.status === "roster_unavailable") return t("lookup.quotaRosterUnavailable");
+  if (quotas.status === "no_matches") return t("lookup.quotaNoMatches");
+  if (quotas.unsupported_providers.length > 0) {
+    return t("lookup.quotaUnsupportedProviders", { providers: quotas.unsupported_providers.join(", ") });
+  }
+  if (quotas.accounts.length === 0) return t("lookup.quotaNoMatches");
+  return null;
+}
+
+function LookupAuthQuotaSection({
+  quotas,
+  refreshingRef,
+  refreshError,
+  onRefresh,
+}: {
+  quotas: LookupAuthQuotas;
+  refreshingRef: string | null;
+  refreshError: string;
+  onRefresh: (ref: string) => void;
+}) {
+  const t = useT();
+  const message = quotaScopeMessage(quotas, t);
+  return (
+    <section className="lookup-section lookup-quota-section">
+      <h3>{t("lookup.authQuotaTitle")}</h3>
+      <p className="muted lookup-quota-subtitle">{t("lookup.authQuotaSubtitle")}</p>
+      {message && <p className="lookup-quota-note">{message}</p>}
+      {refreshError && <p className="error lookup-quota-error" role="alert">{refreshError}</p>}
+      {quotas.accounts.length > 0 && (
+        <div className="lookup-quota-list">
+          {quotas.accounts.map((account) => {
+            const refreshStatus = quotaRefreshStatusLabel(account, quotas.manual_refresh_allowed, t);
+            const refreshable = quotas.manual_refresh_allowed && account.can_refresh && account.refresh_status === "ready";
+            const refreshing = refreshingRef === account.ref;
+						const observedAt = formatReset(account.observed_at);
+						const refreshAfter = formatReset(account.refresh_after);
+            return (
+              <article className="lookup-quota-card" key={account.ref}>
+                <div className="lookup-quota-card-head">
+                  <div>
+                    <div className="lookup-quota-label">{account.label}</div>
+                    <div className="lookup-quota-meta">
+                      {t("lookup.quotaTier")}: {account.tier === "unknown" ? t("lookup.quotaUnknown") : account.tier}
+                      <span> · {t("lookup.quotaStatus")}: {quotaStatusLabel(account, t)}</span>
+                    </div>
+                  </div>
+                  <button
+                    className="btn sm"
+                    type="button"
+                    disabled={!refreshable || refreshingRef !== null}
+                    onClick={() => onRefresh(account.ref)}
+                    aria-label={`${t("lookup.quotaRefresh")} ${account.label}`}
+                  >
+                    {refreshing ? t("lookup.quotaRefreshing") : t("lookup.quotaRefresh")}
+                  </button>
+                </div>
+                <div className="lookup-quota-meta">
+                  {t("lookup.quotaAvailability")}: {account.availability === "ready" ? t("lookup.quotaReady") : account.availability === "exhausted" ? t("lookup.quotaExhausted") : t("lookup.quotaUnknown")}
+                  <span> · {t("lookup.quotaFreshness")}: {account.freshness === "fresh" ? t("lookup.quotaFresh") : account.freshness === "stale" ? t("lookup.quotaStale") : t("lookup.quotaUnknown")}</span>
+                </div>
+				{observedAt && (
+				  <div className="lookup-quota-window-meta">{t("lookup.quotaObservedAt", { at: observedAt })}</div>
+                )}
+                <div className="lookup-quota-windows">
+                  {formatQuotaWindow(account.short, t)}
+                  {formatQuotaWindow(account.long, t)}
+							{!account.short && !account.long && <div className="lookup-quota-window-meta">{t("lookup.quotaNoData")}</div>}
+                </div>
+				{refreshStatus && <div className="lookup-quota-refresh-state">{refreshStatus}{refreshAfter ? ` · ${t("lookup.quotaRefreshAfter", { at: refreshAfter })}` : ""}</div>}
+              </article>
+            );
+          })}
+        </div>
+      )}
+    </section>
+  );
 }
 
 function WindowCard({
@@ -101,7 +246,17 @@ function isAllDerivedLookup(data: LookupResponse): data is LookupAllDerivedRespo
   return "scope" in data && data.scope === "all-derived";
 }
 
-function LookupKeyDetails({ data }: { data: LookupKeyUsage }) {
+function LookupKeyDetails({
+  data,
+  quotaRefresh,
+}: {
+  data: LookupKeyUsage;
+  quotaRefresh?: {
+    refreshingRef: string | null;
+    error: string;
+    onRefresh: (ref: string) => void;
+  };
+}) {
   const t = useT();
   const { limits, usage, concurrency } = data;
   return (
@@ -152,6 +307,14 @@ function LookupKeyDetails({ data }: { data: LookupKeyUsage }) {
         <h3>{t("lookup.aliasesTitle")}</h3>
         <AliasTable aliases={data.aliases ?? []} />
       </section>
+      {quotaRefresh && data.auth_quotas && (
+        <LookupAuthQuotaSection
+          quotas={data.auth_quotas}
+          refreshingRef={quotaRefresh.refreshingRef}
+          refreshError={quotaRefresh.error}
+          onRefresh={quotaRefresh.onRefresh}
+        />
+      )}
     </>
   );
 }
@@ -162,10 +325,13 @@ export default function Lookup() {
   const [data, setData] = useState<LookupResponse | null>(null);
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(false);
+  const [quotaRefreshingRef, setQuotaRefreshingRef] = useState<string | null>(null);
+  const [quotaRefreshError, setQuotaRefreshError] = useState("");
 
   const query = async () => {
     const value = secret.trim();
     setError("");
+    setQuotaRefreshError("");
     if (!value) {
       setData(null);
       setError(t("lookup.keyRequired"));
@@ -183,10 +349,29 @@ export default function Lookup() {
     }
   };
 
+  const refreshQuota = async (accountRef: string) => {
+    const value = secret.trim();
+    if (!value || quotaRefreshingRef !== null) return;
+    setQuotaRefreshError("");
+    setQuotaRefreshingRef(accountRef);
+    try {
+      const result = await fetchLookupQuota(value, accountRef);
+      setData((previous) => previous && !isAllDerivedLookup(previous)
+        ? { ...previous, auth_quotas: result.auth_quotas }
+        : previous);
+    } catch {
+      setQuotaRefreshError(t("lookup.quotaRefreshFailed"));
+    } finally {
+      setQuotaRefreshingRef(null);
+    }
+  };
+
   const clear = () => {
     setSecret("");
     setData(null);
     setError("");
+    setQuotaRefreshError("");
+    setQuotaRefreshingRef(null);
   };
 
   return (
@@ -251,7 +436,16 @@ export default function Lookup() {
                 ))}
               </div>
             )
-          ) : <LookupKeyDetails data={data} />}
+          ) : (
+            <LookupKeyDetails
+              data={data}
+              quotaRefresh={{
+                refreshingRef: quotaRefreshingRef,
+                error: quotaRefreshError,
+                onRefresh: (ref) => { void refreshQuota(ref); },
+              }}
+            />
+          )}
         </main>
       )}
     </div>

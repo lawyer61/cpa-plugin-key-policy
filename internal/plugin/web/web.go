@@ -23,6 +23,7 @@ const contentType = "text/html; charset=utf-8"
 const IndexPath = "/index.html"
 const LookupPath = "/lookup"
 const LookupDataPath = "/lookup/data"
+const LookupQuotaRefreshPath = "/lookup/quota-refresh"
 
 // Serve returns a management response for a plugin resource GET request. It
 // only handles the index page; any other path yields 404.

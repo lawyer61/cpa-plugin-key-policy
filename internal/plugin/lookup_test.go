@@ -47,7 +47,7 @@ func TestLookupReturnsOnlyOwnLightweightUsageAndConcurrency(t *testing.T) {
 	if response.StatusCode != http.StatusOK {
 		t.Fatalf("lookup status = %d body=%s", response.StatusCode, response.Body)
 	}
-	if response.Headers.Get("Cache-Control") != "no-store" {
+	if !strings.Contains(response.Headers.Get("Cache-Control"), "no-store") {
 		t.Fatalf("cache-control = %q", response.Headers.Get("Cache-Control"))
 	}
 	var payload lookupResponse
@@ -81,6 +81,7 @@ func TestLookupRequiresOneBearerHeaderAndRejectsURLKeys(t *testing.T) {
 		{name: "wrong scheme", headers: http.Header{"Authorization": {"Basic " + plain}}, status: http.StatusUnauthorized},
 		{name: "multiple", headers: http.Header{"Authorization": {"Bearer " + plain, "Bearer other"}}, status: http.StatusUnauthorized},
 		{name: "url key", headers: http.Header{"Authorization": {"Bearer " + plain}}, query: url.Values{"key_id": {"priced"}}, status: http.StatusBadRequest},
+		{name: "url auth", headers: http.Header{"Authorization": {"Bearer " + plain}}, query: url.Values{"auth_id": {"hidden"}}, status: http.StatusBadRequest},
 	}
 	for _, test := range requests {
 		t.Run(test.name, func(t *testing.T) {
@@ -88,7 +89,7 @@ func TestLookupRequiresOneBearerHeaderAndRejectsURLKeys(t *testing.T) {
 			if response.StatusCode != test.status {
 				t.Fatalf("status = %d body=%s, want %d", response.StatusCode, response.Body, test.status)
 			}
-			if response.Headers.Get("Cache-Control") != "no-store" {
+			if !strings.Contains(response.Headers.Get("Cache-Control"), "no-store") {
 				t.Fatalf("cache-control = %q", response.Headers.Get("Cache-Control"))
 			}
 		})
@@ -111,6 +112,11 @@ func TestLookupDisabledAndUnknownKeysUseUniformUnauthorizedResponse(t *testing.T
 
 func TestLookupNativeKeyReturnsAllDerivedKeyUsage(t *testing.T) {
 	app, _ := configurePricedApp(t)
+	priced := app.store.FindByID("priced")
+	priced.AccountBinding = &policy.AccountBinding{Allow: []string{"auth-*"}, Strategy: policy.BindingStrategyRoundRobin}
+	if err := app.store.UpsertKey(*priced, false); err != nil {
+		t.Fatal(err)
+	}
 	secondSecret := "cpa_second"
 	secondHash := hashForTest(t, secondSecret)
 	if err := app.store.UpsertKeyWithModelPricing(policy.KeyConfig{
@@ -148,7 +154,7 @@ func TestLookupNativeKeyReturnsAllDerivedKeyUsage(t *testing.T) {
 		t.Fatalf("derived usage = %#v", payload.Keys)
 	}
 	body := string(lookup.Body)
-	for _, forbidden := range []string{"key_hash", "caller_scope", "account_binding", "selected_auth_id", "native-lookup"} {
+	for _, forbidden := range []string{"key_hash", "caller_scope", "account_binding", "selected_auth_id", "native-lookup", "auth_quotas"} {
 		if strings.Contains(body, forbidden) {
 			t.Fatalf("native lookup leaked %q: %s", forbidden, body)
 		}
@@ -161,7 +167,7 @@ func TestLookupPageResourceIsRegisteredAndServed(t *testing.T) {
 	for _, route := range app.managementRegistration().Resources {
 		registered[route.Path] = true
 	}
-	if !registered["/lookup"] || !registered["/lookup/data"] {
+	if !registered["/lookup"] || !registered["/lookup/data"] || !registered["/lookup/quota-refresh"] {
 		t.Fatalf("lookup resources missing: %+v", registered)
 	}
 	rawRequest, _ := json.Marshal(ManagementRequest{Method: http.MethodGet, Path: "/v0/resource/plugins/cpa-key-policy/lookup"})

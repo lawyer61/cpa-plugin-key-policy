@@ -47,7 +47,7 @@ const (
 const (
 	PluginID   = "cpa-key-policy"
 	PluginName = "cpa-key-policy"
-	Version    = "0.7.8"
+	Version    = "0.8.0"
 )
 
 type Envelope struct {
@@ -308,11 +308,12 @@ type ResourceRoute struct {
 }
 
 type ManagementRequest struct {
-	Method  string      `json:"Method"`
-	Path    string      `json:"Path"`
-	Headers http.Header `json:"Headers"`
-	Query   url.Values  `json:"Query"`
-	Body    []byte      `json:"Body"`
+	Method         string      `json:"Method"`
+	Path           string      `json:"Path"`
+	Headers        http.Header `json:"Headers"`
+	Query          url.Values  `json:"Query"`
+	Body           []byte      `json:"Body"`
+	HostCallbackID string      `json:"host_callback_id,omitempty"`
 }
 
 type ManagementResponse struct {

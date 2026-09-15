@@ -21,7 +21,7 @@
 4. **凭证分档 / 归类** — 请求可以钉死在 Codex free/team 等内置档，或你自定义的归类组，**不会串到别的凭证文件**。  
 5. **多目标别名** — 一个别名挂多个后端（优先 或 轮询）。  
 6. **会话亲和** — 同一会话优先复用同一 auth；满载时只在允许账号池内切换。
-7. **网页管理与自助查询** — 插件派生 Key 只能查看自己；显式导入的 CPA 原生 Key 可以查看全部插件派生 Key。
+7. **网页管理与自助查询** — 插件派生 Key 可查看自己的用量及获授权 Codex 账号的匿名额度；显式导入的 CPA 原生 Key 只能聚合查看全部派生 Key 的用量。
 
 ---
 
@@ -37,6 +37,7 @@
 - 可选的 session affinity
 - 每日 / 每周美元上限（可选）
 - 是否允许主端口访问 `/v1/models`（见下文）
+- 是否允许在公开 Lookup 页对单个获授权 Codex 账号执行受限 quota GET
 
 ### 别名（全局映射表）
 
@@ -106,6 +107,8 @@ CPA 原生 key 默认完全不受影响；只有显式以 `native: true` 导入�
 - 激活分别记录 HTTP 状态和 JSON/SSE 生成结果。HTTP 200 中的 `response.failed` 会显示脱敏错误码，不再被 `http_200` 掩盖；已有生成完成、输出或正 token 证据的请求不会自动重复。
 - 每个激活序列**总共最多尝试 5 次，包含首次**。未知 200 若没有完成/输出/token 证据，需要至少相隔一个检查周期的两次新鲜额度 GET，均证明零用量且 reset 随观察时间按完整窗口滑动，才恢复下一次尝试。每次恢复重新取证；重启、刷新或 reset 变化不清零次数。达到 `attempts_exhausted` 后继续查额度，不再发送激活请求。上限为固定值，`/quota-status` 的 `quota_activation_max_attempts` 可查看，不是可编辑设置。
 - 待验证激活的 `next_check_at` 与 auth 的真实维护截止时间同步。升级无需删除主状态或 runtime；旧未知 200 的首次观察只建立恢复证据，不会立即重发。
+- 已绑定派生 Key 的 Lookup 只显示“当前宿主名单 ∩ 非空 `account_binding.allow` ∩ 可静态证明 provider/group 路由”中的 Codex 账号。账号使用每 Key 隔离的匿名编号，不返回邮箱、auth ID/index、文件名、account ID、代理、token 或原始错误；其他提供商明确标为暂不支持。
+- `allow_quota_refresh` 默认关闭。管理员逐 Key 开启后，持有人可按账号执行一次显式 quota GET；手动查询全局串行，并有每 Key/每 auth 60 秒冷却，遵守更长的 `Retry-After`。失败保留旧快照，且绝不触发激活或用户计费。
 
 **运行边界：** 这是纯插件控制。账号绑定流量必须保持插件启用且健康，也不能使用 CPA Home 模式，因为 Home 会在普通插件 scheduler 之前完成选择。若插件被卸载或熔断，仍留在 CPA `api-keys` 中的原生 key 会重新只受宿主全局账号池控制。若要求插件被移除时也尽量失败关闭，请使用插件签发的 key，并且绝不要把它重复放进 CPA `api-keys`。
 
@@ -210,7 +213,7 @@ Key 持有人无需管理密钥，可访问：
 http://<你的-cpa-主机>:<api端口>/v0/resource/plugins/cpa-key-policy/lookup
 ```
 
-自助页只使用 `Authorization: Bearer <key>`。插件派生 Key 仍只显示自己的 UTC 自然日/现有 7 日窗口用量、调用/Token 汇总和当前并发；显式导入 key-policy 且已启用的 CPA 原生 Key 作为特权查询凭证，会列出全部插件派生 Key 的相同用量信息。纯插件无法识别未导入的宿主 `api-keys`。接口不接受 URL 中的 key 或 `key_id`，也不会返回账号绑定、auth 文件、hash、caller scope 或任何明文 Key。
+自助页只使用 `Authorization: Bearer <key>`。插件派生 Key 显示自己的 UTC 自然日/现有 7 日窗口用量、调用/Token 汇总和当前并发；若已配置明确账号绑定，还会显示权限交集内的匿名 Codex 额度缓存。页面普通“刷新”仍只读缓存；管理员需另外开启 `allow_quota_refresh`，持有人才能逐账号刷新额度。显式导入并启用的 CPA 原生 Key 可以聚合查看全部插件派生 Key 的用量，但不会得到上游账号额度或刷新权限。纯插件无法识别未导入的宿主 `api-keys`；接口不接受 URL 中的 key、`key_id` 或 auth ID。
 
 | 区域 | 用途 |
 |------|------|
@@ -257,6 +260,7 @@ curl -X POST "$CPA/v0/management/plugins/cpa-key-policy/keys" \
     "rpm": 60,
     "max_concurrent_requests": 4,
     "session_affinity": true,
+    "allow_quota_refresh": false,
     "account_binding": {
       "allow": ["codex-team-*.json"],
       "strategy": "weighted-round-robin"

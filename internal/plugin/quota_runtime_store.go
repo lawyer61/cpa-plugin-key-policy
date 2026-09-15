@@ -47,6 +47,11 @@ type quotaAuthRuntime struct {
 	AuthIndex             string                                  `json:"auth_index,omitempty"`
 	CredentialFingerprint string                                  `json:"credential_fingerprint,omitempty"`
 	Provider              string                                  `json:"provider,omitempty"`
+	PlanType              string                                  `json:"plan_type,omitempty"`
+	Groups                []string                                `json:"groups,omitempty"`
+	RosterConfirmed       bool                                    `json:"roster_confirmed,omitempty"`
+	QueryEligible         bool                                    `json:"query_eligible,omitempty"`
+	QuotaBackoffUntil     time.Time                               `json:"quota_backoff_until,omitempty"`
 	Status                string                                  `json:"status,omitempty"`
 	InManagedPool         bool                                    `json:"in_managed_pool,omitempty"`
 	InMaintenanceScope    bool                                    `json:"in_maintenance_scope,omitempty"`
@@ -65,6 +70,7 @@ type quotaAuthRuntime struct {
 type quotaRuntimeDocument struct {
 	Version        int                         `json:"version"`
 	UpdatedAt      time.Time                   `json:"updated_at"`
+	AuthRefSecret  string                      `json:"auth_ref_secret,omitempty"`
 	LastRosterSync time.Time                   `json:"last_roster_sync,omitempty"`
 	LastRoundAt    time.Time                   `json:"last_round_at,omitempty"`
 	RoundCursor    string                      `json:"round_cursor,omitempty"`

@@ -27,13 +27,14 @@ type lookupAliasUsage struct {
 }
 
 type lookupResponse struct {
-	KeyID       string              `json:"key_id,omitempty"`
-	Name        string              `json:"name"`
-	Enabled     bool                `json:"enabled"`
-	Limits      lookupLimits        `json:"limits"`
-	Usage       policy.UsageSummary `json:"usage"`
-	Concurrency lookupConcurrency   `json:"concurrency"`
-	Aliases     []lookupAliasUsage  `json:"aliases"`
+	KeyID       string                  `json:"key_id,omitempty"`
+	Name        string                  `json:"name"`
+	Enabled     bool                    `json:"enabled"`
+	Limits      lookupLimits            `json:"limits"`
+	Usage       policy.UsageSummary     `json:"usage"`
+	Concurrency lookupConcurrency       `json:"concurrency"`
+	Aliases     []lookupAliasUsage      `json:"aliases"`
+	AuthQuotas  *lookupAuthQuotaSection `json:"auth_quotas,omitempty"`
 }
 
 type lookupAllDerivedResponse struct {
@@ -41,7 +42,7 @@ type lookupAllDerivedResponse struct {
 	Keys  []lookupResponse `json:"keys"`
 }
 
-func (a *App) lookupData(headers http.Header) ManagementResponse {
+func (a *App) lookupData(headers http.Header, hostCallbackID string) ManagementResponse {
 	token, ok := strictBearerToken(headers)
 	if !ok {
 		return lookupUnauthorized()
@@ -69,6 +70,10 @@ func (a *App) lookupData(headers http.Header) ManagementResponse {
 	payload, found := a.lookupResponseForKey(*key)
 	if !found {
 		return lookupUnauthorized()
+	}
+	if key.AccountBinding != nil && len(key.AccountBinding.Allow) > 0 {
+		quotaView := a.quota.lookupQuotaView(*key, strings.TrimSpace(hostCallbackID) != "")
+		payload.AuthQuotas = &quotaView.section
 	}
 	response := jsonResponse(http.StatusOK, payload)
 	setLookupHeaders(&response)
@@ -139,7 +144,7 @@ func setLookupHeaders(response *ManagementResponse) {
 	if response.Headers == nil {
 		response.Headers = make(http.Header)
 	}
-	response.Headers.Set("Cache-Control", "no-store")
+	response.Headers.Set("Cache-Control", "private, no-store")
 	response.Headers.Set("Pragma", "no-cache")
 	response.Headers.Set("X-Content-Type-Options", "nosniff")
 }

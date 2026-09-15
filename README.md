@@ -21,7 +21,7 @@ In plain words: you issue your own `cpa_…` keys to clients. Each key only sees
 4. **Isolate credentials (tiers / groups)** — pin a request to Codex free/team/… or to a **custom classify group** so it never lands on the wrong auth file.
 5. **Multi-target aliases** — one alias can point at several backends (priority or round-robin).
 6. **Session affinity** — prefer a previous auth, but fail over only inside the allowed account pool.
-7. **Web UI + self-service lookup** — plugin keys inspect only their own usage; an explicitly imported CPA-native key can inspect every plugin-derived key.
+7. **Web UI + self-service lookup** — plugin keys inspect their own usage and anonymously inspect authorized Codex account quota; an explicitly imported CPA-native key can inspect every plugin-derived key's usage only.
 
 ---
 
@@ -37,6 +37,7 @@ A plugin-owned secret (`cpa_…`). Authenticated only by this plugin. Holds:
 - optional session affinity
 - optional daily / weekly dollar limits
 - optional `allow_models_endpoint` (see below)
+- optional `allow_quota_refresh` for a rate-limited, single-account quota GET from the public lookup page
 
 ### Alias (global mapping table)
 
@@ -108,6 +109,8 @@ CPA-native keys are untouched unless explicitly imported as `native: true`. Impo
 - Activation distinguishes HTTP status from the JSON/SSE generation result. A 200 containing `response.failed` displays its safe error code rather than hiding behind `http_200`; completed or partially generated requests are not automatically replayed.
 - Each activation sequence allows **5 total attempts, including the initial request**. An unknown HTTP 200 without completion/output/token evidence needs two new quota GETs, at least one check interval apart, showing zero usage and a reset that keeps moving by a full window before a recovery attempt. Every recovery needs fresh evidence; restarts or moving reset timestamps do not clear the budget. After `attempts_exhausted`, quota checks continue without further activation POSTs. The cap is fixed and reported by `/quota-status` as `quota_activation_max_attempts`, not an editable setting.
 - Pending activation `next_check_at` follows the actual auth maintenance deadline. Upgrade without deleting either state file; the first observation of an old ambiguous 200 only establishes recovery evidence and does not immediately resend it.
+- A bound derived key's Lookup page shows only Codex accounts in the intersection of the current host roster, its non-empty `account_binding.allow`, and statically provable provider/group routes. Accounts use per-key opaque labels; email, auth ID/index, filename, account ID, proxy, token, and raw errors are never returned. Other providers are reported as unsupported.
+- `allow_quota_refresh` defaults to `false`. When enabled, each account card may issue one explicit quota GET. Manual queries are serialized, enforce per-key and per-auth 60-second cooldowns, honor longer upstream `Retry-After`, retain old evidence on failure, and never trigger activation or user billing.
 
 **Operational boundary:** this is a plugin-only control. Keep the plugin enabled and healthy, and do not use CPA Home mode for account-bound traffic because Home selects before the ordinary plugin scheduler. If the plugin is unloaded/fused, a key that still exists in CPA `api-keys` is again governed only by CPA's global pool. For the strongest fail-closed behavior under plugin removal, use plugin-issued keys and never duplicate them in CPA `api-keys`.
 
@@ -212,7 +215,7 @@ Key holders can open the read-only self-service page without a management secret
 http://<your-cpa-host>:<api-port>/v0/resource/plugins/cpa-key-policy/lookup
 ```
 
-It submits the current secret only as `Authorization: Bearer <key>` and shows plugin-priced UTC-day/current 7-day-window usage, call/token summaries, and current key concurrency. A plugin-derived key sees only itself. An enabled CPA-native key explicitly imported into key-policy acts as a privileged lookup credential and sees every plugin-derived key; unimported host keys remain unknown to this pure plugin. URL keys and arbitrary `key_id` lookups are rejected, and no bindings, auth IDs, hashes, caller scopes, or plaintext keys are returned.
+It submits the current secret only as `Authorization: Bearer <key>` and shows plugin-priced UTC-day/current 7-day-window usage, call/token summaries, and current key concurrency. A bound plugin-derived key also sees anonymous cached Codex quota for the roster/binding/static-route intersection. Ordinary page refresh remains cache-only; an administrator must separately enable `allow_quota_refresh` before the holder can refresh one account's quota. An enabled CPA-native key explicitly imported into key-policy sees every plugin-derived key's usage but never receives upstream account quota or refresh rights. Unimported host keys remain unknown. URL keys, auth IDs, and arbitrary `key_id` lookups are rejected.
 
 UI areas:
 
@@ -269,6 +272,7 @@ curl -X POST "$CPA/v0/management/plugins/cpa-key-policy/keys" \
     "rpm": 60,
     "max_concurrent_requests": 4,
     "session_affinity": true,
+    "allow_quota_refresh": false,
     "account_binding": {
       "allow": ["codex-team-*.json"],
       "strategy": "weighted-round-robin"

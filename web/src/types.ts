@@ -73,6 +73,9 @@ export interface KeyPublic {
   session_affinity: boolean;
   // Per-key override for GET /v1/models (see KeyFormValues).
   allow_models_endpoint?: boolean;
+  // Allow this derived key to request a single authorized Codex quota refresh
+  // from the public lookup page. Disabled by default.
+  allow_quota_refresh?: boolean;
   usage: UsageSummary;
   created_at?: string;
   updated_at?: string;
@@ -94,6 +97,7 @@ export interface KeyWriteRequest {
   max_concurrent_requests?: number;
   session_affinity?: boolean;
   allow_models_endpoint?: boolean;
+  allow_quota_refresh?: boolean;
 }
 
 export interface CreateKeyResponse {
@@ -281,6 +285,7 @@ export interface LookupKeyUsage {
   usage: UsageSummary;
   concurrency: LookupConcurrency;
   aliases: LookupAliasSummary[];
+  auth_quotas?: LookupAuthQuotas;
 }
 
 export interface LookupAllDerivedResponse {
@@ -289,6 +294,66 @@ export interface LookupAllDerivedResponse {
 }
 
 export type LookupResponse = LookupKeyUsage | LookupAllDerivedResponse;
+
+export type LookupAuthQuotaStatus =
+  | "active"
+  | "disabled"
+  | "unavailable"
+  | "expired"
+  | "unqueryable"
+  | "unknown";
+
+export type LookupAuthQuotaAvailability = "ready" | "exhausted" | "unknown";
+
+export type LookupAuthQuotaFreshness = "fresh" | "stale" | "unknown";
+
+export type LookupAuthQuotaRefreshStatus =
+  | "ready"
+  | "permission_disabled"
+  | "cooldown"
+  | "busy"
+  | "unavailable"
+  | "transport_unavailable";
+
+export interface LookupAuthQuotaWindow {
+  kind: string;
+  used_percent?: number;
+  remaining_percent?: number;
+  reset_at?: string;
+  exhausted?: boolean;
+}
+
+export interface LookupAuthQuotaAccount {
+  // ref is an opaque server-issued reference used only for the explicit
+  // refresh request. It must never be rendered as an auth ID or filename.
+  ref: string;
+  label: string;
+  provider: "codex";
+  tier: "pro" | "team" | "plus" | "free" | "unknown";
+  status: LookupAuthQuotaStatus;
+  availability: LookupAuthQuotaAvailability;
+  freshness: LookupAuthQuotaFreshness;
+  observed_at?: string;
+  short?: LookupAuthQuotaWindow;
+  long?: LookupAuthQuotaWindow;
+  can_refresh: boolean;
+  refresh_after?: string;
+  refresh_status: LookupAuthQuotaRefreshStatus;
+}
+
+export type LookupAuthQuotasStatus =
+  | "ready"
+  | "binding_required"
+  | "route_unproven"
+  | "roster_unavailable"
+  | "no_matches";
+
+export interface LookupAuthQuotas {
+  status: LookupAuthQuotasStatus;
+  manual_refresh_allowed: boolean;
+  unsupported_providers: string[];
+  accounts: LookupAuthQuotaAccount[];
+}
 
 // --- Advanced Mapping types ---
 

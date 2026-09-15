@@ -86,8 +86,13 @@ type KeyConfig struct {
 	// rewrite the body). So the only per-key control we can enforce at the
 	// plugin layer is the binary choice: 401 (hide the list entirely) or
 	// allow (client sees the full global list). Default false = 401.
-	AllowModelsEndpoint bool    `yaml:"allow_models_endpoint,omitempty" json:"allow_models_endpoint,omitempty"`
-	DailyLimitUSD       float64 `yaml:"daily_limit_usd,omitempty" json:"daily_limit_usd,omitempty"`
+	AllowModelsEndpoint bool `yaml:"allow_models_endpoint,omitempty" json:"allow_models_endpoint,omitempty"`
+	// AllowQuotaRefresh lets this derived key issue one explicitly requested,
+	// rate-limited Codex quota GET for an account it is already authorized to
+	// inspect. It never grants account visibility by itself and is invalid for
+	// imported CPA-native keys.
+	AllowQuotaRefresh bool    `yaml:"allow_quota_refresh,omitempty" json:"allow_quota_refresh,omitempty"`
+	DailyLimitUSD     float64 `yaml:"daily_limit_usd,omitempty" json:"daily_limit_usd,omitempty"`
 	// WeeklyLimitUSD caps the dollar usage over a rolling 7-day window. 0 = unlimited.
 	WeeklyLimitUSD float64   `yaml:"weekly_limit_usd,omitempty" json:"weekly_limit_usd,omitempty"`
 	CreatedAt      time.Time `yaml:"created_at,omitempty" json:"created_at,omitempty"`
@@ -663,6 +668,9 @@ func normalizeConfig(cfg *Config) error {
 			}
 			if len(key.Models) > 0 || len(key.Aliases) > 0 {
 				return fmt.Errorf("native key %q cannot configure models or aliases", key.ID)
+			}
+			if key.AllowQuotaRefresh {
+				return fmt.Errorf("native key %q cannot allow quota refresh", key.ID)
 			}
 		}
 		if key.CallerScope != "" {

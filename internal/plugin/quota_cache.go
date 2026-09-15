@@ -124,6 +124,9 @@ func (c *quotaCache) observe(authID, authIndex, source string, next quotaObserva
 		if next.CredentialFingerprint != "" {
 			current.CredentialFingerprint = next.CredentialFingerprint
 		}
+		if next.PlanType != "" {
+			current.PlanType = next.PlanType
+		}
 		c.byAuth[authID] = cloneQuotaObservation(current)
 		return false
 	}
@@ -296,22 +299,26 @@ func (c *quotaCache) classify(authID string, ttl time.Duration, now time.Time) (
 	if !ok {
 		return quotaAvailabilityUnknown, quotaObservation{}
 	}
+	return classifyQuotaObservation(observation, ttl, now), observation
+}
+
+func classifyQuotaObservation(observation quotaObservation, ttl time.Duration, now time.Time) quotaAvailability {
 	if observation.ExplicitExhausted || windowExhausted(observation.Short) || windowExhausted(observation.Long) {
-		return quotaAvailabilityExhausted, observation
+		return quotaAvailabilityExhausted
 	}
 	if !validQuotaWindow(observation.Long, true) || observation.ObservedAt.IsZero() {
-		return quotaAvailabilityUnknown, observation
+		return quotaAvailabilityUnknown
 	}
 	if ttl <= 0 || observation.ObservedAt.After(now.Add(time.Minute)) || now.Sub(observation.ObservedAt) > ttl {
-		return quotaAvailabilityUnknown, observation
+		return quotaAvailabilityUnknown
 	}
 	if !now.Before(observation.Long.ResetAt) {
-		return quotaAvailabilityUnknown, observation
+		return quotaAvailabilityUnknown
 	}
 	if observation.Short != nil && (!validQuotaWindow(observation.Short, false) || !now.Before(observation.Short.ResetAt)) {
-		return quotaAvailabilityUnknown, observation
+		return quotaAvailabilityUnknown
 	}
-	return quotaAvailabilityReady, observation
+	return quotaAvailabilityReady
 }
 
 func validQuotaWindow(window *quotaWindow, requireUsage bool) bool {

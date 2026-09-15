@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import axios from "axios";
-import { fetchLookupData, LOOKUP_DATA_PATH } from "./lookup";
+import { fetchLookupData, fetchLookupQuota, LOOKUP_DATA_PATH, LOOKUP_QUOTA_REFRESH_PATH } from "./lookup";
 
 vi.mock("axios", () => ({
   default: { get: vi.fn() },
@@ -29,6 +29,22 @@ describe("public key lookup API", () => {
     expect(get).toHaveBeenCalledWith(LOOKUP_DATA_PATH, {
       headers: {
         Authorization: "Bearer secret-123",
+        "Content-Type": "application/json",
+      },
+    });
+  });
+
+  it("uses the explicit GET-only quota refresh contract", async () => {
+    const payload = { auth_quotas: { status: "ready", manual_refresh_allowed: true, unsupported_providers: [], accounts: [] } };
+    get.mockResolvedValue({ data: payload });
+
+    await expect(fetchLookupQuota("  secret-123  ", "  opaque-ref  ")).resolves.toEqual(payload);
+    expect(get).toHaveBeenCalledWith(LOOKUP_QUOTA_REFRESH_PATH, {
+      timeout: 30_000,
+      headers: {
+        Authorization: "Bearer secret-123",
+        "X-Key-Policy-Quota-Refresh": "1",
+        "X-Key-Policy-Auth-Ref": "opaque-ref",
         "Content-Type": "application/json",
       },
     });

@@ -21,6 +21,9 @@ export interface KeyFormValues {
   // downstream key, so the only plugin-enforceable choice is binary: 401 (hide
   // the list) or allow (client sees the full global list). Default false.
   allow_models_endpoint?: boolean;
+  // Per-key permission for an explicit, single-account Codex quota refresh
+  // from the public lookup page. Default false.
+  allow_quota_refresh?: boolean;
   account_binding?: AccountBinding;
   clear_account_binding?: boolean;
 }
@@ -108,6 +111,7 @@ export default function KeyForm({
   const [maxConcurrent, setMaxConcurrent] = useState(initial?.max_concurrent_requests ?? 0);
   const [sessionAffinity, setSessionAffinity] = useState(initial?.session_affinity ?? false);
   const [allowModels, setAllowModels] = useState<boolean>(initial?.allow_models_endpoint ?? false);
+  const [allowQuotaRefresh, setAllowQuotaRefresh] = useState<boolean>(initial?.allow_quota_refresh ?? false);
   const [bindingEnabled, setBindingEnabled] = useState<boolean>(initial?.account_binding !== undefined);
   const [bindingAllow, setBindingAllow] = useState((initial?.account_binding?.allow ?? []).join("\n"));
   const [bindingStrategy, setBindingStrategy] = useState<AccountBinding["strategy"]>(initial?.account_binding?.strategy ?? "weighted-round-robin");
@@ -306,6 +310,7 @@ export default function KeyForm({
       current_concurrent_requests: initial?.current_concurrent_requests ?? 0,
       session_affinity: sessionAffinity,
       allow_models_endpoint: allowModels,
+      allow_quota_refresh: !isNative && allowQuotaRefresh,
       account_binding: currentAccountBinding(),
       clear_account_binding: shouldClearAccountBinding(),
       usage: initial?.usage ?? {
@@ -340,6 +345,7 @@ export default function KeyForm({
         max_concurrent_requests: Math.max(0, Math.floor(maxConcurrent) || 0),
         session_affinity: sessionAffinity,
         allow_models_endpoint: allowModels,
+        allow_quota_refresh: !isNative && allowQuotaRefresh,
 		account_binding: accountBinding,
 		clear_account_binding: !isNative && shouldClearAccountBinding(),
       });
@@ -668,7 +674,13 @@ export default function KeyForm({
               <span className="track"><span className="thumb" /></span>
               <span>{t("keyForm.allowModelsLabel")}</span>
             </label>
-            <p className="muted kf-hint">{t("keyForm.allowModelsHint")}</p></>}
+            <p className="muted kf-hint">{t("keyForm.allowModelsHint")}</p>
+            <label className="switch kf-access-switch" title={t("keyForm.allowQuotaRefreshTitle")}>
+              <input type="checkbox" checked={allowQuotaRefresh} onChange={(e) => setAllowQuotaRefresh(e.target.checked)} />
+              <span className="track"><span className="thumb" /></span>
+              <span>{t("keyForm.allowQuotaRefreshLabel")}</span>
+            </label>
+            <p className="muted kf-hint">{t("keyForm.allowQuotaRefreshHint")}</p></>}
             <label className="switch kf-access-switch" title={t("keyForm.accountBindingTitle")}>
               <input type="checkbox" checked={bindingEnabled} disabled={isNative} onChange={(e) => setBindingEnabled(e.target.checked)} />
               <span className="track"><span className="thumb" /></span>
@@ -876,6 +888,21 @@ export default function KeyForm({
         </label>
         <span className="muted" style={{ fontSize: "0.85em", marginLeft: 8 }}>
           {t("keyForm.allowModelsHint")}
+        </span>
+      </div>}
+
+      {!isNative && <div className="form-row">
+        <label className="switch" title={t("keyForm.allowQuotaRefreshTitle")}>
+          <input
+            type="checkbox"
+            checked={allowQuotaRefresh}
+            onChange={(e) => setAllowQuotaRefresh(e.target.checked)}
+          />
+          <span className="track"><span className="thumb" /></span>
+          <span>{t("keyForm.allowQuotaRefreshLabel")}</span>
+        </label>
+        <span className="muted" style={{ fontSize: "0.85em", marginLeft: 8 }}>
+          {t("keyForm.allowQuotaRefreshHint")}
         </span>
       </div>}
 

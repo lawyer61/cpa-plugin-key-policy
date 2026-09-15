@@ -39,6 +39,9 @@ plugins:
           rpm: 60
           max_concurrent_requests: 4 # 0 = unlimited
           session_affinity: true
+          # Allows this derived key to refresh one authorized Codex quota card.
+          # Cached quota remains visible when false. Native imported keys cannot enable it.
+          allow_quota_refresh: false
           # Optional fail-closed account isolation. Globs match the exact CPA
           # auth candidate ID. A present empty allow list denies every account.
           account_binding:
