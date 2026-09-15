@@ -144,6 +144,10 @@ func (m *quotaManager) loadRuntime(path string) {
 		blocked = true
 		errorText = err.Error()
 	}
+	// A roster timestamp is only trustworthy inside the process that performed
+	// the host callbacks. Keep the private account state, but require this
+	// process to complete a fresh roster sync before public lookup can expose it.
+	doc.LastRosterSync = time.Time{}
 	generatedSecret, secretErr := ensureQuotaAuthRefSecret(&doc)
 	if secretErr != nil && errorText == "" {
 		errorText = "generate auth reference secret: " + secretErr.Error()

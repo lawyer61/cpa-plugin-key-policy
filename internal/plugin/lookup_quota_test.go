@@ -282,6 +282,41 @@ func TestLookupQuotaHidesStaleRosterAndPersistsAnonymousSecret(t *testing.T) {
 	}
 }
 
+func TestQuotaRuntimeLoadRequiresCurrentProcessRosterSync(t *testing.T) {
+	clock := time.Date(2030, 9, 15, 10, 35, 0, 0, time.UTC)
+	path := t.TempDir() + "/quota-runtime.json"
+	doc := quotaRuntimeDocument{
+		Version:        quotaRuntimeVersion,
+		LastRosterSync: clock,
+		Observations:   make(map[string]quotaObservation),
+		Auths: map[string]quotaAuthRuntime{
+			"account-a-team": {
+				AuthID:                "account-a-team",
+				AuthIndex:             "idx-a",
+				Provider:              "codex",
+				CredentialFingerprint: "fingerprint-a",
+				RosterConfirmed:       true,
+				LastRosterSeenAt:      clock,
+			},
+		},
+	}
+	if _, err := ensureQuotaAuthRefSecret(&doc); err != nil {
+		t.Fatal(err)
+	}
+	if err := newQuotaRuntimeStore(path).save(doc); err != nil {
+		t.Fatal(err)
+	}
+	manager := newQuotaManager(nil, nil, func() time.Time { return clock })
+	manager.loadRuntime(path)
+	manager.mu.Lock()
+	loadedSync := manager.runtime.LastRosterSync
+	_, retained := manager.runtime.Auths["account-a-team"]
+	manager.mu.Unlock()
+	if !loadedSync.IsZero() || !retained {
+		t.Fatalf("loaded roster trusted=%s retained=%v", loadedSync, retained)
+	}
+}
+
 type failingListQuotaHost struct {
 	HostClient
 }
