@@ -179,7 +179,6 @@ func (m *quotaManager) loop() {
 	}
 	m.syncRosterOnly()
 	m.alignMaintenanceDeadlines(nextRoundAt)
-	_ = m.persist()
 	for {
 		var timer *time.Timer
 		var timerCh <-chan time.Time
@@ -209,7 +208,6 @@ func (m *quotaManager) loop() {
 			interval = nextInterval
 			needed = nextNeeded
 			m.alignMaintenanceDeadlines(nextRoundAt)
-			_ = m.persist()
 			if needed && !now.Before(nextRoundAt) {
 				m.runScheduledRound()
 				interval, _ = m.durations()

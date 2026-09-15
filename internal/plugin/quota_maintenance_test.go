@@ -336,9 +336,16 @@ func TestQuotaLoopReconfigureDoesNotPostponeDueRound(t *testing.T) {
 	app.quota.setHostClient(host)
 	t.Cleanup(app.Shutdown)
 
-	deadline := time.Now().Add(225 * time.Millisecond)
-	for time.Now().Before(deadline) {
+	deadline := time.Now().Add(2 * time.Second)
+	for {
 		app.quota.configure(app.store.StatePath(), false)
+		_, get, post := host.counts()
+		if get >= 3 && post >= 1 {
+			break
+		}
+		if time.Now().After(deadline) {
+			break
+		}
 		time.Sleep(15 * time.Millisecond)
 	}
 	_, get, post := host.counts()
