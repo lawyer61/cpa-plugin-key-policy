@@ -835,7 +835,8 @@ func (m *quotaManager) needsReview(authID string, ttl time.Duration, now time.Ti
 }
 
 func (m *quotaManager) refreshAuth(host HostClient, rosterEntry HostAuthEntry, settings policy.RuntimeSettings) {
-	releaseAuth, acquired := m.operations.acquireBackgroundAuth(rosterEntry.ID)
+	operationID := m.quotaOperationID(rosterEntry.ID)
+	releaseAuth, acquired := m.operations.acquireBackgroundAuth(operationID)
 	if !acquired {
 		return
 	}
@@ -880,11 +881,11 @@ func (m *quotaManager) refreshAuth(host HostClient, rosterEntry HostAuthEntry, s
 		return
 	}
 	fingerprint := codexCredentialFingerprint(credentials)
-	observation, _, err := m.fetchCodexQuotaBackground(host, credentials, rosterEntry.ID)
+	observation, _, err := m.fetchCodexQuotaBackground(host, credentials, operationID)
 	if err != nil {
 		var httpErr quotaHTTPError
 		if errors.As(err, &httpErr) {
-			m.setQuotaBackoff(rosterEntry.ID, httpErr.retryAt)
+			m.setQuotaBackoff(rosterEntry.ID, fingerprint, httpErr.retryAt)
 			if httpErr.retryAt.After(nextCheck) {
 				nextCheck = httpErr.retryAt
 			}
@@ -892,7 +893,7 @@ func (m *quotaManager) refreshAuth(host HostClient, rosterEntry HostAuthEntry, s
 		m.setAuthError(rosterEntry.ID, "quota_get_failed", err)
 		return
 	}
-	m.setQuotaBackoff(rosterEntry.ID, time.Time{})
+	m.setQuotaBackoff(rosterEntry.ID, fingerprint, time.Time{})
 	observation.AuthIndex = rosterEntry.AuthIndex
 	observation.CredentialFingerprint = fingerprint
 	m.cache.observe(rosterEntry.ID, rosterEntry.AuthIndex, "quota-get", observation)
@@ -951,14 +952,14 @@ func fetchCodexQuotaWithCallback(host HostClient, credentials codexCredentials, 
 	return observation, response.StatusCode, nil
 }
 
-func (m *quotaManager) fetchCodexQuotaBackground(host HostClient, credentials codexCredentials, authID string) (quotaObservation, int, error) {
+func (m *quotaManager) fetchCodexQuotaBackground(host HostClient, credentials codexCredentials, operationID string) (quotaObservation, int, error) {
 	releaseGET, acquired := m.operations.acquireBackgroundGET()
 	if !acquired {
 		return quotaObservation{}, 0, errors.New("quota manager stopped")
 	}
 	defer releaseGET()
 	observation, status, err := fetchCodexQuota(host, credentials, m.now)
-	m.operations.noteAuthAttempt(authID)
+	m.operations.noteAuthAttempt(operationID)
 	return observation, status, err
 }
 
@@ -1309,7 +1310,7 @@ func (m *quotaManager) tryActivate(host HostClient, rosterEntry HostAuthEntry, c
 	if !m.waitVerifyDelay() {
 		return
 	}
-	verified, _, verifyErr := m.fetchCodexQuotaBackground(host, credentials, rosterEntry.ID)
+	verified, _, verifyErr := m.fetchCodexQuotaBackground(host, credentials, m.quotaOperationID(rosterEntry.ID))
 	if verifyErr == nil {
 		verifyAt := verified.ObservedAt
 		if verifyAt.IsZero() {
@@ -1440,15 +1441,33 @@ func (m *quotaManager) setNextCheck(authID string, next time.Time) {
 	m.mu.Unlock()
 }
 
-func (m *quotaManager) setQuotaBackoff(authID string, until time.Time) {
+func (m *quotaManager) quotaOperationID(authID string) string {
 	m.mu.Lock()
-	runtime := m.runtime.Auths[authID]
-	runtime.QuotaBackoffUntil = until
-	if until.After(runtime.NextCheckAt) {
-		runtime.NextCheckAt = until
-		alignActivationDeadline(&runtime)
+	fingerprint := m.runtime.Auths[authID].CredentialFingerprint
+	m.mu.Unlock()
+	return quotaOperationIdentity(fingerprint, authID)
+}
+
+func (m *quotaManager) setQuotaBackoff(authID, fingerprint string, until time.Time) {
+	m.mu.Lock()
+	matched := false
+	for candidateID, runtime := range m.runtime.Auths {
+		if candidateID != authID && (fingerprint == "" || runtime.CredentialFingerprint != fingerprint) {
+			continue
+		}
+		matched = true
+		runtime.QuotaBackoffUntil = until
+		if until.After(runtime.NextCheckAt) {
+			runtime.NextCheckAt = until
+			alignActivationDeadline(&runtime)
+		}
+		m.runtime.Auths[candidateID] = runtime
 	}
-	m.runtime.Auths[authID] = runtime
+	if !matched {
+		runtime := m.runtime.Auths[authID]
+		runtime.QuotaBackoffUntil = until
+		m.runtime.Auths[authID] = runtime
+	}
 	m.mu.Unlock()
 }
 

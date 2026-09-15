@@ -160,6 +160,59 @@ func TestLookupQuotaUsesRosterBindingAndStaticRouteIntersection(t *testing.T) {
 	}
 }
 
+func TestLookupQuotaDeduplicatesOneUpstreamAccountAcrossAuthFiles(t *testing.T) {
+	clock := time.Date(2030, 9, 15, 10, 15, 0, 0, time.UTC)
+	activeID := "account-a-active-team"
+	disabledID := "account-a-disabled-team"
+	active := HostAuthEntry{ID: activeID, AuthIndex: "idx-active", Provider: "codex", Status: "active"}
+	disabled := HostAuthEntry{ID: disabledID, AuthIndex: "idx-disabled", Provider: "codex", Status: "disabled", Disabled: true}
+	host := &fakeQuotaHost{
+		entries: []HostAuthEntry{disabled, active},
+		runtime: map[string]HostAuthEntry{
+			"idx-active":   active,
+			"idx-disabled": disabled,
+		},
+		documents: map[string]HostAuthDocument{
+			"idx-active":   {AuthIndex: "idx-active", JSON: quotaCredentialJSON(clock, "team", "acct-shared", "access-active", "refresh-active")},
+			"idx-disabled": {AuthIndex: "idx-disabled", JSON: quotaCredentialJSON(clock, "team", "acct-shared", "access-disabled", "refresh-disabled")},
+		},
+	}
+	app, secret := prepareLookupQuotaApp(t, true, &clock, host)
+	payload := lookupQuotaPayloadForTest(t, lookupRequestWithCallbackForTest(t, app, secret, "callback"))
+	if len(payload.AuthQuotas.Accounts) != 1 {
+		t.Fatalf("shared upstream account rendered %d cards: %#v", len(payload.AuthQuotas.Accounts), payload.AuthQuotas.Accounts)
+	}
+	account := payload.AuthQuotas.Accounts[0]
+	if account.Status != "active" || !account.CanRefresh {
+		t.Fatalf("eligible duplicate was not preferred: %#v", account)
+	}
+	view := app.quota.lookupQuotaView(*app.store.FindByID("bound-key"), true)
+	target := view.targets[account.Ref]
+	if target.authID != activeID || target.operationID != quotaOperationIdentity(target.fingerprint, activeID) {
+		t.Fatalf("deduplicated target=%#v", target)
+	}
+	host.mu.Lock()
+	host.entries[0], host.entries[1] = host.entries[1], host.entries[0]
+	host.mu.Unlock()
+	app.quota.syncRosterOnly()
+	reordered := lookupQuotaPayloadForTest(t, lookupRequestWithCallbackForTest(t, app, secret, "callback"))
+	if len(reordered.AuthQuotas.Accounts) != 1 || reordered.AuthQuotas.Accounts[0].Ref != account.Ref {
+		t.Fatalf("roster order changed deduplicated account: %#v", reordered.AuthQuotas.Accounts)
+	}
+	app.quota.mu.Lock()
+	fingerprint := app.quota.runtime.Auths[activeID].CredentialFingerprint
+	app.quota.mu.Unlock()
+	backoff := clock.Add(20 * time.Minute)
+	app.quota.setQuotaBackoff(activeID, fingerprint, backoff)
+	app.quota.mu.Lock()
+	activeBackoff := app.quota.runtime.Auths[activeID].QuotaBackoffUntil
+	disabledBackoff := app.quota.runtime.Auths[disabledID].QuotaBackoffUntil
+	app.quota.mu.Unlock()
+	if !activeBackoff.Equal(backoff) || !disabledBackoff.Equal(backoff) {
+		t.Fatalf("shared-account backoff active=%s disabled=%s", activeBackoff, disabledBackoff)
+	}
+}
+
 func TestLookupQuotaStaticRoutesFailClosedOnAmbiguousTarget(t *testing.T) {
 	key := policy.KeyConfig{
 		Enabled: true,
@@ -437,13 +490,14 @@ func TestLookupManualQuotaTimeoutKeepsOperationSlotUntilHostReturns(t *testing.T
 	app.quota.manualTimeout = 15 * time.Millisecond
 	payload := lookupQuotaPayloadForTest(t, lookupRequestWithCallbackForTest(t, app, secret, "lookup"))
 	ref := payload.AuthQuotas.Accounts[0].Ref
+	operationID := app.quota.lookupQuotaView(*app.store.FindByID("bound-key"), true).targets[ref].operationID
 	response := quotaRefreshRequestForTest(t, app, secret, ref, "slow")
 	if response.StatusCode != http.StatusGatewayTimeout {
 		t.Fatalf("timeout response=%d %s", response.StatusCode, response.Body)
 	}
 	<-host.started
 	app.quota.operations.mu.Lock()
-	active := app.quota.operations.activeAuth["account-a-team"]
+	active := app.quota.operations.activeAuth[operationID]
 	getActive := app.quota.operations.getActive
 	app.quota.operations.mu.Unlock()
 	if active != "manual" || !getActive {
@@ -453,7 +507,7 @@ func TestLookupManualQuotaTimeoutKeepsOperationSlotUntilHostReturns(t *testing.T
 	deadline := time.Now().Add(time.Second)
 	for time.Now().Before(deadline) {
 		app.quota.operations.mu.Lock()
-		active = app.quota.operations.activeAuth["account-a-team"]
+		active = app.quota.operations.activeAuth[operationID]
 		getActive = app.quota.operations.getActive
 		app.quota.operations.mu.Unlock()
 		if active == "" && !getActive {

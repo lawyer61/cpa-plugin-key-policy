@@ -51,6 +51,7 @@ type lookupQuotaTarget struct {
 	authID        string
 	authIndex     string
 	fingerprint   string
+	operationID   string
 	backoff       time.Time
 	queryEligible bool
 	ref           string
@@ -122,10 +123,16 @@ func quotaAuthRef(secret []byte, key policy.KeyConfig, runtime quotaAuthRuntime)
 	_, _ = mac.Write([]byte{0})
 	_, _ = mac.Write([]byte(key.KeyHash))
 	_, _ = mac.Write([]byte{0})
-	_, _ = mac.Write([]byte(runtime.AuthID))
-	_, _ = mac.Write([]byte{0})
 	_, _ = mac.Write([]byte(runtime.CredentialFingerprint))
 	return base64.RawURLEncoding.EncodeToString(mac.Sum(nil))
+}
+
+func quotaOperationIdentity(fingerprint, authID string) string {
+	fingerprint = strings.TrimSpace(fingerprint)
+	if fingerprint != "" {
+		return "account:" + fingerprint
+	}
+	return "auth:" + strings.TrimSpace(authID)
 }
 
 func lookupQuotaRoutesForKey(key policy.KeyConfig) lookupQuotaRoutes {
@@ -241,6 +248,12 @@ func (m *quotaManager) lookupQuotaView(key policy.KeyConfig, transportAvailable 
 		view.section.Status = "roster_unavailable"
 		return view
 	}
+	type candidate struct {
+		authID      string
+		runtime     quotaAuthRuntime
+		observation quotaObservation
+	}
+	byAccount := make(map[string][]candidate)
 	for authID, runtime := range runtimes {
 		if !runtime.RosterConfirmed || runtime.Provider != "codex" || runtime.CredentialFingerprint == "" || !runtime.LastRosterSeenAt.Equal(lastRosterSync) {
 			continue
@@ -248,16 +261,41 @@ func (m *quotaManager) lookupQuotaView(key policy.KeyConfig, transportAvailable 
 		if !quotaKeyAllowsAuth(key, authID, runtime.Groups) {
 			continue
 		}
-		ref := quotaAuthRef(secret, key, runtime)
 		observation, _ := m.cache.get(authID)
 		if observation.CredentialFingerprint != "" && observation.CredentialFingerprint != runtime.CredentialFingerprint {
 			observation = quotaObservation{}
 		}
+		byAccount[runtime.CredentialFingerprint] = append(byAccount[runtime.CredentialFingerprint], candidate{
+			authID:      authID,
+			runtime:     runtime,
+			observation: observation,
+		})
+	}
+	for fingerprint, candidates := range byAccount {
+		selected := candidates[0]
+		observation := quotaObservation{}
+		observationAuthID := ""
+		backoff := time.Time{}
+		tiers := make([]string, 0, len(candidates)*2)
+		for _, item := range candidates {
+			if lookupQuotaCandidatePreferred(item.runtime, item.authID, selected.runtime, selected.authID) {
+				selected = item
+			}
+			if item.runtime.QuotaBackoffUntil.After(backoff) {
+				backoff = item.runtime.QuotaBackoffUntil
+			}
+			tiers = append(tiers, item.runtime.PlanType, item.observation.PlanType)
+			if quotaObservationHasPublicEvidence(item.observation) && lookupQuotaObservationPreferred(item.observation, item.authID, observation, observationAuthID) {
+				observation = item.observation
+				observationAuthID = item.authID
+			}
+		}
+		ref := quotaAuthRef(secret, key, quotaAuthRuntime{CredentialFingerprint: fingerprint})
 		account := lookupAuthQuotaAccount{
 			Ref:           ref,
 			Provider:      "codex",
-			Tier:          publicQuotaTier(runtime.PlanType, observation.PlanType),
-			Status:        publicQuotaAuthStatus(runtime),
+			Tier:          publicQuotaTier(tiers...),
+			Status:        publicQuotaAuthStatus(selected.runtime),
 			Availability:  publicQuotaAvailability(observation, ttl, now),
 			Freshness:     quotaObservationFreshness(observation, ttl, now),
 			Short:         publicLookupQuotaWindow(observation.Short),
@@ -268,21 +306,22 @@ func (m *quotaManager) lookupQuotaView(key policy.KeyConfig, transportAvailable 
 			account.ObservedAt = publicQuotaTime(observation.ObservedAt)
 		}
 		target := lookupQuotaTarget{
-			authID:        authID,
-			authIndex:     runtime.AuthIndex,
-			fingerprint:   runtime.CredentialFingerprint,
-			backoff:       runtime.QuotaBackoffUntil,
-			queryEligible: runtime.QueryEligible,
+			authID:        selected.authID,
+			authIndex:     selected.runtime.AuthIndex,
+			fingerprint:   fingerprint,
+			operationID:   quotaOperationIdentity(fingerprint, selected.authID),
+			backoff:       backoff,
+			queryEligible: selected.runtime.QueryEligible,
 			ref:           ref,
 		}
 		if key.AllowQuotaRefresh {
 			switch {
 			case !transportAvailable || persistenceBlocked:
 				account.RefreshStatus = "transport_unavailable"
-			case !runtime.QueryEligible:
+			case !selected.runtime.QueryEligible:
 				account.RefreshStatus = "unavailable"
 			default:
-				state := m.operations.manualState(key.ID, authID, runtime.QuotaBackoffUntil)
+				state := m.operations.manualState(key.ID, target.operationID, backoff)
 				account.RefreshStatus = state.Status
 				account.CanRefresh = state.Status == "ready"
 				account.RefreshAfter = publicQuotaTime(state.RetryAt)
@@ -301,6 +340,30 @@ func (m *quotaManager) lookupQuotaView(key policy.KeyConfig, transportAvailable 
 		view.section.Status = "ready"
 	}
 	return view
+}
+
+func lookupQuotaCandidatePreferred(next quotaAuthRuntime, nextID string, current quotaAuthRuntime, currentID string) bool {
+	if next.QueryEligible != current.QueryEligible {
+		return next.QueryEligible
+	}
+	if nextID != currentID {
+		return nextID < currentID
+	}
+	return next.AuthIndex < current.AuthIndex
+}
+
+func quotaObservationHasPublicEvidence(observation quotaObservation) bool {
+	return observation.Short != nil || observation.Long != nil || observation.ExplicitExhausted
+}
+
+func lookupQuotaObservationPreferred(next quotaObservation, nextAuthID string, current quotaObservation, currentAuthID string) bool {
+	if !next.ObservedAt.Equal(current.ObservedAt) {
+		return next.ObservedAt.After(current.ObservedAt)
+	}
+	if !next.ReceivedAt.Equal(current.ReceivedAt) {
+		return next.ReceivedAt.After(current.ReceivedAt)
+	}
+	return currentAuthID == "" || nextAuthID < currentAuthID
 }
 
 func publicQuotaAvailability(observation quotaObservation, ttl time.Duration, now time.Time) string {
@@ -456,7 +519,7 @@ func (a *App) lookupQuotaRefresh(headers http.Header, hostCallbackID string) Man
 	if !target.queryEligible {
 		return lookupQuotaError(http.StatusConflict, "quota_refresh_unavailable", "quota account cannot be queried", time.Time{})
 	}
-	release, gate := a.quota.operations.acquireManual(key.ID, target.authID, target.backoff)
+	release, gate := a.quota.operations.acquireManual(key.ID, target.operationID, target.backoff)
 	if !gate.Acquired {
 		if gate.Status == "cooldown" {
 			return lookupQuotaError(http.StatusTooManyRequests, "quota_refresh_cooldown", "manual quota refresh is cooling down", gate.RetryAt)
@@ -526,7 +589,7 @@ func (m *quotaManager) executeManualQuotaRefresh(token string, target lookupQuot
 	if err != nil {
 		var httpErr quotaHTTPError
 		if errors.As(err, &httpErr) {
-			m.setQuotaBackoff(target.authID, httpErr.retryAt)
+			m.setQuotaBackoff(target.authID, target.fingerprint, httpErr.retryAt)
 			_ = m.persist()
 			if statusCode == http.StatusTooManyRequests {
 				return manualQuotaRefreshResult{status: http.StatusTooManyRequests, code: "quota_query_limited", message: "upstream quota query was rate limited", retryAt: httpErr.retryAt}
@@ -549,7 +612,7 @@ func (m *quotaManager) executeManualQuotaRefresh(token string, target lookupQuot
 	observation.AuthIndex = post.entry.AuthIndex
 	observation.CredentialFingerprint = post.fingerprint
 	m.cache.observe(target.authID, post.entry.AuthIndex, "lookup-manual", observation)
-	m.setQuotaBackoff(target.authID, time.Time{})
+	m.setQuotaBackoff(target.authID, target.fingerprint, time.Time{})
 	if err := m.persist(); err != nil {
 		return manualQuotaRefreshResult{status: http.StatusServiceUnavailable, code: "quota_refresh_state_unavailable", message: "quota state could not be persisted"}
 	}
