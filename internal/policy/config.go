@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -14,6 +15,10 @@ import (
 
 	"gopkg.in/yaml.v3"
 )
+
+const CurrentUsageSchemaVersion = 2
+
+var ErrLegacyUsageSchema = errors.New("legacy usage schema requires migration")
 
 type Config struct {
 	Enabled                  bool   `yaml:"enabled" json:"enabled"`
@@ -93,7 +98,7 @@ type KeyConfig struct {
 	// imported CPA-native keys.
 	AllowQuotaRefresh bool    `yaml:"allow_quota_refresh,omitempty" json:"allow_quota_refresh,omitempty"`
 	DailyLimitUSD     float64 `yaml:"daily_limit_usd,omitempty" json:"daily_limit_usd,omitempty"`
-	// WeeklyLimitUSD caps the dollar usage over a rolling 7-day window. 0 = unlimited.
+	// WeeklyLimitUSD caps today plus the previous six UTC calendar days. 0 = unlimited.
 	WeeklyLimitUSD float64   `yaml:"weekly_limit_usd,omitempty" json:"weekly_limit_usd,omitempty"`
 	CreatedAt      time.Time `yaml:"created_at,omitempty" json:"created_at,omitempty"`
 	UpdatedAt      time.Time `yaml:"updated_at,omitempty" json:"updated_at,omitempty"`
@@ -202,47 +207,82 @@ type KeyAliasRef struct {
 	PerCallUSD               *float64 `yaml:"per_call_usd,omitempty" json:"per_call_usd,omitempty"`
 }
 
-// UsageState holds per-key dollar usage accounting persisted in the state JSON.
-// It carries rolling daily/weekly windows plus a per-alias breakdown
-// (ByAlias). The per-alias breakdown tracks BOTH a daily and a weekly window
-// (see AliasUsageWindows) so the key detail page can show per-alias today /
-// rolling-week figures.
-//
-// Legacy state files stored ByAlias as map[string]UsageWindow (a single
-// window per alias). UsageState.UnmarshalJSON auto-migrates that shape into
-// the dual-window form (old value → Daily; Weekly zeroed).
+// UsageState is the v2 per-key usage ledger. Days is keyed by an explicit UTC
+// calendar date (YYYY-MM-DD); each day owns both the key total and per-alias
+// counters. Daily and seven-day views are derived from these bounded buckets.
 type UsageState struct {
-	Daily   UsageWindow                  `json:"daily"`
-	Weekly  UsageWindow                  `json:"weekly"`
-	ByAlias map[string]AliasUsageWindows `json:"by_alias,omitempty"`
+	Days                         map[string]*UsageDay `json:"days,omitempty"`
+	WeeklyHistoryIncompleteUntil time.Time            `json:"weekly_history_incomplete_until,omitempty"`
+	LastUsageResetAt             time.Time            `json:"last_usage_reset_at,omitempty"`
+
+	// legacy* are populated only while reading a schema-less v1 state. They are
+	// never marshaled and are consumed exactly once by the Configure migration.
+	legacyDaily   UsageWindow
+	legacyWeekly  UsageWindow
+	legacyByAlias map[string]AliasUsageWindows
 }
 
-// AliasUsageWindows holds the daily and rolling-weekly usage windows for a
-// single alias under a key. Replaces the legacy single-window ByAlias map;
-// old state files are auto-migrated on load (see UsageState.UnmarshalJSON).
+// UsageDay is one UTC calendar-day bucket. UsageWindow is reused as the
+// counter bag; WindowStart is normalized to that day's UTC midnight.
+type UsageDay struct {
+	Total   UsageWindow            `json:"total"`
+	ByAlias map[string]UsageWindow `json:"by_alias,omitempty"`
+}
+
+// AliasUsageWindows is retained only to decode the two legacy by-alias
+// windows. New state never writes this shape.
 type AliasUsageWindows struct {
 	Daily  UsageWindow `json:"daily"`
 	Weekly UsageWindow `json:"weekly"`
 }
 
-// UnmarshalJSON migrates the legacy ByAlias shape (map[string]UsageWindow,
-// a single window per alias) into the current dual-window form
-// (map[string]AliasUsageWindows). Detection is per-entry: an entry carrying a
-// "daily" or "weekly" key is read as the new form; otherwise it is read as a
-// bare UsageWindow and placed into Daily (Weekly zeroed). Unknown shapes are
-// skipped rather than failing the whole load.
+// MarshalJSON keeps optional timestamps absent instead of emitting Go's zero
+// time (year 1), which would otherwise leak into the state file despite
+// omitempty on time.Time.
+func (s UsageState) MarshalJSON() ([]byte, error) {
+	var incompleteUntil *time.Time
+	if !s.WeeklyHistoryIncompleteUntil.IsZero() {
+		value := s.WeeklyHistoryIncompleteUntil
+		incompleteUntil = &value
+	}
+	var lastReset *time.Time
+	if !s.LastUsageResetAt.IsZero() {
+		value := s.LastUsageResetAt
+		lastReset = &value
+	}
+	return json.Marshal(struct {
+		Days                         map[string]*UsageDay `json:"days,omitempty"`
+		WeeklyHistoryIncompleteUntil *time.Time           `json:"weekly_history_incomplete_until,omitempty"`
+		LastUsageResetAt             *time.Time           `json:"last_usage_reset_at,omitempty"`
+	}{
+		Days:                         s.Days,
+		WeeklyHistoryIncompleteUntil: incompleteUntil,
+		LastUsageResetAt:             lastReset,
+	})
+}
+
+// UnmarshalJSON accepts both v2 day buckets and the legacy daily/weekly
+// windows. State.UsageSchemaVersion decides whether the legacy fields are
+// migrated; keeping them out of the public shape prevents accidental dual
+// accounting.
 func (s *UsageState) UnmarshalJSON(raw []byte) error {
 	var p struct {
-		Daily   UsageWindow     `json:"daily"`
-		Weekly  UsageWindow     `json:"weekly"`
-		ByAlias json.RawMessage `json:"by_alias,omitempty"`
+		Days                         map[string]*UsageDay `json:"days,omitempty"`
+		WeeklyHistoryIncompleteUntil time.Time            `json:"weekly_history_incomplete_until,omitempty"`
+		LastUsageResetAt             time.Time            `json:"last_usage_reset_at,omitempty"`
+		Daily                        UsageWindow          `json:"daily"`
+		Weekly                       UsageWindow          `json:"weekly"`
+		ByAlias                      json.RawMessage      `json:"by_alias,omitempty"`
 	}
 	if err := json.Unmarshal(raw, &p); err != nil {
 		return err
 	}
-	s.Daily = p.Daily
-	s.Weekly = p.Weekly
-	s.ByAlias = make(map[string]AliasUsageWindows)
+	s.Days = p.Days
+	s.WeeklyHistoryIncompleteUntil = p.WeeklyHistoryIncompleteUntil
+	s.LastUsageResetAt = p.LastUsageResetAt
+	s.legacyDaily = p.Daily
+	s.legacyWeekly = p.Weekly
+	s.legacyByAlias = make(map[string]AliasUsageWindows)
 	if len(p.ByAlias) == 0 || string(p.ByAlias) == "null" {
 		return nil
 	}
@@ -257,14 +297,14 @@ func (s *UsageState) UnmarshalJSON(raw []byte) error {
 		if hasJSONKey(rawEntry, "daily") || hasJSONKey(rawEntry, "weekly") {
 			var w AliasUsageWindows
 			if err := json.Unmarshal(rawEntry, &w); err == nil {
-				s.ByAlias[alias] = w
+				s.legacyByAlias[alias] = w
 			}
 			continue
 		}
 		// Legacy single-window format: migrate into Daily (weekly zeroed).
 		var w UsageWindow
 		if err := json.Unmarshal(rawEntry, &w); err == nil {
-			s.ByAlias[alias] = AliasUsageWindows{Daily: w}
+			s.legacyByAlias[alias] = AliasUsageWindows{Daily: w}
 		}
 	}
 	return nil
@@ -314,6 +354,7 @@ type UsageWindow struct {
 
 type State struct {
 	Version                       int                    `json:"version"`
+	UsageSchemaVersion            int                    `json:"usage_schema_version"`
 	Keys                          []KeyConfig            `json:"keys"`
 	Usage                         map[string]*UsageState `json:"usage,omitempty"`
 	UpdatedAt                     time.Time              `json:"updated_at"`
@@ -933,10 +974,85 @@ func LoadState(path string) (*State, error) {
 	if state.Version == 0 {
 		state.Version = 1
 	}
+	if state.Version != 1 {
+		return nil, fmt.Errorf("unsupported state version %d", state.Version)
+	}
+	if state.UsageSchemaVersion != 0 && state.UsageSchemaVersion != CurrentUsageSchemaVersion {
+		return nil, fmt.Errorf("unsupported usage schema version %d", state.UsageSchemaVersion)
+	}
 	if state.Usage == nil {
 		state.Usage = make(map[string]*UsageState)
 	}
+	if state.UsageSchemaVersion == CurrentUsageSchemaVersion {
+		if err := validateUsageStateV2(state.Usage); err != nil {
+			return nil, err
+		}
+	}
 	return &state, nil
+}
+
+// backupStateForUsageMigration creates the non-overwriting sensitive backup
+// required before replacing a schema-less legacy ledger with v2 day buckets.
+func backupStateForUsageMigration(path string, at time.Time) (string, error) {
+	suffix := at.UTC().Format("20060102T150405.000000000Z")
+	src, err := os.Open(path)
+	if err != nil {
+		return "", err
+	}
+	defer src.Close()
+	var backupPath string
+	var dst *os.File
+	for attempt := 0; ; attempt++ {
+		backupPath = path + ".pre-usage-v2." + suffix
+		if attempt > 0 {
+			backupPath += fmt.Sprintf("-%d", attempt)
+		}
+		backupPath += ".bak"
+		dst, err = os.OpenFile(backupPath, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+		if err == nil {
+			break
+		}
+		if !errors.Is(err, os.ErrExist) {
+			return "", err
+		}
+	}
+	ok := false
+	defer func() {
+		_ = dst.Close()
+		if !ok {
+			_ = os.Remove(backupPath)
+		}
+	}()
+	if _, err := io.Copy(dst, src); err != nil {
+		return "", err
+	}
+	if err := dst.Sync(); err != nil {
+		return "", err
+	}
+	if err := dst.Close(); err != nil {
+		return "", err
+	}
+	ok = true
+	return backupPath, nil
+}
+
+// saveMigratedState persists a fully populated State after the caller created
+// the migration backup. It preserves all non-usage settings from the loaded
+// document byte-for-structure (apart from the usage fields and UpdatedAt).
+// In particular, legacy per-key Models must remain until normalizeConfig has
+// converted them to aliases; dropping them here would lose routing policy.
+func saveMigratedState(path string, state *State) error {
+	if state == nil {
+		return errors.New("state is required")
+	}
+	copyState := *state
+	copyState.UsageSchemaVersion = CurrentUsageSchemaVersion
+	copyState.UpdatedAt = time.Now().UTC()
+	raw, err := json.MarshalIndent(copyState, "", "  ")
+	if err != nil {
+		return err
+	}
+	return atomicWriteStateFile(path, raw)
 }
 
 // SaveState atomically writes the key list plus usage ledger to the state file.
@@ -969,12 +1085,13 @@ func saveStateDocument(path string, keys []KeyConfig, usage map[string]*UsageSta
 		cleanKeys[i].Models = nil
 	}
 	state := State{
-		Version:       1,
-		Keys:          cleanKeys,
-		Usage:         usage,
-		UpdatedAt:     time.Now().UTC(),
-		Aliases:       aliases,
-		ClassifyRules: rules,
+		Version:            1,
+		UsageSchemaVersion: CurrentUsageSchemaVersion,
+		Keys:               cleanKeys,
+		Usage:              usage,
+		UpdatedAt:          time.Now().UTC(),
+		Aliases:            aliases,
+		ClassifyRules:      rules,
 	}
 	if settings != nil {
 		globalWeightedRoundRobin := settings.GlobalWeightedRoundRobin
@@ -1029,6 +1146,9 @@ func SaveUsageOnly(path string, usage map[string]*UsageState) error {
 	var quotaActivationScope *string
 	var quotaActivationModel *string
 	if cur, err := LoadState(path); err == nil {
+		if cur.UsageSchemaVersion == 0 {
+			return ErrLegacyUsageSchema
+		}
 		keys = cur.Keys
 		aliases = cur.Aliases
 		rules = cur.ClassifyRules
@@ -1052,6 +1172,7 @@ func SaveUsageOnly(path string, usage map[string]*UsageState) error {
 	}
 	state := State{
 		Version:                       1,
+		UsageSchemaVersion:            CurrentUsageSchemaVersion,
 		Keys:                          keys,
 		Usage:                         usage,
 		UpdatedAt:                     time.Now().UTC(),

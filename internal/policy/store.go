@@ -14,6 +14,7 @@ import (
 type Store struct {
 	mu                            sync.RWMutex
 	updateMu                      sync.Mutex
+	usageGate                     sync.RWMutex
 	persistMu                     sync.Mutex
 	enabled                       bool
 	globalWeightedRoundRobin      bool
@@ -106,9 +107,17 @@ func (s *Store) SetClock(now func() time.Time) {
 	if now == nil {
 		return
 	}
+	s.usageGate.Lock()
+	defer s.usageGate.Unlock()
 	s.mu.Lock()
 	s.limiter = NewRateLimiterWithClock(now)
-	s.usage = newUsageLedger(now)
+	if s.usage == nil {
+		s.usage = newUsageLedger(now)
+	} else {
+		s.usage.mu.Lock()
+		s.usage.now = now
+		s.usage.mu.Unlock()
+	}
 	s.mu.Unlock()
 }
 
@@ -123,17 +132,46 @@ func (s *Store) Configure(cfg Config) error {
 		return err
 	}
 
-	// Bug 2 fix: flush any in-memory changes to the *old* state path BEFORE
-	// loading the (possibly different) new state file. Without this, keys/usage
-	// changed via the management API in the last <=15s window (or any abnormal
-	// path that skipped persist) would be lost when LoadState reads a stale disk
-	// snapshot. StopUsageFlusher stops the background loop and flushes once.
-	s.StopUsageFlusher()
+	// Stop the worker before taking the exclusive usage gate; otherwise the
+	// worker could wait for a read gate while Configure waits for it to exit.
+	s.stopUsageFlusherLoop()
+	s.usageGate.Lock()
+	defer s.usageGate.Unlock()
+	// Flush under the exclusive gate so a usage record cannot land between the
+	// final old-path snapshot and the authoritative reload below.
+	if err := s.flushUsageNoGate(); err != nil {
+		return fmt.Errorf("flush usage before configure: %w", err)
+	}
+	migrationNow := time.Now()
+	s.mu.RLock()
+	if s.usage != nil {
+		s.usage.mu.Lock()
+		migrationNow = s.usage.now()
+		s.usage.mu.Unlock()
+	}
+	s.mu.RUnlock()
 
 	keys := cfg.Keys
 	var loadedUsage map[string]*UsageState
 	firstBoot := false
 	if state, errLoad := LoadState(statePath); errLoad == nil {
+		if state.UsageSchemaVersion == 0 {
+			if _, errBackup := backupStateForUsageMigration(statePath, migrationNow); errBackup != nil {
+				return fmt.Errorf("backup legacy usage state: %w", errBackup)
+			}
+			migrated, errMigrate := migrateLegacyUsage(state.Usage, migrationNow)
+			if errMigrate != nil {
+				return fmt.Errorf("migrate legacy usage: %w", errMigrate)
+			}
+			state.Usage = migrated
+			state.UsageSchemaVersion = CurrentUsageSchemaVersion
+			s.persistMu.Lock()
+			errMigrate = saveMigratedState(statePath, state)
+			s.persistMu.Unlock()
+			if errMigrate != nil {
+				return fmt.Errorf("persist migrated usage state: %w", errMigrate)
+			}
+		}
 		keys = state.Keys
 		loadedUsage = state.Usage
 		if state.GlobalWeightedRoundRobin != nil {
@@ -196,7 +234,7 @@ func (s *Store) Configure(cfg Config) error {
 	}
 
 	next := make(map[string]*KeyConfig, len(keys))
-	now := time.Now().UTC()
+	now := migrationNow.UTC()
 	// Build the global alias lookup from the config (post-migration).
 	aliasLookup := make(map[string]*AliasMapping, len(cfg.Aliases))
 	for i := range cfg.Aliases {
@@ -222,8 +260,8 @@ func (s *Store) Configure(cfg Config) error {
 	}
 
 	s.mu.Lock()
-	// Stop any prior flusher before rebuilding keys/state path. (StopUsageFlusher
-	// above already handled the flush-then-stop for the old path; this guards
+	// Stop any prior flusher before rebuilding keys/state path. (The loop stop
+	// above already handled the old worker; this guards
 	// against a flusher that started after this point in a re-entrant call.)
 	if s.flusher != nil {
 		s.flusher.stop()
@@ -258,8 +296,9 @@ func (s *Store) Configure(cfg Config) error {
 	}
 	// Re-load usage into the (clock-bound) ledger for restart recovery. The
 	// clock is preserved when set via SetClock; otherwise default time.Now.
-	clockNow := s.usage.now
-	s.usage = newUsageLedger(clockNow)
+	if s.usage == nil {
+		s.usage = newUsageLedger(time.Now)
+	}
 	s.usage.loadFromState(loadedUsage)
 
 	// First boot (no state file existed): persist a baseline state so that the
@@ -268,19 +307,9 @@ func (s *Store) Configure(cfg Config) error {
 	// state containing only usage (no keys) — then the next Configure would
 	// load an empty key list. Keys come from next (cfg.Keys or disk), usage is
 	// freshly loaded (empty on first boot).
-	var baseKeys []KeyConfig
-	var baseUsage map[string]*UsageState
-	var baseAliases []AliasMapping
-	var baseRules []ClassifyRule
-	if firstBoot {
-		baseKeys = s.keysSnapshotLocked()
-		baseUsage = s.usageSnapshotLocked()
-		baseAliases = s.aliasesSnapshotLocked()
-		baseRules = s.classifyRulesSnapshotLocked()
-	}
 	s.mu.Unlock()
 	if firstBoot {
-		if errSave := s.saveState(statePath, baseKeys, baseUsage, baseAliases, baseRules); errSave != nil {
+		if errSave := s.persistCurrentStateNoGate(); errSave != nil {
 			return fmt.Errorf("seed state: %w", errSave)
 		}
 	}
@@ -449,6 +478,29 @@ func (s *Store) runtimeComponents() (*RateLimiter, *usageLedger) {
 	return limiter, usage
 }
 
+func (s *Store) usageOverLimit(key KeyConfig) (string, UsageSummary) {
+	s.usageGate.RLock()
+	defer s.usageGate.RUnlock()
+	s.mu.RLock()
+	usage := s.usage
+	s.mu.RUnlock()
+	if usage == nil {
+		return "", UsageSummary{}
+	}
+	return usage.OverLimit(key)
+}
+
+func (s *Store) recordUsageCost(id, alias string, amount, cacheCost float64, cacheReadTokens, inputTokens, outputTokens, callCount int64) {
+	s.usageGate.RLock()
+	defer s.usageGate.RUnlock()
+	s.mu.RLock()
+	usage := s.usage
+	s.mu.RUnlock()
+	if usage != nil {
+		usage.RecordCost(id, alias, amount, cacheCost, cacheReadTokens, inputTokens, outputTokens, callCount)
+	}
+}
+
 func (s *Store) StatePath() string {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -516,7 +568,7 @@ func (s *Store) Authenticate(method, path string, headers http.Header, query map
 		}
 		decision.Rule = rule
 	}
-	limiter, usageLedger := s.runtimeComponents()
+	limiter, _ := s.runtimeComponents()
 	if limiter != nil && !limiter.Allow(key.ID, key.RPM) {
 		decision.RateLimited = true
 		decision.Reason = "rpm_exceeded"
@@ -526,12 +578,10 @@ func (s *Store) Authenticate(method, path string, headers http.Header, query map
 	// set (>0). This is a pre-request gate; the request that pushes usage over
 	// the limit is allowed through, and the next request is rejected — matching
 	// the RPM limiter's "off-by-one" semantics.
-	if usageLedger != nil {
-		if reason, _ := usageLedger.OverLimit(*key); reason != "" {
-			decision.CostLimited = true
-			decision.Reason = reason
-			return decision
-		}
+	if reason, _ := s.usageOverLimit(*key); reason != "" {
+		decision.CostLimited = true
+		decision.Reason = reason
+		return decision
 	}
 	decision.Allowed = true
 	decision.Reason = "allowed"
@@ -746,7 +796,6 @@ func (s *Store) RecordResponseCost(headers http.Header, query map[string][]strin
 	if key == nil || !key.Enabled {
 		return 0
 	}
-	_, usageLedger := s.runtimeComponents()
 	alias := strings.TrimSpace(requested)
 	if alias == "" {
 		return 0
@@ -757,7 +806,7 @@ func (s *Store) RecordResponseCost(headers http.Header, query map[string][]strin
 	}
 	inputPerMillion, outputPerMillion, _, priced := key.PriceForAlias(alias)
 	cost := ComputeCost(inputPerMillion, outputPerMillion, priced, usage)
-	if priced && usage.Found && usageLedger != nil {
+	if priced && usage.Found {
 		// Record even when cost == 0 (a priced-but-free alias: input/output/cache
 		// prices all configured as 0). Token / call counters must still advance so
 		// the UI can report usage volume and hit-rate; the USD just stays 0.
@@ -768,7 +817,7 @@ func (s *Store) RecordResponseCost(headers http.Header, query map[string][]strin
 		// input tokens for hit-rate denominator parity (treat all prompt tokens
 		// as non-cache input on this path, since we can't tell otherwise).
 		// callCount=1: this was a successful, token-billed request.
-		usageLedger.RecordCost(key.ID, alias, cost, 0, 0, int64(usage.PromptTokens), int64(usage.CompletionTokens), 1)
+		s.recordUsageCost(key.ID, alias, cost, 0, 0, int64(usage.PromptTokens), int64(usage.CompletionTokens), 1)
 	}
 	return cost
 }
@@ -806,7 +855,6 @@ func (s *Store) RecordUsage(apiKeyOrID, alias, model string, failed bool, detail
 	if key == nil || !key.Enabled {
 		return 0
 	}
-	_, usageLedger := s.runtimeComponents()
 	// Resolve the alias to price against. Prefer the client-requested alias
 	// (matches what the user configured prices for); fall back to the upstream
 	// model id, which equals the alias for this plugin (alias == target_model).
@@ -832,10 +880,8 @@ func (s *Store) RecordUsage(apiKeyOrID, alias, model string, failed bool, detail
 		if cost < 0 {
 			cost = 0
 		}
-		if usageLedger != nil {
-			// callCount=1 regardless of cost (even free calls count toward volume).
-			usageLedger.RecordCost(key.ID, resolved, cost, 0, 0, 0, 0, 1)
-		}
+		// callCount=1 regardless of cost (even free calls count toward volume).
+		s.recordUsageCost(key.ID, resolved, cost, 0, 0, 0, 0, 1)
 		return cost
 	}
 
@@ -880,13 +926,13 @@ func (s *Store) RecordUsage(apiKeyOrID, alias, model string, failed bool, detail
 			nonCacheInput = billableDetail.InputTokens - cr
 		}
 	}
-	if priced && usage.Found && usageLedger != nil {
+	if priced && usage.Found {
 		// Record even when cost == 0 (priced-but-free alias: all token prices 0).
 		// Token (input/output/cache) + call counters must advance so the UI
 		// reports usage volume and hit-rate; USD stays 0. Previously `cost > 0`
 		// dropped free-but-priced requests entirely, hiding their volume.
 		// callCount=1: this was a successful, token-billed request.
-		usageLedger.RecordCost(key.ID, resolved, cost, cacheCost, cacheReadTokens, nonCacheInput, billableDetail.OutputTokens, 1)
+		s.recordUsageCost(key.ID, resolved, cost, cacheCost, cacheReadTokens, nonCacheInput, billableDetail.OutputTokens, 1)
 	}
 	return cost
 }
@@ -894,19 +940,95 @@ func (s *Store) RecordUsage(apiKeyOrID, alias, model string, failed bool, detail
 // UsageSummaryFor returns the current daily/weekly usage + limits for a key
 // (for the keys-list management API).
 func (s *Store) UsageSummaryFor(key KeyConfig) UsageSummary {
-	_, usage := s.runtimeComponents()
+	s.usageGate.RLock()
+	defer s.usageGate.RUnlock()
+	s.mu.RLock()
+	usage := s.usage
+	s.mu.RUnlock()
 	if usage == nil {
-		return UsageSummary{DailyLimitUSD: key.DailyLimitUSD, WeeklyLimitUSD: key.WeeklyLimitUSD}
+		return UsageSummary{DailyLimitUSD: key.DailyLimitUSD, WeeklyLimitUSD: key.WeeklyLimitUSD, WindowMode: usageWindowMode, WeeklyHistoryComplete: true}
 	}
 	return usage.Summary(key)
 }
 
-// ResetUsage clears in-memory usage for a key (manual quota unlock).
-func (s *Store) ResetUsage(id string) {
-	_, usage := s.runtimeComponents()
-	if usage != nil {
-		usage.resetUsage(id)
+type UsageResetResult struct {
+	ResetAt time.Time    `json:"reset_at"`
+	Usage   UsageSummary `json:"usage"`
+}
+
+// ResetUsage atomically persists and then publishes an empty usage ledger for
+// one derived key. Records completed before the transaction are cleared;
+// records completed after usageGate is released enter the new ledger.
+func (s *Store) ResetUsage(id string) (UsageResetResult, error) {
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return UsageResetResult{}, errors.New("id is required")
 	}
+	s.updateMu.Lock()
+	defer s.updateMu.Unlock()
+	s.usageGate.Lock()
+	defer s.usageGate.Unlock()
+	s.persistMu.Lock()
+	defer s.persistMu.Unlock()
+
+	s.mu.RLock()
+	key := cloneKeyConfig(s.keys[id])
+	if key == nil {
+		s.mu.RUnlock()
+		return UsageResetResult{}, ErrUnknownKey
+	}
+	if key.Native {
+		s.mu.RUnlock()
+		return UsageResetResult{}, ErrNativeKeyUsageReset
+	}
+	path := s.statePath
+	keys := s.keysSnapshotLocked()
+	aliases := s.aliasesSnapshotLocked()
+	rules := s.classifyRulesSnapshotLocked()
+	settings := s.runtimeSettingsLocked()
+	usage := s.usage
+	s.mu.RUnlock()
+	if usage == nil {
+		return UsageResetResult{}, errors.New("usage ledger is unavailable")
+	}
+	if path == "" {
+		return UsageResetResult{}, errors.New("state path is unavailable")
+	}
+
+	usage.mu.Lock()
+	defer usage.mu.Unlock()
+	resetAt := usage.now().UTC()
+	candidate := usage.snapshotLocked(resetAt)
+	resetState := &UsageState{Days: make(map[string]*UsageDay), LastUsageResetAt: resetAt}
+	candidate[id] = resetState
+	zeroDaily := UsageWindow{WindowStart: utcDayStart(resetAt)}
+	zeroWeekly := UsageWindow{WindowStart: utcDayStart(resetAt).Add(-6 * dayWindow)}
+	summary := summaryFromWindows(*key, resetState, zeroDaily, zeroWeekly, resetAt)
+	if err := saveStateWithSettings(path, keys, candidate, aliases, rules, settings); err != nil {
+		return UsageResetResult{}, err
+	}
+	usage.entries = candidate
+	return UsageResetResult{ResetAt: resetAt, Usage: summary}, nil
+}
+
+// UsageDetailsFor returns key config, total summary and alias rows from one
+// ledger lock and one clock read.
+func (s *Store) UsageDetailsFor(keyID string) (KeyConfig, UsageSummary, []AliasUsageEntry, bool) {
+	s.usageGate.RLock()
+	defer s.usageGate.RUnlock()
+	key := s.findByID(keyID)
+	if key == nil {
+		return KeyConfig{}, UsageSummary{}, nil, false
+	}
+	s.mu.RLock()
+	usage := s.usage
+	s.mu.RUnlock()
+	if usage == nil {
+		summary := UsageSummary{DailyLimitUSD: key.DailyLimitUSD, WeeklyLimitUSD: key.WeeklyLimitUSD, WindowMode: usageWindowMode, WeeklyHistoryComplete: true}
+		return *key, summary, nil, true
+	}
+	summary, aliases := usage.Details(*key)
+	return *key, summary, aliases, true
 }
 
 // AliasUsageFor returns a per-alias usage breakdown for the key with the given
@@ -915,26 +1037,8 @@ func (s *Store) ResetUsage(id string) {
 // with zero values; ledger residuals for aliases no longer in the key's config
 // appear with InConfig=false. Rows are sorted by alias.
 func (s *Store) AliasUsageFor(keyID string) (KeyConfig, []AliasUsageEntry, bool) {
-	key := s.findByID(keyID)
-	if key == nil {
-		return KeyConfig{}, nil, false
-	}
-	_, usage := s.runtimeComponents()
-	if usage == nil {
-		rows := make([]AliasUsageEntry, 0, len(key.Models))
-		for _, r := range key.Models {
-			rows = append(rows, AliasUsageEntry{
-				Alias:       r.Alias,
-				Provider:    r.Provider,
-				TargetModel: r.TargetModel,
-				BillingMode: r.BillingMode,
-				PerCallUSD:  r.PerCallUSD,
-				InConfig:    true,
-			})
-		}
-		return *key, rows, true
-	}
-	return *key, usage.AliasUsage(*key), true
+	key, _, aliases, ok := s.UsageDetailsFor(keyID)
+	return key, aliases, ok
 }
 
 // FindByAPIKey resolves a downstream plain key to policy (copy). Returns nil when unknown.
@@ -1463,9 +1567,11 @@ func (s *Store) DeleteKey(id string) error {
 	if limiter != nil {
 		limiter.Reset(id)
 	}
+	s.usageGate.RLock()
 	if usageLedger != nil {
 		usageLedger.resetUsage(id)
 	}
+	s.usageGate.RUnlock()
 	return s.saveState(path, keys, usage, s.AliasesSnapshot(), s.ClassifyRulesSnapshot())
 }
 
@@ -1767,14 +1873,39 @@ func (s *Store) usageSnapshotLocked() map[string]*UsageState {
 	return s.usage.snapshot()
 }
 
+func (s *Store) runtimeSettingsLocked() RuntimeSettings {
+	return RuntimeSettings{
+		GlobalWeightedRoundRobin:      s.globalWeightedRoundRobin,
+		AuthConcurrencyLimits:         cloneIntMap(s.authConcurrencyLimits),
+		SessionAffinityIdleTTLSeconds: s.sessionAffinityIdleTTLSeconds,
+		SessionAffinityMaxEntries:     s.sessionAffinityMaxEntries,
+		QuotaCheckInterval:            s.quotaCheckInterval,
+		QuotaCacheTTL:                 s.quotaCacheTTL,
+		QuotaActivationEnabled:        s.quotaActivationEnabled,
+		QuotaActivationScope:          s.quotaActivationScope,
+		QuotaActivationModel:          s.quotaActivationModel,
+	}
+}
+
 // FlushUsage persists the current usage ledger to the state file alongside the
 // current key list. Called by the background flusher and at lifecycle points
 // (reconfigure / shutdown).
 func (s *Store) FlushUsage() error {
-	s.mu.Lock()
+	s.usageGate.RLock()
+	defer s.usageGate.RUnlock()
+	return s.flushUsageNoGate()
+}
+
+// flushUsageNoGate requires the caller to hold usageGate (read or write).
+// persistMu is acquired before taking the ledger snapshot, so an older
+// snapshot can never wait behind and then overwrite a newer admin reset.
+func (s *Store) flushUsageNoGate() error {
+	s.persistMu.Lock()
+	defer s.persistMu.Unlock()
+	s.mu.RLock()
 	usage := s.usageSnapshotLocked()
 	path := s.statePath
-	s.mu.Unlock()
+	s.mu.RUnlock()
 	if path == "" {
 		return nil
 	}
@@ -1783,20 +1914,38 @@ func (s *Store) FlushUsage() error {
 	// API (UpsertKey/DeleteKey/RotateKey), so the periodic flush must not
 	// overwrite them with an in-memory snapshot that could be stale or
 	// truncated.
-	return s.saveUsageOnly(path, usage)
+	return SaveUsageOnly(path, usage)
 }
 
-func (s *Store) saveState(path string, keys []KeyConfig, usage map[string]*UsageState, aliases []AliasMapping, rules []ClassifyRule) error {
+func (s *Store) saveState(path string, keys []KeyConfig, _ map[string]*UsageState, aliases []AliasMapping, rules []ClassifyRule) error {
+	s.usageGate.RLock()
+	defer s.usageGate.RUnlock()
 	s.persistMu.Lock()
 	defer s.persistMu.Unlock()
-	settings := s.RuntimeSettings()
+	s.mu.RLock()
+	usage := s.usageSnapshotLocked()
+	settings := s.runtimeSettingsLocked()
+	s.mu.RUnlock()
 	return saveStateWithSettings(path, keys, usage, aliases, rules, settings)
 }
 
-func (s *Store) saveUsageOnly(path string, usage map[string]*UsageState) error {
+// persistCurrentStateNoGate writes a complete current snapshot. The caller
+// must hold usageGate; this is used while Configure owns the exclusive gate.
+func (s *Store) persistCurrentStateNoGate() error {
 	s.persistMu.Lock()
 	defer s.persistMu.Unlock()
-	return SaveUsageOnly(path, usage)
+	s.mu.RLock()
+	path := s.statePath
+	keys := s.keysSnapshotLocked()
+	usage := s.usageSnapshotLocked()
+	aliases := s.aliasesSnapshotLocked()
+	rules := s.classifyRulesSnapshotLocked()
+	settings := s.runtimeSettingsLocked()
+	s.mu.RUnlock()
+	if path == "" {
+		return nil
+	}
+	return saveStateWithSettings(path, keys, usage, aliases, rules, settings)
 }
 
 // StartUsageFlusher launches a goroutine that periodically persists the usage
@@ -1820,8 +1969,7 @@ func (s *Store) StartUsageFlusher() func() {
 	return stop
 }
 
-// StopUsageFlusher stops the background flusher and flushes once more.
-func (s *Store) StopUsageFlusher() {
+func (s *Store) stopUsageFlusherLoop() {
 	s.mu.Lock()
 	f := s.flusher
 	s.flusher = nil
@@ -1830,6 +1978,11 @@ func (s *Store) StopUsageFlusher() {
 		f.stop()
 		<-f.doneCh
 	}
+}
+
+// StopUsageFlusher stops the background flusher and flushes once more.
+func (s *Store) StopUsageFlusher() {
+	s.stopUsageFlusherLoop()
 	_ = s.FlushUsage()
 }
 
@@ -1855,6 +2008,8 @@ func (f *usageFlusher) loop() {
 }
 
 func (s *Store) Status() map[string]any {
+	s.usageGate.RLock()
+	defer s.usageGate.RUnlock()
 	s.mu.RLock()
 	enabled := s.enabled
 	settings := RuntimeSettings{

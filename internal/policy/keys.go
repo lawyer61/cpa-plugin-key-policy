@@ -15,6 +15,7 @@ import (
 const HashPrefix = "sha256:"
 
 var ErrUnknownKey = errors.New("unknown key")
+var ErrNativeKeyUsageReset = errors.New("native CPA keys do not own a resettable derived-key usage ledger")
 
 func GenerateKey() (string, error) {
 	buf := make([]byte, 32)

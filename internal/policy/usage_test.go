@@ -201,6 +201,20 @@ func TestUsageSummaryReflectsUsage(t *testing.T) {
 	if s.DailyResetAt.IsZero() {
 		t.Fatal("daily_reset_at should be set")
 	}
+	raw, err := json.Marshal(s)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(raw, &payload); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := payload["weekly_history_incomplete_until"]; ok {
+		t.Fatalf("complete history emitted a zero incomplete timestamp: %s", raw)
+	}
+	if _, ok := payload["last_usage_reset_at"]; ok {
+		t.Fatalf("never-reset key emitted a zero reset timestamp: %s", raw)
+	}
 }
 
 func TestUsagePersistsAcrossRestart(t *testing.T) {
@@ -662,8 +676,8 @@ func TestAliasUsageUnknownKey(t *testing.T) {
 
 // TestAliasUsageLegacyStateMigrates: a state file written in the legacy
 // single-window ByAlias format (map[string]UsageWindow) loads into the new
-// dual-window form: the old value lands in Daily, Weekly is zeroed, and the
-// key detail API surfaces it (InConfig=false if the alias is no longer configured).
+// v2 day-bucket form: a legacy bare alias window confirmed to be today lands
+// in today's bucket and therefore contributes to both daily and seven-day views.
 func TestAliasUsageLegacyStateMigrates(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "state.json")
@@ -716,9 +730,8 @@ func TestAliasUsageLegacyStateMigrates(t *testing.T) {
 	if !nearly(fast.Daily.TotalUSD, 0.80) || fast.Daily.CallCount != 2 || fast.Daily.InputTokens != 800_000 {
 		t.Fatalf("migrated daily = %+v, want 0.80/2/800000", fast.Daily)
 	}
-	// Weekly zeroed by migration (no legacy weekly per-alias data existed).
-	if fast.Weekly.TotalUSD != 0 || fast.Weekly.CallCount != 0 {
-		t.Fatalf("migrated weekly should be zero: %+v", fast.Weekly)
+	if !nearly(fast.Weekly.TotalUSD, 0.80) || fast.Weekly.CallCount != 2 {
+		t.Fatalf("migrated seven-day alias = %+v", fast.Weekly)
 	}
 	// Persisting then reloading keeps the new dual-window shape (round-trip).
 	if err := store.FlushUsage(); err != nil {
@@ -729,30 +742,24 @@ func TestAliasUsageLegacyStateMigrates(t *testing.T) {
 		t.Fatal(err)
 	}
 	var check struct {
-		Usage map[string]struct {
-			ByAlias map[string]struct {
-				Daily  UsageWindow `json:"daily"`
-				Weekly UsageWindow `json:"weekly"`
-			} `json:"by_alias"`
+		UsageSchemaVersion int `json:"usage_schema_version"`
+		Usage              map[string]struct {
+			Days map[string]UsageDay `json:"days"`
 		} `json:"usage"`
 	}
 	if err := json.Unmarshal(raw2, &check); err != nil {
 		t.Fatal(err)
 	}
-	a, ok := check.Usage["team-a"].ByAlias["fast"]
+	if check.UsageSchemaVersion != CurrentUsageSchemaVersion {
+		t.Fatalf("usage schema = %d", check.UsageSchemaVersion)
+	}
+	day, ok := check.Usage["team-a"].Days["2026-06-29"]
 	if !ok {
-		t.Fatal("fast not in re-persisted by_alias")
+		t.Fatal("migrated day not persisted")
 	}
-	if !nearly(a.Daily.TotalUSD, 0.80) || !nearly(a.Weekly.TotalUSD, 0.80) {
-		// After the flush, the weekly alias window was populated by the
-		// post-migration in-memory state (RecordCost wrote both daily+weekly on
-		// the original record, but the legacy file only had the single window).
-		// The migration put 0.80 into Daily only; Weekly stays 0 here until a
-		// new write occurs. Accept either: Daily must be 0.80.
-		t.Logf("round-trip by_alias fast = %+v", a)
-	}
-	if !nearly(a.Daily.TotalUSD, 0.80) {
-		t.Fatalf("round-trip daily = %v, want 0.80", a.Daily.TotalUSD)
+	a, ok := day.ByAlias["fast"]
+	if !ok || !nearly(a.TotalUSD, 0.80) {
+		t.Fatalf("round-trip alias = %+v, want 0.80", a)
 	}
 }
 
@@ -778,5 +785,252 @@ func TestCallCountIncrementedTokenMode(t *testing.T) {
 	s := store.UsageSummaryFor(store.Keys()[0])
 	if s.DailyCallCount != 2 {
 		t.Fatalf("token-mode daily call count = %d, want 2", s.DailyCallCount)
+	}
+}
+
+func TestUsageSevenUTCDaysContainsTodayAndRollsOneDay(t *testing.T) {
+	now := time.Date(2026, 9, 9, 12, 0, 0, 0, time.UTC)
+	store := NewStore()
+	store.SetClock(func() time.Time { return now })
+	if err := store.Configure(Config{
+		Enabled:   true,
+		StateFile: filepath.Join(t.TempDir(), "state.json"),
+		Keys: []KeyConfig{{
+			ID: "seven-days", Enabled: true,
+			KeyHash: hashForUsageTest(t, "cpa_seven_days"),
+			Models: []ModelRule{{Alias: "fast", Provider: "codex", TargetModel: "m",
+				InputPricePerMillion: 1}},
+		}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Sep 9 is D-7 for the Sep 16 query and must be excluded.
+	store.RecordUsage("seven-days", "fast", "m", false, UsageDetail{InputTokens: 1_000_000})
+	now = time.Date(2026, 9, 10, 12, 0, 0, 0, time.UTC)
+	store.RecordUsage("seven-days", "fast", "m", false, UsageDetail{InputTokens: 2_000_000})
+	now = time.Date(2026, 9, 16, 12, 0, 0, 0, time.UTC)
+	store.RecordUsage("seven-days", "fast", "m", false, UsageDetail{InputTokens: 4_000_000})
+
+	key, summary, aliases, ok := store.UsageDetailsFor("seven-days")
+	if !ok || key.ID != "seven-days" {
+		t.Fatal("key not found")
+	}
+	if !nearly(summary.DailyUSD, 4) || !nearly(summary.WeeklyUSD, 6) {
+		t.Fatalf("summary = %+v, want daily=4 weekly=6", summary)
+	}
+	if summary.WeeklyUSD < summary.DailyUSD {
+		t.Fatalf("weekly must contain daily: %+v", summary)
+	}
+	if summary.DailyInputTokens != 4_000_000 || summary.WeeklyInputTokens != 6_000_000 || summary.DailyCallCount != 1 || summary.WeeklyCallCount != 2 {
+		t.Fatalf("counter range mismatch: %+v", summary)
+	}
+	if summary.WindowMode != "utc-days-7" || !summary.WeeklyHistoryComplete {
+		t.Fatalf("window metadata = %+v", summary)
+	}
+	if got, want := summary.WeeklyWindowStart, time.Date(2026, 9, 10, 0, 0, 0, 0, time.UTC); !got.Equal(want) {
+		t.Fatalf("weekly_window_start = %v, want %v", got, want)
+	}
+	if got, want := summary.WeeklyNextRollAt, time.Date(2026, 9, 17, 0, 0, 0, 0, time.UTC); !got.Equal(want) {
+		t.Fatalf("weekly_next_roll_at = %v, want %v", got, want)
+	}
+	if len(aliases) != 1 || !nearly(aliases[0].Daily.TotalUSD, 4) || !nearly(aliases[0].Weekly.TotalUSD, 6) {
+		t.Fatalf("alias windows = %+v, want daily=4 weekly=6", aliases)
+	}
+
+	// The next UTC midnight rolls out Sep 10 only; Sep 16 remains.
+	now = time.Date(2026, 9, 17, 0, 1, 0, 0, time.UTC)
+	summary = store.UsageSummaryFor(key)
+	if summary.DailyUSD != 0 || !nearly(summary.WeeklyUSD, 4) {
+		t.Fatalf("after one-day roll = %+v, want daily=0 weekly=4", summary)
+	}
+}
+
+func TestUsageUsesUTCDatesWhenClockHasNonUTCLocation(t *testing.T) {
+	shanghai := time.FixedZone("UTC+8", 8*60*60)
+	now := time.Date(2026, 9, 17, 7, 30, 0, 0, shanghai) // Sep 16 23:30 UTC
+	store := NewStore()
+	store.SetClock(func() time.Time { return now })
+	if err := store.Configure(Config{
+		Enabled: true, StateFile: filepath.Join(t.TempDir(), "state.json"),
+		Keys: []KeyConfig{{ID: "utc", Enabled: true, KeyHash: hashForUsageTest(t, "cpa_utc"),
+			Models: []ModelRule{{Alias: "fast", Provider: "codex", TargetModel: "m", InputPricePerMillion: 1}}}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	store.RecordUsage("utc", "fast", "m", false, UsageDetail{InputTokens: 1_000_000})
+	now = time.Date(2026, 9, 17, 8, 30, 0, 0, shanghai) // Sep 17 00:30 UTC
+	store.RecordUsage("utc", "fast", "m", false, UsageDetail{InputTokens: 2_000_000})
+
+	s := store.UsageSummaryFor(store.Keys()[0])
+	if !nearly(s.DailyUSD, 2) || !nearly(s.WeeklyUSD, 3) {
+		t.Fatalf("UTC boundary summary = %+v, want daily=2 weekly=3", s)
+	}
+	if got, want := s.DailyResetAt, time.Date(2026, 9, 18, 0, 0, 0, 0, time.UTC); !got.Equal(want) {
+		t.Fatalf("daily_reset_at = %v, want %v", got, want)
+	}
+}
+
+func TestWeeklyLimitUsesSameSevenUTCDaysAndRecoversWhenOldestDayRollsOut(t *testing.T) {
+	now := time.Date(2026, 12, 26, 12, 0, 0, 0, time.UTC)
+	store := NewStore()
+	store.SetClock(func() time.Time { return now })
+	if err := store.Configure(Config{
+		Enabled: true, StateFile: filepath.Join(t.TempDir(), "state.json"),
+		Keys: []KeyConfig{{ID: "limited", Enabled: true, KeyHash: hashForUsageTest(t, "cpa_weekly_limit"), WeeklyLimitUSD: 5,
+			Models: []ModelRule{{Alias: "fast", Provider: "codex", TargetModel: "m", InputPricePerMillion: 1}}}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	store.RecordUsage("limited", "fast", "m", false, UsageDetail{InputTokens: 3_000_000})
+	now = time.Date(2027, 1, 1, 12, 0, 0, 0, time.UTC)
+	store.RecordUsage("limited", "fast", "m", false, UsageDetail{InputTokens: 2_000_000})
+	hdr := http.Header{"Authorization": {"Bearer cpa_weekly_limit"}}
+	decision := store.Authenticate("POST", "/v1/chat/completions", hdr, nil, []byte(`{"model":"fast"}`))
+	if decision.Allowed || decision.Reason != "weekly_exceeded" {
+		t.Fatalf("at seven-day limit = %+v", decision)
+	}
+	if summary := store.UsageSummaryFor(imgKey(store, "limited")); !nearly(summary.WeeklyUSD, 5) || !nearly(summary.DailyUSD, 2) {
+		t.Fatalf("limit summary = %+v", summary)
+	}
+
+	// Jan 2's range starts Dec 27, so the Dec 26 charge rolls out while Jan 1
+	// remains. The exact same value used by the UI now admits the request.
+	now = time.Date(2027, 1, 2, 0, 1, 0, 0, time.UTC)
+	decision = store.Authenticate("POST", "/v1/chat/completions", hdr, nil, []byte(`{"model":"fast"}`))
+	if !decision.Allowed {
+		t.Fatalf("after oldest day rolls out = %+v", decision)
+	}
+	if summary := store.UsageSummaryFor(imgKey(store, "limited")); !nearly(summary.WeeklyUSD, 2) || summary.DailyUSD != 0 {
+		t.Fatalf("rolled summary = %+v", summary)
+	}
+}
+
+func TestLegacyUsageMigrationBacksUpAndKeepsOnlyConfirmedToday(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "state.json")
+	legacy := map[string]any{
+		"version": 1,
+		"keys": []map[string]any{{
+			"id": "team-a", "enabled": true,
+			"key_hash": hashForUsageTest(t, "cpa_legacy_v2"),
+			"models": []map[string]any{{
+				"alias": "fast", "provider": "codex", "target_model": "m",
+				"input_price_per_million": 1,
+			}},
+		}},
+		"usage": map[string]any{
+			"team-a": map[string]any{
+				"daily": map[string]any{
+					"total_usd": 3.0, "window_start": "2026-09-16T00:00:00Z",
+					"input_tokens": 3000000, "call_count": 3,
+				},
+				"weekly": map[string]any{
+					"total_usd": 9.0, "window_start": "2026-09-13T04:00:00Z",
+				},
+				"by_alias": map[string]any{
+					"fast": map[string]any{
+						"daily":  map[string]any{"total_usd": 2.5, "input_tokens": 2500000, "call_count": 2, "window_start": "2026-09-16T00:00:00Z"},
+						"weekly": map[string]any{"total_usd": 8.5, "window_start": "2026-09-13T04:00:00Z"},
+					},
+				},
+			},
+		},
+		"updated_at": "2026-09-16T10:00:00Z",
+	}
+	raw, _ := json.MarshalIndent(legacy, "", "  ")
+	if err := os.WriteFile(path, raw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	now := time.Date(2026, 9, 16, 17, 54, 0, 0, time.UTC)
+	store := NewStore()
+	store.SetClock(func() time.Time { return now })
+	if err := store.Configure(Config{Enabled: true, StateFile: path}); err != nil {
+		t.Fatal(err)
+	}
+
+	backups, err := filepath.Glob(path + ".pre-usage-v2.*.bak")
+	if err != nil || len(backups) != 1 {
+		t.Fatalf("migration backups = %v, err=%v", backups, err)
+	}
+	if info, err := os.Stat(backups[0]); err != nil || info.Mode().Perm() != 0o600 {
+		t.Fatalf("backup mode: info=%v err=%v", info, err)
+	}
+
+	key, summary, aliases, ok := store.UsageDetailsFor("team-a")
+	if !ok || key.ID != "team-a" {
+		t.Fatal("migrated key missing")
+	}
+	if !nearly(summary.DailyUSD, 3) || !nearly(summary.WeeklyUSD, 3) {
+		t.Fatalf("migrated totals = %+v, want confirmed today only", summary)
+	}
+	if summary.WeeklyHistoryComplete {
+		t.Fatalf("migrated history should be incomplete: %+v", summary)
+	}
+	wantIncompleteUntil := time.Date(2026, 9, 22, 0, 0, 0, 0, time.UTC)
+	if summary.WeeklyHistoryIncompleteUntil == nil || !summary.WeeklyHistoryIncompleteUntil.Equal(wantIncompleteUntil) {
+		t.Fatalf("incomplete_until = %v, want %v", summary.WeeklyHistoryIncompleteUntil, wantIncompleteUntil)
+	}
+	if len(aliases) != 1 || !nearly(aliases[0].Daily.TotalUSD, 2.5) || !nearly(aliases[0].Weekly.TotalUSD, 2.5) {
+		t.Fatalf("migrated alias = %+v", aliases)
+	}
+
+	persisted, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var doc map[string]any
+	if err := json.Unmarshal(persisted, &doc); err != nil {
+		t.Fatal(err)
+	}
+	if got := int(doc["usage_schema_version"].(float64)); got != CurrentUsageSchemaVersion {
+		t.Fatalf("usage_schema_version = %d, want %d", got, CurrentUsageSchemaVersion)
+	}
+	teamUsage := doc["usage"].(map[string]any)["team-a"].(map[string]any)
+	if _, ok := teamUsage["weekly"]; ok {
+		t.Fatalf("legacy weekly was persisted into v2: %s", persisted)
+	}
+	if _, ok := teamUsage["days"]; !ok {
+		t.Fatalf("v2 day buckets missing: %s", persisted)
+	}
+
+	// A v2 reload is not a second migration and does not duplicate today's usage.
+	if err := store.Configure(Config{Enabled: true, StateFile: path}); err != nil {
+		t.Fatal(err)
+	}
+	backups, _ = filepath.Glob(path + ".pre-usage-v2.*.bak")
+	if len(backups) != 1 {
+		t.Fatalf("migration repeated, backups=%v", backups)
+	}
+	summary = store.UsageSummaryFor(imgKey(store, "team-a"))
+	if !nearly(summary.DailyUSD, 3) || !nearly(summary.WeeklyUSD, 3) {
+		t.Fatalf("reload duplicated usage: %+v", summary)
+	}
+
+	// At M+6 UTC midnight, no unknown pre-migration day remains in range.
+	now = wantIncompleteUntil
+	summary = store.UsageSummaryFor(imgKey(store, "team-a"))
+	if !summary.WeeklyHistoryComplete || summary.WeeklyHistoryIncompleteUntil != nil {
+		t.Fatalf("history flag did not expire: %+v", summary)
+	}
+}
+
+func TestUnknownUsageSchemaIsRejectedWithoutOverwritingState(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.json")
+	original := []byte(`{"version":1,"usage_schema_version":99,"keys":[],"updated_at":"2026-09-16T00:00:00Z"}`)
+	if err := os.WriteFile(path, original, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	store := NewStore()
+	if err := store.Configure(Config{Enabled: true, StateFile: path}); err == nil {
+		t.Fatal("unknown usage schema should be rejected")
+	}
+	after, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(after) != string(original) {
+		t.Fatalf("unknown state was overwritten: %s", after)
 	}
 }

@@ -178,15 +178,17 @@ function WindowCard({
   label,
   used,
   limit,
-  resetAt,
+  timeAt,
+  timeKind,
 }: {
   label: string;
   used: number;
   limit: number;
-  resetAt?: string;
+  timeAt?: string;
+  timeKind: "reset" | "roll";
 }) {
   const t = useT();
-  const reset = formatReset(resetAt);
+  const time = formatReset(timeAt);
   return (
     <div className="lookup-window-card">
       <div className="lookup-window-label">{label}</div>
@@ -197,7 +199,9 @@ function WindowCard({
       <div className="lookup-window-caption">
         {t("lookup.used", { used: formatUSD(used).replace("$", ""), limit: displayLimit(limit, t("lookup.unlimited")).replace("$", "") })}
       </div>
-      {reset && <div className="lookup-window-reset">{t("lookup.resetAt", { at: reset })}</div>}
+      {time && <div className="lookup-window-reset">
+        {t(timeKind === "roll" ? "lookup.nextRollAt" : "lookup.resetAt", { at: time })}
+      </div>}
     </div>
   );
 }
@@ -278,15 +282,28 @@ function LookupKeyDetails({
             label={t("lookup.dailyWindow")}
             used={usage.daily_usd ?? 0}
             limit={limits.daily_usd}
-            resetAt={usage.daily_reset_at}
+            timeAt={usage.daily_reset_at}
+            timeKind="reset"
           />
           <WindowCard
             label={t("lookup.weeklyWindow")}
             used={usage.weekly_usd ?? 0}
             limit={limits.weekly_usd}
-            resetAt={usage.weekly_reset_at}
+            timeAt={usage.weekly_next_roll_at}
+            timeKind="roll"
           />
         </div>
+        <p className="muted lookup-window-note">{t("lookup.utcWindowHint")}</p>
+        {usage.weekly_history_complete === false && (
+          <p className="lookup-quota-note">
+            {t("lookup.historyIncomplete", { at: formatReset(usage.weekly_history_incomplete_until) ?? "—" })}
+          </p>
+        )}
+        {formatReset(usage.last_usage_reset_at) && (
+          <p className="muted lookup-window-note">
+            {t("lookup.lastUsageReset", { at: formatReset(usage.last_usage_reset_at) ?? "—" })}
+          </p>
+        )}
       </section>
 
       <section className="lookup-section">

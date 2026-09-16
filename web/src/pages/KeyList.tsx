@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { Link, useNavigate } from "react-router-dom";
-import { listKeys, deleteKey, rotateKey, resetRPM } from "../api/keys";
+import { listKeys, deleteKey, rotateKey, resetRPM, resetUsage } from "../api/keys";
 import type { KeyPublic } from "../types";
 import PlainKeyModal from "../components/PlainKeyModal";
 import { useT } from "../i18n";
@@ -21,6 +21,7 @@ export default function KeyList() {
   const [loading, setLoading] = useState(true);
   const [plain, setPlain] = useState<string | null>(null);
   const [plainTitle, setPlainTitle] = useState<string>("");
+  const [resettingUsage, setResettingUsage] = useState<Set<string>>(() => new Set());
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -51,12 +52,30 @@ export default function KeyList() {
     }
   };
 
-  const onReset = async (id: string) => {
+  const onResetRPM = async (id: string) => {
     try {
       await resetRPM(id);
       void load();
     } catch (e) {
       alert((e as Error).message ?? t("keys.resetFailed"));
+    }
+  };
+
+  const onResetUsage = async (id: string, name: string) => {
+    if (!confirm(t("keys.resetUsageConfirm", { name: name || id }))) return;
+    setResettingUsage((current) => new Set(current).add(id));
+    try {
+      await resetUsage(id);
+      await load();
+    } catch (e) {
+      const err = e as { response?: { data?: { error?: { message?: string } } }; message?: string };
+      alert(err.response?.data?.error?.message ?? err.message ?? t("keys.resetUsageFailed"));
+    } finally {
+      setResettingUsage((current) => {
+        const next = new Set(current);
+        next.delete(id);
+        return next;
+      });
     }
   };
 
@@ -93,7 +112,9 @@ export default function KeyList() {
               k={k}
               onDelete={onDelete}
               onRotate={k.native ? undefined : onRotate}
-              onReset={k.native ? undefined : onReset}
+              onResetRPM={k.native ? undefined : onResetRPM}
+              onResetUsage={k.native ? undefined : onResetUsage}
+              usageResetPending={resettingUsage.has(k.id)}
             />
           ))}
         </div>
@@ -122,12 +143,16 @@ function KeyCard({
   k,
   onDelete,
   onRotate,
-  onReset,
+  onResetRPM,
+  onResetUsage,
+  usageResetPending,
 }: {
   k: KeyPublic;
   onDelete: (id: string) => void;
   onRotate?: (id: string) => void;
-  onReset?: (id: string) => void;
+  onResetRPM?: (id: string) => void;
+  onResetUsage?: (id: string, name: string) => void;
+  usageResetPending: boolean;
 }) {
   const t = useT();
   const nav = useNavigate();
@@ -238,6 +263,28 @@ function KeyCard({
         </div>
       )}
 
+      {k.usage.weekly_history_complete === false && (
+        <div className="kc-usage-note">
+          {t("keys.weeklyHistoryIncomplete", {
+            at: k.usage.weekly_history_incomplete_until ? new Date(k.usage.weekly_history_incomplete_until).toLocaleString() : "—",
+          })}
+        </div>
+      )}
+      {k.usage.last_usage_reset_at && (
+        <div className="kc-usage-note">
+          {t("keys.lastUsageReset", { at: new Date(k.usage.last_usage_reset_at).toLocaleString() })}
+        </div>
+      )}
+
+      {(onResetRPM || onResetUsage) && (
+        <div className="kc-reset-actions mobile-only">
+          {onResetRPM && <button className="btn sm" onClick={(e) => { e.stopPropagation(); onResetRPM(k.id); }}>{t("keys.resetRpm")}</button>}
+          {onResetUsage && <button className="btn sm danger" disabled={usageResetPending} onClick={(e) => { e.stopPropagation(); onResetUsage(k.id, k.name); }}>
+            {usageResetPending ? t("keys.resettingUsage") : t("keys.resetUsage")}
+          </button>}
+        </div>
+      )}
+
       {/* Desktop: hover/focus action row. Not an overlay — sits at the card
        * footer and expands on hover/focus-within so card info stays visible.
        * Hidden on mobile (CSS .kc-actions display:none under 641px). The
@@ -249,7 +296,10 @@ function KeyCard({
         <Link to={`/keys/${encodeURIComponent(k.id)}/edit`}>
           <button className="btn sm" onClick={(e) => e.stopPropagation()}>{t("keys.edit")}</button>
         </Link>
-        {onReset && <button className="btn sm" onClick={(e) => { e.stopPropagation(); onReset(k.id); }}>{t("keys.resetRpm")}</button>}
+        {onResetRPM && <button className="btn sm" onClick={(e) => { e.stopPropagation(); onResetRPM(k.id); }}>{t("keys.resetRpm")}</button>}
+        {onResetUsage && <button className="btn sm danger" disabled={usageResetPending} onClick={(e) => { e.stopPropagation(); onResetUsage(k.id, k.name); }}>
+          {usageResetPending ? t("keys.resettingUsage") : t("keys.resetUsage")}
+        </button>}
         {onRotate && <button className="btn sm" onClick={(e) => { e.stopPropagation(); onRotate(k.id); }}>{t("keys.rotate")}</button>}
         <button className="btn sm danger" onClick={(e) => { e.stopPropagation(); onDelete(k.id); }}>{t("keys.delete")}</button>
       </div>

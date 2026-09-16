@@ -1,9 +1,11 @@
 package policy
 
 import (
+	"errors"
 	"net/http"
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 	"time"
 )
@@ -459,7 +461,11 @@ func TestStopUsageFlusherFlushesWithoutWorker(t *testing.T) {
 		t.Fatal(err)
 	}
 	usage := state.Usage["shutdown-key"]
-	if usage == nil || usage.Daily.TotalUSD != 1 || usage.Daily.CallCount != 1 {
+	if usage == nil {
+		t.Fatal("persisted usage missing")
+	}
+	day := usage.Days[usageDayKey(now)]
+	if day == nil || day.Total.TotalUSD != 1 || day.Total.CallCount != 1 {
 		t.Fatalf("persisted usage = %#v, want one $1 call", usage)
 	}
 }
@@ -472,4 +478,196 @@ func imgKey(s *Store, id string) KeyConfig {
 		panic("key not found: " + id)
 	}
 	return *k
+}
+
+func TestResetUsagePersistsOneDerivedKeyAndPreservesLimitsAndRPM(t *testing.T) {
+	now := time.Date(2026, 9, 16, 18, 0, 0, 0, time.UTC)
+	path := filepath.Join(t.TempDir(), "state.json")
+	hashA, _ := HashKey("cpa_reset_a")
+	hashB, _ := HashKey("cpa_reset_b")
+	store := NewStore()
+	store.SetClock(func() time.Time { return now })
+	if err := store.Configure(Config{Enabled: true, StateFile: path, Keys: []KeyConfig{
+		{ID: "a", Name: "A", Enabled: true, KeyHash: hashA, RPM: 10, DailyLimitUSD: 3, WeeklyLimitUSD: 9,
+			Models: []ModelRule{{Alias: "fast", Provider: "codex", TargetModel: "m", BillingMode: "per_call", PerCallUSD: 1}}},
+		{ID: "b", Name: "B", Enabled: true, KeyHash: hashB,
+			Models: []ModelRule{{Alias: "fast", Provider: "codex", TargetModel: "m", BillingMode: "per_call", PerCallUSD: 2}}},
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	store.RecordUsage("a", "fast", "m", false, UsageDetail{})
+	store.RecordUsage("b", "fast", "m", false, UsageDetail{})
+	beforeB := store.UsageSummaryFor(imgKey(store, "b"))
+	hdr := http.Header{"Authorization": {"Bearer cpa_reset_a"}}
+	if decision := store.Authenticate("POST", "/v1/chat/completions", hdr, nil, []byte(`{"model":"fast"}`)); !decision.Allowed {
+		t.Fatalf("authenticate = %+v", decision)
+	}
+	rpmBefore := store.limiter.Snapshot()["a"]
+
+	result, err := store.ResetUsage("a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !result.ResetAt.Equal(now) || result.Usage.DailyUSD != 0 || result.Usage.WeeklyUSD != 0 {
+		t.Fatalf("reset result = %+v", result)
+	}
+	if !result.Usage.WeeklyHistoryComplete || result.Usage.LastUsageResetAt == nil || !result.Usage.LastUsageResetAt.Equal(now) {
+		t.Fatalf("reset metadata = %+v", result.Usage)
+	}
+	if got := store.limiter.Snapshot()["a"]; got != rpmBefore {
+		t.Fatalf("RPM changed from %d to %d", rpmBefore, got)
+	}
+	keyA := imgKey(store, "a")
+	if keyA.DailyLimitUSD != 3 || keyA.WeeklyLimitUSD != 9 {
+		t.Fatalf("limits changed: %+v", keyA)
+	}
+	if got := store.UsageSummaryFor(imgKey(store, "b")); !nearly(got.DailyUSD, beforeB.DailyUSD) || !nearly(got.WeeklyUSD, beforeB.WeeklyUSD) {
+		t.Fatalf("other key changed: %+v", got)
+	}
+
+	// Successful reset is durable without waiting for the background flusher.
+	restarted := NewStore()
+	restarted.SetClock(func() time.Time { return now })
+	if err := restarted.Configure(Config{Enabled: true, StateFile: path}); err != nil {
+		t.Fatal(err)
+	}
+	got := restarted.UsageSummaryFor(imgKey(restarted, "a"))
+	if got.DailyUSD != 0 || got.WeeklyUSD != 0 || got.LastUsageResetAt == nil || !got.LastUsageResetAt.Equal(now) {
+		t.Fatalf("restarted reset usage = %+v", got)
+	}
+
+	// A request that settles after the reset is billed into the new ledger.
+	restarted.RecordUsage("a", "fast", "m", false, UsageDetail{})
+	got = restarted.UsageSummaryFor(imgKey(restarted, "a"))
+	if !nearly(got.DailyUSD, 1) || !nearly(got.WeeklyUSD, 1) {
+		t.Fatalf("post-reset settlement = %+v", got)
+	}
+}
+
+func TestResetUsageRejectsNativeKeyAndAllowsDisabledDerivedKey(t *testing.T) {
+	now := time.Date(2026, 9, 16, 18, 0, 0, 0, time.UTC)
+	hashNative, _ := HashKey("native")
+	hashDisabled, _ := HashKey("derived")
+	store := NewStore()
+	store.SetClock(func() time.Time { return now })
+	if err := store.Configure(Config{Enabled: true, StateFile: filepath.Join(t.TempDir(), "state.json"), Keys: []KeyConfig{
+		{ID: "native", Enabled: true, Native: true, KeyHash: hashNative, CallerScope: CallerScopeForKey("native"), AccountBinding: &AccountBinding{Allow: []string{"codex-*.json"}}},
+		{ID: "disabled", Enabled: false, KeyHash: hashDisabled},
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.ResetUsage("native"); !errors.Is(err, ErrNativeKeyUsageReset) {
+		t.Fatalf("native reset error = %v", err)
+	}
+	if _, err := store.ResetUsage("disabled"); err != nil {
+		t.Fatalf("disabled derived reset: %v", err)
+	}
+	if imgKey(store, "disabled").Enabled {
+		t.Fatal("reset must not enable a disabled key")
+	}
+}
+
+func TestResetUsagePersistenceFailureLeavesLiveUsage(t *testing.T) {
+	now := time.Date(2026, 9, 16, 18, 0, 0, 0, time.UTC)
+	store := NewStore()
+	store.SetClock(func() time.Time { return now })
+	if err := store.Configure(Config{Enabled: true, StateFile: filepath.Join(t.TempDir(), "state.json"), Keys: []KeyConfig{{
+		ID: "a", Enabled: true, KeyHash: hashForUsageTest(t, "cpa_reset_fail"),
+		Models: []ModelRule{{Alias: "fast", Provider: "codex", TargetModel: "m", BillingMode: "per_call", PerCallUSD: 1}},
+	}}}); err != nil {
+		t.Fatal(err)
+	}
+	store.RecordUsage("a", "fast", "m", false, UsageDetail{})
+	store.mu.Lock()
+	store.statePath = "/proc/1/mem"
+	store.mu.Unlock()
+	if _, err := store.ResetUsage("a"); err == nil {
+		t.Fatal("reset should fail when state cannot be atomically replaced")
+	}
+	got := store.UsageSummaryFor(imgKey(store, "a"))
+	if !nearly(got.DailyUSD, 1) || !nearly(got.WeeklyUSD, 1) || got.LastUsageResetAt != nil {
+		t.Fatalf("failed reset mutated live usage: %+v", got)
+	}
+}
+
+func TestConfigureStopsWhenFinalUsageFlushFails(t *testing.T) {
+	now := time.Date(2026, 9, 16, 18, 0, 0, 0, time.UTC)
+	store := NewStore()
+	store.SetClock(func() time.Time { return now })
+	if err := store.Configure(Config{Enabled: true, StateFile: filepath.Join(t.TempDir(), "state.json"), Keys: []KeyConfig{{
+		ID: "old", Enabled: true, KeyHash: hashForUsageTest(t, "cpa_old"),
+		Models: []ModelRule{{Alias: "fast", Provider: "codex", TargetModel: "m", BillingMode: "per_call", PerCallUSD: 1}},
+	}}}); err != nil {
+		t.Fatal(err)
+	}
+	store.RecordUsage("old", "fast", "m", false, UsageDetail{})
+	store.mu.Lock()
+	store.statePath = "/proc/1/mem"
+	store.mu.Unlock()
+	err := store.Configure(Config{Enabled: true, StateFile: filepath.Join(t.TempDir(), "new-state.json")})
+	if err == nil {
+		t.Fatal("configure should not load a new state after the old usage flush fails")
+	}
+	if key := store.FindByID("old"); key == nil {
+		t.Fatal("failed configure replaced the live key set")
+	}
+	if got := store.UsageSummaryFor(imgKey(store, "old")); !nearly(got.DailyUSD, 1) {
+		t.Fatalf("failed configure lost live usage: %+v", got)
+	}
+}
+
+func TestBlockedFlushCannotResurrectUsageAfterReset(t *testing.T) {
+	now := time.Date(2026, 9, 16, 18, 0, 0, 0, time.UTC)
+	path := filepath.Join(t.TempDir(), "state.json")
+	store := NewStore()
+	store.SetClock(func() time.Time { return now })
+	if err := store.Configure(Config{Enabled: true, StateFile: path, Keys: []KeyConfig{{
+		ID: "a", Enabled: true, KeyHash: hashForUsageTest(t, "cpa_stale_flush"),
+		Models: []ModelRule{{Alias: "fast", Provider: "codex", TargetModel: "m", BillingMode: "per_call", PerCallUSD: 1}},
+	}}}); err != nil {
+		t.Fatal(err)
+	}
+	store.RecordUsage("a", "fast", "m", false, UsageDetail{})
+
+	// Hold disk serialization so FlushUsage blocks after taking its read gate.
+	// ResetUsage needs the write gate, therefore it cannot persist zero first
+	// and then be overwritten by an already-captured stale flush snapshot.
+	store.persistMu.Lock()
+	flushDone := make(chan error, 1)
+	go func() { flushDone <- store.FlushUsage() }()
+	deadline := time.Now().Add(time.Second)
+	for {
+		if store.usageGate.TryLock() {
+			store.usageGate.Unlock()
+			if time.Now().After(deadline) {
+				store.persistMu.Unlock()
+				t.Fatal("flush did not acquire the usage read gate")
+			}
+			runtime.Gosched()
+			continue
+		}
+		break
+	}
+	resetDone := make(chan error, 1)
+	go func() {
+		_, err := store.ResetUsage("a")
+		resetDone <- err
+	}()
+	store.persistMu.Unlock()
+	if err := <-flushDone; err != nil {
+		t.Fatal(err)
+	}
+	if err := <-resetDone; err != nil {
+		t.Fatal(err)
+	}
+
+	restarted := NewStore()
+	restarted.SetClock(func() time.Time { return now })
+	if err := restarted.Configure(Config{Enabled: true, StateFile: path}); err != nil {
+		t.Fatal(err)
+	}
+	got := restarted.UsageSummaryFor(imgKey(restarted, "a"))
+	if got.DailyUSD != 0 || got.WeeklyUSD != 0 || got.LastUsageResetAt == nil {
+		t.Fatalf("stale flush resurrected reset usage: %+v", got)
+	}
 }

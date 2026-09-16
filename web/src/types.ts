@@ -31,7 +31,12 @@ export interface UsageSummary {
   daily_limit_usd: number;
   weekly_limit_usd: number;
   daily_reset_at?: string;
-  weekly_reset_at?: string;
+  weekly_window_start?: string;
+  weekly_next_roll_at?: string;
+  window_mode?: "utc-days-7";
+  weekly_history_complete?: boolean;
+  weekly_history_incomplete_until?: string;
+  last_usage_reset_at?: string;
   // Cache reporting (omitted when zero). Hit-rate is derived client-side as
   // cache_read_tokens / (cache_read_tokens + input_tokens).
   daily_cache_cost_usd?: number;
@@ -40,6 +45,8 @@ export interface UsageSummary {
   weekly_cache_read_tokens?: number;
   daily_input_tokens?: number;
   weekly_input_tokens?: number;
+  daily_output_tokens?: number;
+  weekly_output_tokens?: number;
   // Call counts: successful requests billed into the window (token or
   // per-call). Failed requests don't count. Display only.
   daily_call_count?: number;
@@ -112,9 +119,9 @@ export interface RotateKeyResponse {
   generated: boolean;
 }
 
-// UsageWindow mirrors policy.UsageWindow: a dollar total bound to a window
+// UsageWindow mirrors policy.UsageWindow: a dollar total bound to a range
 // start, plus cache/input/output/call counters for display. The key detail
-// page reads one Daily and one Weekly per alias.
+// page reads UTC today and the latest seven UTC calendar days per alias.
 export interface UsageWindow {
   total_usd: number;
   window_start?: string;
@@ -145,7 +152,15 @@ export interface KeyUsageResponse {
   key_name: string;
   daily_limit_usd: number;
   weekly_limit_usd: number;
+  usage: UsageSummary;
   aliases: AliasUsageEntry[];
+}
+
+export interface ResetUsageResponse {
+  reset: true;
+  id: string;
+  reset_at: string;
+  usage: UsageSummary;
 }
 
 // A model the user can pick when creating/editing a key.

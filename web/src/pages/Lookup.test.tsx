@@ -47,7 +47,17 @@ describe("public lookup page", () => {
       name: "Team A",
       enabled: true,
       limits: { rpm: 10, daily_usd: 2, weekly_usd: 5, max_concurrent_requests: 4 },
-      usage: { daily_usd: 0.5, weekly_usd: 1, daily_limit_usd: 2, weekly_limit_usd: 5 },
+      usage: {
+        daily_usd: 0.5,
+        weekly_usd: 1,
+        daily_limit_usd: 2,
+        weekly_limit_usd: 5,
+        window_mode: "utc-days-7",
+        weekly_history_complete: false,
+        weekly_history_incomplete_until: "2030-09-22T00:00:00Z",
+        weekly_next_roll_at: "2030-09-17T00:00:00Z",
+        last_usage_reset_at: "2030-09-16T10:00:00Z",
+      },
       concurrency: { current: 1, maximum: 4 },
       aliases: [],
     });
@@ -69,6 +79,10 @@ describe("public lookup page", () => {
     });
     expect(fetchLookupData).toHaveBeenCalledWith("secret-123");
     expect(host.textContent).toContain("Team A");
+    expect(host.textContent).toContain("近 7 个 UTC 自然日");
+    expect(host.textContent).toContain("下次窗口滚动");
+    expect(host.textContent).toContain("七日历史暂不完整");
+    expect(host.textContent).toContain("最近重置用量");
     const clear = Array.from(host.querySelectorAll("button")).find((button) => button.textContent?.trim() === "清除");
     await act(async () => {
       clear?.dispatchEvent(new MouseEvent("click", { bubbles: true }));

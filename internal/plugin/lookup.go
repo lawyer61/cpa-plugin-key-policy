@@ -81,7 +81,7 @@ func (a *App) lookupData(headers http.Header, hostCallbackID string) ManagementR
 }
 
 func (a *App) lookupResponseForKey(key policy.KeyConfig) (lookupResponse, bool) {
-	current, aliases, found := a.store.AliasUsageFor(key.ID)
+	current, usage, aliases, found := a.store.UsageDetailsFor(key.ID)
 	if !found {
 		return lookupResponse{}, false
 	}
@@ -105,7 +105,7 @@ func (a *App) lookupResponseForKey(key policy.KeyConfig) (lookupResponse, bool) 
 			WeeklyUSD:             key.WeeklyLimitUSD,
 			MaxConcurrentRequests: key.MaxConcurrentRequests,
 		},
-		Usage: a.store.UsageSummaryFor(key),
+		Usage: usage,
 		Concurrency: lookupConcurrency{
 			Current: a.concurrency.keyCurrent(key.ID),
 			Maximum: key.MaxConcurrentRequests,

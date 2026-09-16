@@ -7,8 +7,8 @@ import { MobileTabBar } from "./KeyList";
 import { formatUSD } from "../utils/money";
 
 // Window switch for the per-alias breakdown table: each alias row has its own
-// daily and rolling-weekly window, and the user toggles which one all rows
-// show at once. Mirrors the KeyList usage column's today/this-week framing.
+// UTC today and the current seven UTC calendar days, and the user toggles
+// which one all rows show at once.
 type Window = "daily" | "weekly";
 
 // Compact integer formatting with thousands separators. 0 shows as "0".
@@ -25,6 +25,12 @@ function hitRate(w: UsageWindow): string {
   const denom = cr + inp;
   if (denom <= 0) return "—";
   return Math.round((cr / denom) * 100) + "%";
+}
+
+function fmtTime(value?: string): string | null {
+  if (!value) return null;
+  const date = new Date(value);
+  return Number.isNaN(date.getTime()) || date.getUTCFullYear() <= 1 ? null : date.toLocaleString();
 }
 
 // Billing-mode tag, reusing the existing .tag styling. Per-call rows use a
@@ -76,18 +82,22 @@ export default function KeyUsage() {
   if (error || !data) return <div className="error">{error || t("keyUsage.notFound")}</div>;
 
   const aliases = data.aliases ?? [];
-  const hasUsage = aliases.some((a) => (a.daily.call_count ?? 0) > 0 || (a.weekly.call_count ?? 0) > 0 || (a.daily.total_usd ?? 0) > 0 || (a.weekly.total_usd ?? 0) > 0);
+  const hasUsage = (data.usage.daily_call_count ?? 0) !== 0 || (data.usage.weekly_call_count ?? 0) !== 0 || data.usage.daily_usd !== 0 || data.usage.weekly_usd !== 0;
 
   const windowOf = (a: AliasUsageEntry): UsageWindow => (win === "daily" ? a.daily : a.weekly);
 
-  // Mobile hero totals: sum across aliases for the active window.
-  const heroUsd = aliases.reduce((s, a) => s + (windowOf(a).total_usd ?? 0), 0);
-  const heroCalls = aliases.reduce((s, a) => s + (windowOf(a).call_count ?? 0), 0);
-  const heroInput = aliases.reduce((s, a) => s + (windowOf(a).input_tokens ?? 0), 0);
-  const heroOutput = aliases.reduce((s, a) => s + (windowOf(a).output_tokens ?? 0), 0);
+  // The hero uses the backend's total snapshot rather than re-summing aliases:
+  // legacy migrations deliberately preserve any pre-existing total/alias gap.
+  const heroUsd = win === "daily" ? data.usage.daily_usd : data.usage.weekly_usd;
+  const heroCalls = win === "daily" ? (data.usage.daily_call_count ?? 0) : (data.usage.weekly_call_count ?? 0);
+  const heroInput = win === "daily" ? (data.usage.daily_input_tokens ?? 0) : (data.usage.weekly_input_tokens ?? 0);
+  const heroOutput = win === "daily" ? (data.usage.daily_output_tokens ?? 0) : (data.usage.weekly_output_tokens ?? 0);
   const heroLimit = win === "daily" ? data.daily_limit_usd : data.weekly_limit_usd;
   const heroPct = heroLimit > 0 ? Math.min(100, (heroUsd / heroLimit) * 100) : 0;
   const maxAliasUsd = Math.max(1, ...aliases.map((a) => windowOf(a).total_usd ?? 0));
+  const nextRoll = fmtTime(data.usage.weekly_next_roll_at);
+  const incompleteUntil = fmtTime(data.usage.weekly_history_incomplete_until);
+  const lastReset = fmtTime(data.usage.last_usage_reset_at);
 
   return (
     <div>
@@ -124,6 +134,15 @@ export default function KeyUsage() {
             {t("keyUsage.tabWeekly")}
           </button>
         </div>
+      </div>
+
+      <div className="usage-window-notes">
+        <div className="muted">{win === "daily" ? t("keyUsage.utcDailyHint") : t("keyUsage.utcWeeklyHint")}</div>
+        {win === "weekly" && nextRoll && <div className="muted">{t("keyUsage.nextRoll", { at: nextRoll })}</div>}
+        {data.usage.weekly_history_complete === false && (
+          <div className="usage-history-warning">{t("keyUsage.historyIncomplete", { at: incompleteUntil ?? "—" })}</div>
+        )}
+        {lastReset && <div className="muted">{t("keyUsage.lastReset", { at: lastReset })}</div>}
       </div>
 
       {/* Desktop: hero summary + per-alias table (unchanged) */}

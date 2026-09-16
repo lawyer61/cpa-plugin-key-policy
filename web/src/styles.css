@@ -335,6 +335,15 @@ td.strong { font-weight: 600; color: var(--text); }
 .keyusage-id { font-size: 13px; background: var(--panel-2); color: var(--muted);
   padding: 2px 8px; border-radius: var(--r-sm); border: 1px solid var(--border); }
 .keyusage-toggle { display: inline-flex; gap: 6px; }
+.usage-window-notes {
+  display: flex; flex-wrap: wrap; gap: 6px 14px;
+  margin: -4px 0 14px; font-size: 12px;
+}
+.usage-history-warning {
+  color: var(--danger); background: var(--danger-soft);
+  border: 1px solid var(--danger-border); border-radius: var(--r-sm);
+  padding: 2px 7px;
+}
 
 /* Empty-state hint above the table: subtle italic muted text. */
 .keyusage-empty {
@@ -584,6 +593,18 @@ td.strong { font-weight: 600; color: var(--text); }
   border: 1px solid var(--border);
 }
 .keycard .kc-chips .chip.more { color: var(--muted); font-weight: 600; }
+.keycard .kc-usage-note {
+  margin-top: 8px; padding: 7px 8px;
+  border: 1px solid var(--warning-border, var(--border));
+  border-radius: var(--r-sm); background: var(--muted-bg);
+  color: var(--muted); font-size: 11px; line-height: 1.4;
+}
+.keycard .kc-reset-actions {
+  gap: 6px; flex-wrap: wrap; margin-top: 10px;
+}
+@media (max-width: 640px) {
+  .keycard .kc-reset-actions.mobile-only { display: flex !important; }
+}
 /* swipe-to-revoke layer */
 .keycard .kc-revoke {
   position: absolute; top: 0; right: 0; bottom: 0;
@@ -618,7 +639,6 @@ td.strong { font-weight: 600; color: var(--text); }
     max-height: 80px; opacity: 1;
     margin-top: 12px; padding-top: 12px; border-top-width: 1px;
   }
-  .keycard.disabled .kc-actions { max-height: 0 !important; opacity: 0 !important; overflow: hidden; }
   .keycard .kc-actions .btn { flex: 0 0 auto; }
 }
 

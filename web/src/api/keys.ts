@@ -5,6 +5,7 @@ import type {
   CreateKeyResponse,
   RotateKeyResponse,
   KeyUsageResponse,
+  ResetUsageResponse,
 } from "../types";
 
 export async function listKeys(): Promise<KeyPublic[]> {
@@ -46,6 +47,15 @@ export async function rotateKey(id: string): Promise<RotateKeyResponse> {
 export async function resetRPM(id: string): Promise<void> {
   const c = apiClient();
   await c.post(pluginPath("/keys/reset-rpm"), { id });
+}
+
+export async function resetUsage(id: string): Promise<ResetUsageResponse> {
+  const c = apiClient();
+  const { data } = await c.post<ResetUsageResponse>(
+    pluginPath("/keys/reset-usage"),
+    { id },
+  );
+  return data;
 }
 
 // fetchKeyUsage returns the per-alias usage breakdown for one key (the key

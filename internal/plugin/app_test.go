@@ -6,6 +6,7 @@ import (
 	"net/url"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"cpa-key-policy/internal/policy"
 )
@@ -715,6 +716,7 @@ func TestManagementKeyUsageEndpoint(t *testing.T) {
 	var got struct {
 		KeyID   string                   `json:"key_id"`
 		KeyName string                   `json:"key_name"`
+		Usage   policy.UsageSummary      `json:"usage"`
 		Aliases []policy.AliasUsageEntry `json:"aliases"`
 	}
 	if err := json.Unmarshal(resp.Body, &got); err != nil {
@@ -722,6 +724,9 @@ func TestManagementKeyUsageEndpoint(t *testing.T) {
 	}
 	if got.KeyID != "priced" || len(got.Aliases) != 1 {
 		t.Fatalf("usage response = %+v, want key_id=priced 1 alias", got)
+	}
+	if !nearly(got.Usage.DailyUSD, 0.30) || !nearly(got.Usage.WeeklyUSD, 0.30) || got.Usage.WindowMode != "utc-days-7" {
+		t.Fatalf("usage summary = %+v", got.Usage)
 	}
 	a := got.Aliases[0]
 	if a.Alias != "fast" || !a.InConfig || a.Provider != "codex" {
@@ -753,6 +758,52 @@ func TestManagementKeyUsageEndpoint(t *testing.T) {
 	nopeResp := managementResponseFromEnvelope(t, mustHandle(t, app, MethodManagementHandle, nopeReq))
 	if nopeResp.StatusCode != http.StatusNotFound {
 		t.Fatalf("unknown id status = %d, want 404", nopeResp.StatusCode)
+	}
+}
+
+func TestManagementResetUsageEndpoint(t *testing.T) {
+	app, _ := configurePricedApp(t)
+	usageReq, _ := json.Marshal(UsageHandleRequest{
+		APIKey: "priced", Alias: "fast", Model: "gpt-5-codex",
+		Detail: UsageDetail{InputTokens: 200_000, OutputTokens: 100_000, TotalTokens: 300_000},
+	})
+	if _, err := app.HandleMethod(MethodUsageHandle, usageReq); err != nil {
+		t.Fatal(err)
+	}
+
+	req, _ := json.Marshal(ManagementRequest{
+		Method: http.MethodPost,
+		Path:   "/v0/management/plugins/cpa-key-policy/keys/reset-usage",
+		Body:   []byte(`{"id":"priced"}`),
+	})
+	resp := managementResponseFromEnvelope(t, mustHandle(t, app, MethodManagementHandle, req))
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status=%d body=%s", resp.StatusCode, resp.Body)
+	}
+	var got struct {
+		Reset   bool                `json:"reset"`
+		ID      string              `json:"id"`
+		ResetAt time.Time           `json:"reset_at"`
+		Usage   policy.UsageSummary `json:"usage"`
+	}
+	if err := json.Unmarshal(resp.Body, &got); err != nil {
+		t.Fatal(err)
+	}
+	if !got.Reset || got.ID != "priced" || got.ResetAt.IsZero() || got.Usage.DailyUSD != 0 || got.Usage.WeeklyUSD != 0 {
+		t.Fatalf("reset response = %+v", got)
+	}
+	if got.Usage.LastUsageResetAt == nil || !got.Usage.LastUsageResetAt.Equal(got.ResetAt) {
+		t.Fatalf("last_usage_reset_at=%v reset_at=%v", got.Usage.LastUsageResetAt, got.ResetAt)
+	}
+
+	missingReq, _ := json.Marshal(ManagementRequest{
+		Method: http.MethodPost,
+		Path:   "/v0/management/plugins/cpa-key-policy/keys/reset-usage",
+		Body:   []byte(`{}`),
+	})
+	missing := managementResponseFromEnvelope(t, mustHandle(t, app, MethodManagementHandle, missingReq))
+	if missing.StatusCode != http.StatusBadRequest {
+		t.Fatalf("missing id status=%d", missing.StatusCode)
 	}
 }
 

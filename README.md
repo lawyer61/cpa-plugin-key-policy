@@ -17,7 +17,7 @@ In plain words: you issue your own `cpa_…` keys to clients. Each key only sees
 
 1. **Issue keys** — create many downstream keys; each has an allow-list of models (or shared aliases).
 2. **Route** — client calls with alias name `fast`; plugin rewrites to e.g. `codex` + `gpt-5.6-luna`.
-3. **Limit** — per-key RPM and in-flight concurrency, optional daily/weekly USD caps, plus exact auth-ID concurrency limits.
+3. **Limit** — per-key RPM and in-flight concurrency, optional UTC-day / latest-7-UTC-days USD caps, plus exact auth-ID concurrency limits.
 4. **Isolate credentials (tiers / groups)** — pin a request to Codex free/team/… or to a **custom classify group** so it never lands on the wrong auth file.
 5. **Multi-target aliases** — one alias can point at several backends (priority or round-robin).
 6. **Session affinity** — prefer a previous auth, but fail over only inside the allowed account pool.
@@ -35,7 +35,7 @@ A plugin-owned secret (`cpa_…`). Authenticated only by this plugin. Holds:
 - RPM
 - process-local maximum concurrent model executions
 - optional session affinity
-- optional daily / weekly dollar limits
+- optional UTC-day / latest-seven-UTC-calendar-day dollar limits
 - optional `allow_models_endpoint` (see below)
 - optional `allow_quota_refresh` for a rate-limited, single-account quota GET from the public lookup page
 
@@ -68,7 +68,7 @@ Two sources of “which auth file may serve this request”:
 
 - Weight is read from the CPA credential candidate's `Weight`, `Attributes.weight`, or `Metadata.weight` field.
 - Missing or invalid weight defaults to `1`; non-positive weight stops new requests; values are capped at `1000000`.
-- Scheduler state is scoped by downstream key + provider + model + group + Priority. Keys with different bindings do not share a cursor.
+- RR/WRR rotation state is scoped by downstream key + provider + group + Priority and is shared across compatible requested models. Session-affinity state remains model-specific. Keys with different bindings do not share a cursor.
 - Lower-priority credentials participate only when every higher-priority credential is unavailable or has non-positive weight.
 - When CPA omits frontend-auth metadata, the plugin recovers the unique group from the Header key, `requested_model`, and final provider/model. Missing or ambiguous target information fails; it never falls back to the full pool.
 - `global_weighted_round_robin: true` preserves the old group-ignoring behavior only for keys without `account_binding`. It never bypasses an explicit binding or its target group.
@@ -96,6 +96,14 @@ CPA-native keys are untouched unless explicitly imported as `native: true`. Impo
 - If that auth is full, cooling, unavailable, or no longer allowed, selection falls back through the configured WRR/RR/fill-first policy **inside the same allowed pool**. It never delegates to the host's global pool.
 - Slots and affinity are process-local memory. Lowering a limit during hot reconfigure gates new work but does not evict active work.
 - Image/video `per_call` compensation is charged once after concurrency admission. A later upstream failure still cannot be refunded.
+
+### Usage windows, migration, and admin reset
+
+- “Today” is the current **UTC calendar day**. The seven-day value is today plus the previous six UTC dates; it is not an independently anchored 168-hour cycle. At UTC midnight only the oldest day rolls out, so the seven-day total contains today's total.
+- `daily_limit_usd` and `weekly_limit_usd` use the same ledger values shown by the management UI and public Lookup page. Admission remains post-paid: concurrent requests can finish slightly over a configured dollar limit.
+- Upgrading from v0.8.x creates a non-overwriting `cpa-key-policy-state.json.pre-usage-v2.<timestamp>.bak`, migrates only usage provably belonging to the current UTC day, and marks seven-day history incomplete until six more UTC day boundaries have accumulated. The old independent weekly aggregate remains only in the backup.
+- The management Key list has separate **Reset RPM** and **Reset usage** actions. Reset usage clears one derived key's active amount, token, request, and alias counters while preserving its limits, RPM state, bindings, concurrency, affinity, and upstream account quota. In-flight requests that finish afterward are counted normally. Native CPA keys cannot use this reset.
+- Usage reset is persisted before success is returned. Do not downgrade an active v2 state file in place: stop writers and restore the matching pre-migration backup when rolling back to an older plugin; usage recorded after upgrade cannot be losslessly converted back.
 
 ### Codex quota-aware Fill First and cycle maintenance
 
@@ -215,7 +223,7 @@ Key holders can open the read-only self-service page without a management secret
 http://<your-cpa-host>:<api-port>/v0/resource/plugins/cpa-key-policy/lookup
 ```
 
-It submits the current secret only as `Authorization: Bearer <key>` and shows plugin-priced UTC-day/current 7-day-window usage, call/token summaries, and current key concurrency. A bound plugin-derived key also sees anonymous cached Codex quota for the roster/binding/static-route intersection. Ordinary page refresh remains cache-only; an administrator must separately enable `allow_quota_refresh` before the holder can refresh one account's quota. An enabled CPA-native key explicitly imported into key-policy sees every plugin-derived key's usage but never receives upstream account quota or refresh rights. Unimported host keys remain unknown. URL keys, auth IDs, and arbitrary `key_id` lookups are rejected.
+It submits the current secret only as `Authorization: Bearer <key>` and shows plugin-priced UTC-today / latest-seven-UTC-calendar-day usage, call/token summaries, and current key concurrency. A bound plugin-derived key also sees anonymous cached Codex quota for the roster/binding/static-route intersection. Ordinary page refresh remains cache-only; an administrator must separately enable `allow_quota_refresh` before the holder can refresh one account's quota. An enabled CPA-native key explicitly imported into key-policy sees every plugin-derived key's usage but never receives upstream account quota or refresh rights. Unimported host keys remain unknown. URL keys, auth IDs, and arbitrary `key_id` lookups are rejected.
 
 UI areas:
 

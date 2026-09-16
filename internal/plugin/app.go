@@ -908,6 +908,7 @@ func (a *App) managementRegistration() ManagementRegistrationResponse {
 			{Method: http.MethodDelete, Path: base + "/keys", Description: "Delete a downstream CPA key policy by id."},
 			{Method: http.MethodPost, Path: base + "/keys/rotate", Description: "Rotate one downstream CPA key by id."},
 			{Method: http.MethodPost, Path: base + "/keys/reset-rpm", Description: "Reset one downstream CPA key RPM counter by id."},
+			{Method: http.MethodPost, Path: base + "/keys/reset-usage", Description: "Reset one derived key's persisted UTC daily and seven-day usage by id."},
 			{Method: http.MethodGet, Path: base + "/keys/usage", Description: "Per-alias usage breakdown for one downstream CPA key by id."},
 			{Method: http.MethodGet, Path: base + "/status", Description: "Show cpa-key-policy runtime status."},
 			{Method: http.MethodGet, Path: base + "/settings", Description: "Show scheduler settings."},
@@ -979,6 +980,8 @@ func (a *App) handleManagement(raw []byte) ([]byte, error) {
 		return OKEnvelope(a.rotateKey(idFromRequest(req.Query, req.Body)))
 	case req.Method == http.MethodPost && path == base+"/keys/reset-rpm":
 		return OKEnvelope(a.resetRPM(idFromRequest(req.Query, req.Body)))
+	case req.Method == http.MethodPost && path == base+"/keys/reset-usage":
+		return OKEnvelope(a.resetUsage(idFromRequest(req.Query, req.Body)))
 	case req.Method == http.MethodGet && path == base+"/keys/usage":
 		return OKEnvelope(a.keyUsage(idFromRequest(req.Query, req.Body)))
 	case req.Method == http.MethodGet && path == base+"/status":
@@ -1330,6 +1333,19 @@ func (a *App) resetRPM(id string) ManagementResponse {
 	return jsonResponse(http.StatusOK, map[string]any{"reset": true, "id": strings.TrimSpace(id)})
 }
 
+func (a *App) resetUsage(id string) ManagementResponse {
+	result, err := a.store.ResetUsage(id)
+	if err != nil {
+		return storeError(err)
+	}
+	return jsonResponse(http.StatusOK, map[string]any{
+		"reset":    true,
+		"id":       strings.TrimSpace(id),
+		"reset_at": result.ResetAt,
+		"usage":    result.Usage,
+	})
+}
+
 // keyUsage returns the per-alias usage breakdown for one downstream key (the
 // key detail subpage data source). id is taken from the query string (or body),
 // matching the rotate/reset-rpm/delete convention.
@@ -1338,7 +1354,7 @@ func (a *App) keyUsage(id string) ManagementResponse {
 	if id == "" {
 		return jsonError(http.StatusBadRequest, "missing_id", "id is required")
 	}
-	key, aliases, ok := a.store.AliasUsageFor(id)
+	key, usage, aliases, ok := a.store.UsageDetailsFor(id)
 	if !ok {
 		return jsonError(http.StatusNotFound, "not_found", "key not found")
 	}
@@ -1347,6 +1363,7 @@ func (a *App) keyUsage(id string) ManagementResponse {
 		"key_name":         key.Name,
 		"daily_limit_usd":  key.DailyLimitUSD,
 		"weekly_limit_usd": key.WeeklyLimitUSD,
+		"usage":            usage,
 		"aliases":          aliases,
 	})
 }
