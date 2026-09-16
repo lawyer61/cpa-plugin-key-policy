@@ -556,3 +556,34 @@ func schedulerPickForTest(t *testing.T, app *App, request SchedulerPickRequest) 
 	}
 	return response
 }
+
+func TestRoundRobinAndWeightedRoundRobinShareStateAcrossModels(t *testing.T) {
+	app := NewApp()
+	candidates := []SchedulerAuthCandidate{
+		{ID: "auth-a", Provider: "codex", Weight: 1},
+		{ID: "auth-b", Provider: "codex", Weight: 1},
+	}
+	sol := SchedulerPickRequest{Provider: "codex", Model: "gpt-5.6-sol"}
+	terra := SchedulerPickRequest{Provider: "codex", Model: "gpt-5.6-terra"}
+
+	solPool := schedulerPoolKey(sol, "key-1", "team", 0)
+	terraPool := schedulerPoolKey(terra, "key-1", "team", 0)
+	if solPool != terraPool {
+		t.Fatalf("RR/WRR pool must be shared across models: sol=%q terra=%q", solPool, terraPool)
+	}
+
+	if got := app.pickRoundRobin(solPool, candidates).ID; got != "auth-a" {
+		t.Fatalf("first RR pick = %q, want auth-a", got)
+	}
+	if got := app.pickRoundRobin(terraPool, candidates).ID; got != "auth-b" {
+		t.Fatalf("cross-model RR pick = %q, want auth-b", got)
+	}
+
+	app.clearSchedulerState()
+	if got := app.pickSmoothWeighted(sol, "key-1", "team", 0, append([]SchedulerAuthCandidate(nil), candidates...)).ID; got != "auth-a" {
+		t.Fatalf("first WRR pick = %q, want auth-a", got)
+	}
+	if got := app.pickSmoothWeighted(terra, "key-1", "team", 0, append([]SchedulerAuthCandidate(nil), candidates...)).ID; got != "auth-b" {
+		t.Fatalf("cross-model WRR pick = %q, want auth-b", got)
+	}
+}

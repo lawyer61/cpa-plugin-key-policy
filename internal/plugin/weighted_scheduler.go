@@ -138,7 +138,9 @@ func schedulerPoolKey(req SchedulerPickRequest, owner, group string, priority in
 	if provider == "" {
 		provider = strings.Join(providers, ",")
 	}
-	return strings.ToLower(strings.TrimSpace(owner)) + "\x00" + provider + "\x00" + strings.ToLower(strings.TrimSpace(req.Model)) + "\x00" +
+	// Model is deliberately excluded so RR/WRR progress is shared across models
+	// for the same owner, provider, group, and priority tier.
+	return strings.ToLower(strings.TrimSpace(owner)) + "\x00" + provider + "\x00" +
 		strings.ToLower(strings.TrimSpace(group)) + "\x00" + strconv.Itoa(priority)
 }
 

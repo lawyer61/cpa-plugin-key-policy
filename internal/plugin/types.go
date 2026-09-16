@@ -47,7 +47,7 @@ const (
 const (
 	PluginID   = "cpa-key-policy"
 	PluginName = "cpa-key-policy"
-	Version    = "0.8.0"
+	Version    = "0.8.1"
 )
 
 type Envelope struct {
