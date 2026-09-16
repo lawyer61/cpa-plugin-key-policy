@@ -724,8 +724,11 @@ func candidateMatchesRequestedProvider(candidate SchedulerAuthCandidate, req Sch
 func schedulerCandidateUsable(status string) bool {
 	status = strings.ToLower(strings.TrimSpace(status))
 	status = strings.NewReplacer("-", "_", " ", "_").Replace(status)
+	// CPA may keep an auth's aggregate status at error after its current-model
+	// retry deadline has elapsed. Candidate membership is the host's current
+	// availability boundary, so a residual error alone must not block recovery.
 	switch status {
-	case "disabled", "error", "expired", "revoked", "invalid", "unavailable", "cooldown", "cooling_down", "quota_exhausted", "exhausted", "blocked":
+	case "disabled", "expired", "revoked", "invalid", "unavailable", "cooldown", "cooling_down", "quota_exhausted", "exhausted", "blocked":
 		return false
 	default:
 		return true

@@ -92,6 +92,45 @@ func TestBoundSchedulerRoundRobin(t *testing.T) {
 	}
 }
 
+func TestBoundSchedulerAcceptsHostProjectedResidualError(t *testing.T) {
+	for _, strategy := range []string{"round-robin", "weighted-round-robin", "fill-first", "quota-fill-first"} {
+		t.Run(strategy, func(t *testing.T) {
+			app, plain := configureBoundApp(t, strategy, false)
+			request := boundSchedulerRequest(plain)
+			request.Candidates = []SchedulerAuthCandidate{{
+				ID:         "account-a-recovered",
+				Provider:   "codex",
+				Status:     "error",
+				Weight:     1,
+				Attributes: map[string]string{"plan_type": "team"},
+			}}
+
+			rawRequest, err := json.Marshal(request)
+			if err != nil {
+				t.Fatal(err)
+			}
+			rawResponse, err := app.HandleMethod(MethodSchedulerPick, rawRequest)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var envelope Envelope
+			if err := json.Unmarshal(rawResponse, &envelope); err != nil {
+				t.Fatal(err)
+			}
+			if !envelope.OK {
+				t.Fatalf("scheduler rejected host-projected recovered candidate: %+v", envelope.Error)
+			}
+			var response SchedulerPickResponse
+			if err := json.Unmarshal(envelope.Result, &response); err != nil {
+				t.Fatal(err)
+			}
+			if !response.Handled || response.AuthID != "account-a-recovered" {
+				t.Fatalf("scheduler response = %+v, want recovered candidate", response)
+			}
+		})
+	}
+}
+
 func TestBoundSchedulerFillFirst(t *testing.T) {
 	app, plain := configureBoundApp(t, "fill-first", false)
 	request := boundSchedulerRequest(plain)
@@ -133,6 +172,15 @@ func TestBoundSchedulerRejectsUnavailableProviderMismatchAndOutOfPoolPin(t *test
 		metadata  map[string]any
 	}{
 		{name: "cooldown", candidate: SchedulerAuthCandidate{ID: "account-a-team", Provider: "codex", Status: "cooldown", Attributes: map[string]string{"plan_type": "team"}}},
+		{name: "disabled", candidate: SchedulerAuthCandidate{ID: "account-a-team", Provider: "codex", Status: "disabled", Attributes: map[string]string{"plan_type": "team"}}},
+		{name: "expired", candidate: SchedulerAuthCandidate{ID: "account-a-team", Provider: "codex", Status: "expired", Attributes: map[string]string{"plan_type": "team"}}},
+		{name: "revoked", candidate: SchedulerAuthCandidate{ID: "account-a-team", Provider: "codex", Status: "revoked", Attributes: map[string]string{"plan_type": "team"}}},
+		{name: "invalid", candidate: SchedulerAuthCandidate{ID: "account-a-team", Provider: "codex", Status: "invalid", Attributes: map[string]string{"plan_type": "team"}}},
+		{name: "unavailable", candidate: SchedulerAuthCandidate{ID: "account-a-team", Provider: "codex", Status: "unavailable", Attributes: map[string]string{"plan_type": "team"}}},
+		{name: "cooling down", candidate: SchedulerAuthCandidate{ID: "account-a-team", Provider: "codex", Status: "cooling-down", Attributes: map[string]string{"plan_type": "team"}}},
+		{name: "quota exhausted", candidate: SchedulerAuthCandidate{ID: "account-a-team", Provider: "codex", Status: "quota_exhausted", Attributes: map[string]string{"plan_type": "team"}}},
+		{name: "exhausted", candidate: SchedulerAuthCandidate{ID: "account-a-team", Provider: "codex", Status: "exhausted", Attributes: map[string]string{"plan_type": "team"}}},
+		{name: "blocked", candidate: SchedulerAuthCandidate{ID: "account-a-team", Provider: "codex", Status: "blocked", Attributes: map[string]string{"plan_type": "team"}}},
 		{name: "provider mismatch", candidate: SchedulerAuthCandidate{ID: "account-a-team", Provider: "claude", Attributes: map[string]string{"plan_type": "team"}}},
 		{name: "out-of-pool pin", candidate: SchedulerAuthCandidate{ID: "account-b-team", Provider: "codex", Attributes: map[string]string{"plan_type": "team"}}, metadata: map[string]any{"pinned_auth_id": "account-b-team"}},
 	}
