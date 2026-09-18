@@ -29,7 +29,7 @@ describe("KeyForm pricing draft", () => {
     host = null;
   });
 
-  async function renderForm() {
+  async function renderForm(onSubmit: (value: unknown) => Promise<void> = async () => {}) {
     host = document.createElement("div");
     document.body.appendChild(host);
     root = createRoot(host);
@@ -51,6 +51,7 @@ describe("KeyForm pricing draft", () => {
                       alias: "gemini-2.5-flash",
                       provider: "antigravity",
                       target_model: "gemini-2.5-flash",
+                      billing_multiplier: 1.25,
                     }],
                     daily_limit_usd: 1,
                     weekly_limit_usd: 5,
@@ -62,7 +63,7 @@ describe("KeyForm pricing draft", () => {
                   }}
                   pickPath="/pick"
                   submitLabel="create"
-                  onSubmit={async () => {}}
+                  onSubmit={onSubmit}
                   onCancel={() => {}}
                 />
               }
@@ -91,12 +92,15 @@ describe("KeyForm pricing draft", () => {
     const textInputs = Array.from(host!.querySelectorAll<HTMLInputElement>("input:not([type]), input[type='text']"));
     const name = textInputs.find((input) => input.value === "before")!;
     const price = host!.querySelector<HTMLInputElement>("tbody input[type='number']")!;
+    const multiplier = host!.querySelector<HTMLInputElement>("tbody input[title]")!;
     await act(async () => {
       const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")?.set;
       setter?.call(name, "after");
       name.dispatchEvent(new Event("input", { bubbles: true }));
       setter?.call(price, "0.025");
       price.dispatchEvent(new Event("input", { bubbles: true }));
+      setter?.call(multiplier, "1.5");
+      multiplier.dispatchEvent(new Event("input", { bubbles: true }));
     });
     await act(async () => host!.querySelector<HTMLButtonElement>("button.mc-add")!.click());
     const state = JSON.parse(host!.querySelector("#state-probe")!.textContent || "{}");
@@ -107,5 +111,21 @@ describe("KeyForm pricing draft", () => {
 		expect(state.keyDraft.allow_quota_refresh).toBe(true);
     expect(state.models[0].input_price_per_million).toBe(0.025);
     expect(state.keyDraft.models[0].input_price_per_million).toBe(0.025);
+    expect(state.models[0].billing_multiplier).toBe(1.5);
+    expect(state.keyDraft.models[0].billing_multiplier).toBe(1.5);
+  });
+
+  it("rejects a non-positive multiplier before submitting", async () => {
+    const onSubmit = vi.fn().mockResolvedValue(undefined);
+    await renderForm(onSubmit);
+    const multiplier = host!.querySelector<HTMLInputElement>("tbody input[title]")!;
+    await act(async () => {
+      const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")?.set;
+      setter?.call(multiplier, "0");
+      multiplier.dispatchEvent(new Event("input", { bubbles: true }));
+      host!.querySelector<HTMLButtonElement>(".fp-foot .btn.primary")!.click();
+    });
+    expect(onSubmit).not.toHaveBeenCalled();
+    expect(host!.querySelector(".error")?.textContent).toContain("大于 0");
   });
 });

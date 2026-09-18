@@ -21,6 +21,7 @@ type aliasUpsertRequest struct {
 	OutputPricePerMillion    float64              `json:"output_price_per_million"`
 	CacheReadPricePerMillion float64              `json:"cache_read_price_per_million"`
 	PerCallUSD               float64              `json:"per_call_usd"`
+	BillingMultiplier        *float64             `json:"billing_multiplier,omitempty"`
 }
 
 func (a *App) upsertAlias(raw []byte) ManagementResponse {
@@ -38,11 +39,18 @@ func (a *App) upsertAlias(raw []byte) ManagementResponse {
 		OutputPricePerMillion:    req.OutputPricePerMillion,
 		CacheReadPricePerMillion: req.CacheReadPricePerMillion,
 		PerCallUSD:               req.PerCallUSD,
+		BillingMultiplier:        req.BillingMultiplier,
 	}
 	if err := a.store.UpsertAlias(alias); err != nil {
 		return jsonError(http.StatusBadRequest, "validation_error", err.Error())
 	}
 	a.notifyQuotaPolicyChanged()
+	for _, saved := range a.store.AliasesSnapshot() {
+		if strings.EqualFold(saved.Alias, alias.Alias) {
+			alias = saved
+			break
+		}
+	}
 	return jsonResponse(http.StatusOK, map[string]any{"alias": alias})
 }
 

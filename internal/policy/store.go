@@ -3,6 +3,7 @@ package policy
 import (
 	"errors"
 	"fmt"
+	"math"
 	"net/http"
 	"os"
 	"sort"
@@ -804,8 +805,12 @@ func (s *Store) RecordResponseCost(headers http.Header, query map[string][]strin
 	if !usage.Found {
 		return 0
 	}
-	inputPerMillion, outputPerMillion, _, priced := key.PriceForAlias(alias)
-	cost := ComputeCost(inputPerMillion, outputPerMillion, priced, usage)
+	rule, priced := key.ModelForAlias(alias)
+	cost := ComputeCost(rule.InputPricePerMillion, rule.OutputPricePerMillion, priced, usage)
+	cost *= billingMultiplierValue(rule.BillingMultiplier)
+	if math.IsNaN(cost) || math.IsInf(cost, 0) {
+		return cost
+	}
 	if priced && usage.Found {
 		// Record even when cost == 0 (a priced-but-free alias: input/output/cache
 		// prices all configured as 0). Token / call counters must still advance so
@@ -865,7 +870,8 @@ func (s *Store) RecordUsage(apiKeyOrID, alias, model string, failed bool, detail
 	if resolved == "" {
 		return 0
 	}
-	rule, _ := key.ModelForAlias(resolved)
+	rule, priced := key.ModelForAlias(resolved)
+	multiplier := billingMultiplierValue(rule.BillingMultiplier)
 
 	// Per-call billing: a fixed USD charge per SUCCESSFUL request, independent
 	// of token counts. Failed requests are not charged and don't count. A
@@ -876,9 +882,12 @@ func (s *Store) RecordUsage(apiKeyOrID, alias, model string, failed bool, detail
 		if failed {
 			return 0
 		}
-		cost := rule.PerCallUSD
+		cost := rule.PerCallUSD * multiplier
 		if cost < 0 {
 			cost = 0
+		}
+		if math.IsNaN(cost) || math.IsInf(cost, 0) {
+			return cost
 		}
 		// callCount=1 regardless of cost (even free calls count toward volume).
 		s.recordUsageCost(key.ID, resolved, cost, 0, 0, 0, 0, 1)
@@ -906,8 +915,12 @@ func (s *Store) RecordUsage(apiKeyOrID, alias, model string, failed bool, detail
 	if !usage.Found {
 		return 0
 	}
-	inputPerMillion, outputPerMillion, cacheReadPerMillion, priced := key.PriceForAlias(resolved)
-	cost, cacheCost, cacheReadTokens := ComputeCacheCostBreakdown(provider, inputPerMillion, outputPerMillion, cacheReadPerMillion, priced, billableDetail)
+	cost, cacheCost, cacheReadTokens := ComputeCacheCostBreakdown(provider, rule.InputPricePerMillion, rule.OutputPricePerMillion, rule.CacheReadPricePerMillion, priced, billableDetail)
+	cost *= multiplier
+	cacheCost *= multiplier
+	if math.IsNaN(cost) || math.IsInf(cost, 0) || math.IsNaN(cacheCost) || math.IsInf(cacheCost, 0) {
+		return cost
+	}
 	// Non-cache input tokens billed at the input price — the denominator partner
 	// for hit-rate = cacheRead / (cacheRead + input). Must mirror the biller's
 	// internal split so the reported rate matches the actual pricing.
@@ -1318,12 +1331,17 @@ func resolveAliasRefsToModels(refs []KeyAliasRef, aliases map[string]*AliasMappi
 			continue
 		}
 		for _, t := range a.Targets {
+			multiplier := billingMultiplierValue(a.BillingMultiplier)
+			if ref.BillingMultiplier != nil {
+				multiplier = *ref.BillingMultiplier
+			}
 			rule := ModelRule{
-				Alias:       a.Alias,
-				Provider:    t.Provider,
-				TargetModel: t.TargetModel,
-				Group:       t.Group,
-				BillingMode: a.BillingMode,
+				Alias:             a.Alias,
+				Provider:          t.Provider,
+				TargetModel:       t.TargetModel,
+				Group:             t.Group,
+				BillingMode:       a.BillingMode,
+				BillingMultiplier: &multiplier,
 			}
 			if ref.BillingMode != nil {
 				rule.BillingMode = *ref.BillingMode
@@ -1539,6 +1557,12 @@ func applyModelPricingOverrides(models []ModelRule, refs []KeyAliasRef, aliases 
 		out[idx].OutputPricePerMillion = &outputPrice
 		out[idx].CacheReadPricePerMillion = &cachePrice
 		out[idx].PerCallUSD = &perCallPrice
+		// Older clients omit the field entirely. Preserve an existing override in
+		// that case; only an explicitly submitted multiplier replaces it.
+		if model.BillingMultiplier != nil {
+			multiplier := *model.BillingMultiplier
+			out[idx].BillingMultiplier = &multiplier
+		}
 	}
 	return out
 }
@@ -1652,6 +1676,9 @@ func (s *Store) UpsertAlias(alias AliasMapping) error {
 	found := false
 	for i, a := range existing {
 		if strings.EqualFold(a.Alias, alias.Alias) {
+			if alias.BillingMultiplier == nil {
+				alias.BillingMultiplier = a.BillingMultiplier
+			}
 			existing[i] = alias
 			found = true
 			break

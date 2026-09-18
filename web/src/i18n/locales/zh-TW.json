@@ -105,6 +105,10 @@
     "colGroup": "檔位",
     "colBillingMode": "計費方式",
     "colBillingModeHint": "勾選切為「按次計費」：每次成功請求扣固定美元，與 token 無關；token 價保留但不生效，取消勾選即恢復。",
+    "colBillingMultiplier": "計費倍率",
+    "colBillingMultiplierHint": "在模型基礎費用算出後乘一次的正數倍率。1 保持原價，1.5 代表按 1.5 倍計費。",
+    "billingMultiplierInvalid": "每個模型的計費倍率都必須是大於 0 的有限數值。",
+    "pricingSettlementHint": "價格與倍率修改只影響後續結算，歷史用量不會重算。",
     "billingTokens": "按 token",
     "billingPerCall": "按次",
     "billingModeTitle": "切換按 token / 按次計費",
@@ -270,7 +274,13 @@
     "quotaAvailability": {"ready": "可用", "unknown": "未知", "exhausted": "已耗盡"},
     "quotaFreshness": {"fresh": "新鮮", "stale": "已過期", "unknown": "新鮮度未知"},
     "quotaWindowKind": {"five_hour": "5 小時", "weekly": "週", "monthly": "月", "unknown": "未知"},
-    "runtimeActivationCurrent": "啟用中的請求：{{n}}"
+    "runtimeActivationCurrent": "啟用中的請求：{{n}}",
+    "alias": {
+      "multiplier": "計費倍率",
+      "multiplierHint": "模型基礎費用算出後乘一次；必須大於 0，預設 1。",
+      "multiplierInvalid": "計費倍率必須是大於 0 的有限數值。",
+      "pricingSettlementHint": "價格與倍率修改只影響後續結算，歷史用量不會重算。"
+    }
   },
   "lookup": {
     "title": "Key 查詢",

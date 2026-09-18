@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -16,7 +17,10 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-const CurrentUsageSchemaVersion = 2
+const (
+	CurrentUsageSchemaVersion = 2
+	DefaultBillingMultiplier  = 1.0
+)
 
 var ErrLegacyUsageSchema = errors.New("legacy usage schema requires migration")
 
@@ -140,6 +144,11 @@ type ModelRule struct {
 	// increments for reporting). Negative is rejected by normalizeConfig. Only
 	// meaningful under "per_call"; ignored under "tokens".
 	PerCallUSD float64 `yaml:"per_call_usd,omitempty" json:"per_call_usd,omitempty"`
+	// BillingMultiplier scales the already-computed token or per-call charge.
+	// nil means the backward-compatible default of 1. Resolved ModelRules carry
+	// a non-nil effective value; the pointer preserves missing-vs-explicit-zero
+	// while decoding legacy config and management requests.
+	BillingMultiplier *float64 `yaml:"billing_multiplier,omitempty" json:"billing_multiplier,omitempty"`
 }
 
 // AliasMapping is one entry in the global alias mapping table. It maps a
@@ -158,6 +167,9 @@ type AliasMapping struct {
 	OutputPricePerMillion    float64 `yaml:"output_price_per_million,omitempty" json:"output_price_per_million,omitempty"`
 	CacheReadPricePerMillion float64 `yaml:"cache_read_price_per_million,omitempty" json:"cache_read_price_per_million,omitempty"`
 	PerCallUSD               float64 `yaml:"per_call_usd,omitempty" json:"per_call_usd,omitempty"`
+	// BillingMultiplier is the global default for this billing alias. nil keeps
+	// legacy state equivalent to an explicit multiplier of 1.
+	BillingMultiplier *float64 `yaml:"billing_multiplier,omitempty" json:"billing_multiplier,omitempty"`
 }
 
 // AliasTarget is one selectable destination for an alias. Group optionally
@@ -205,6 +217,8 @@ type KeyAliasRef struct {
 	OutputPricePerMillion    *float64 `yaml:"output_price_per_million,omitempty" json:"output_price_per_million,omitempty"`
 	CacheReadPricePerMillion *float64 `yaml:"cache_read_price_per_million,omitempty" json:"cache_read_price_per_million,omitempty"`
 	PerCallUSD               *float64 `yaml:"per_call_usd,omitempty" json:"per_call_usd,omitempty"`
+	// Optional per-key multiplier override. nil inherits the global alias value.
+	BillingMultiplier *float64 `yaml:"billing_multiplier,omitempty" json:"billing_multiplier,omitempty"`
 }
 
 // UsageState is the v2 per-key usage ledger. Days is keyed by an explicit UTC
@@ -618,6 +632,7 @@ func migrateModelsToAliases(cfg *Config) {
 					OutputPricePerMillion:    m.OutputPricePerMillion,
 					CacheReadPricePerMillion: m.CacheReadPricePerMillion,
 					PerCallUSD:               m.PerCallUSD,
+					BillingMultiplier:        m.BillingMultiplier,
 				})
 				existing[al] = ai
 			}
@@ -657,12 +672,41 @@ func mergeAliasTarget(a *AliasMapping, target AliasTarget) {
 	a.Targets = append(a.Targets, target)
 }
 
+func billingMultiplierValue(value *float64) float64 {
+	if value == nil {
+		return DefaultBillingMultiplier
+	}
+	return *value
+}
+
+func finiteNonNegative(value float64) bool {
+	return value >= 0 && !math.IsNaN(value) && !math.IsInf(value, 0)
+}
+
+func validBillingMultiplier(value *float64) bool {
+	if value == nil {
+		return true
+	}
+	return *value > 0 && !math.IsNaN(*value) && !math.IsInf(*value, 0)
+}
+
 func normalizeConfig(cfg *Config) error {
 	settings, err := normalizeRuntimeSettings(runtimeSettingsFromConfig(*cfg))
 	if err != nil {
 		return err
 	}
 	applyRuntimeSettings(cfg, settings)
+	// Models is a legacy/input projection and may be cleared by migration before
+	// the normal validation loop. Reject an explicitly invalid multiplier first
+	// so an existing global alias cannot accidentally hide it.
+	for i := range cfg.Keys {
+		for j := range cfg.Keys[i].Models {
+			model := &cfg.Keys[i].Models[j]
+			if !validBillingMultiplier(model.BillingMultiplier) {
+				return fmt.Errorf("key %q model %q billing_multiplier must be a finite number greater than 0", strings.TrimSpace(cfg.Keys[i].ID), strings.TrimSpace(model.Alias))
+			}
+		}
+	}
 
 	// Auto-migrate: when a key has per-key Models but no Aliases, promote
 	// Models to the global alias table and convert the key to reference aliases.
@@ -768,8 +812,8 @@ func normalizeConfig(cfg *Config) error {
 			// for multi-target global aliases (resolveAliasRefsToModels emits
 			// one ModelRule per target, all sharing the alias name). Do not
 			// reject them; the pricing is unified at the alias level.
-			if model.InputPricePerMillion < 0 || model.OutputPricePerMillion < 0 || model.CacheReadPricePerMillion < 0 {
-				return fmt.Errorf("key %q model %q prices cannot be negative", key.ID, model.Alias)
+			if !finiteNonNegative(model.InputPricePerMillion) || !finiteNonNegative(model.OutputPricePerMillion) || !finiteNonNegative(model.CacheReadPricePerMillion) {
+				return fmt.Errorf("key %q model %q prices must be finite and non-negative", key.ID, model.Alias)
 			}
 			// BillingMode: normalize empty to "tokens"; reject unknown modes.
 			switch strings.ToLower(strings.TrimSpace(model.BillingMode)) {
@@ -780,8 +824,11 @@ func normalizeConfig(cfg *Config) error {
 			default:
 				return fmt.Errorf("key %q model %q billing_mode %q must be \"tokens\" or \"per_call\"", key.ID, model.Alias, model.BillingMode)
 			}
-			if model.PerCallUSD < 0 {
-				return fmt.Errorf("key %q model %q per_call_usd cannot be negative", key.ID, model.Alias)
+			if !finiteNonNegative(model.PerCallUSD) {
+				return fmt.Errorf("key %q model %q per_call_usd must be finite and non-negative", key.ID, model.Alias)
+			}
+			if !validBillingMultiplier(model.BillingMultiplier) {
+				return fmt.Errorf("key %q model %q billing_multiplier must be a finite number greater than 0", key.ID, model.Alias)
 			}
 		}
 	}
@@ -833,11 +880,14 @@ func normalizeConfig(cfg *Config) error {
 		default:
 			return fmt.Errorf("alias %q billing_mode %q must be \"tokens\" or \"per_call\"", a.Alias, a.BillingMode)
 		}
-		if a.InputPricePerMillion < 0 || a.OutputPricePerMillion < 0 || a.CacheReadPricePerMillion < 0 {
-			return fmt.Errorf("alias %q prices cannot be negative", a.Alias)
+		if !finiteNonNegative(a.InputPricePerMillion) || !finiteNonNegative(a.OutputPricePerMillion) || !finiteNonNegative(a.CacheReadPricePerMillion) {
+			return fmt.Errorf("alias %q prices must be finite and non-negative", a.Alias)
 		}
-		if a.PerCallUSD < 0 {
-			return fmt.Errorf("alias %q per_call_usd cannot be negative", a.Alias)
+		if !finiteNonNegative(a.PerCallUSD) {
+			return fmt.Errorf("alias %q per_call_usd must be finite and non-negative", a.Alias)
+		}
+		if !validBillingMultiplier(a.BillingMultiplier) {
+			return fmt.Errorf("alias %q billing_multiplier must be a finite number greater than 0", a.Alias)
 		}
 	}
 
@@ -910,6 +960,9 @@ func normalizeConfig(cfg *Config) error {
 				if refs[firstIdx].PerCallUSD == nil && ref.PerCallUSD != nil {
 					refs[firstIdx].PerCallUSD = ref.PerCallUSD
 				}
+				if refs[firstIdx].BillingMultiplier == nil && ref.BillingMultiplier != nil {
+					refs[firstIdx].BillingMultiplier = ref.BillingMultiplier
+				}
 				continue
 			}
 			refSeen[lk] = len(refs)
@@ -929,17 +982,20 @@ func normalizeConfig(cfg *Config) error {
 				}
 				ref.BillingMode = &mode
 			}
-			if ref.InputPricePerMillion != nil && *ref.InputPricePerMillion < 0 {
-				return fmt.Errorf("key %q alias %q input_price override cannot be negative", key.ID, ref.Alias)
+			if ref.InputPricePerMillion != nil && !finiteNonNegative(*ref.InputPricePerMillion) {
+				return fmt.Errorf("key %q alias %q input_price override must be finite and non-negative", key.ID, ref.Alias)
 			}
-			if ref.OutputPricePerMillion != nil && *ref.OutputPricePerMillion < 0 {
-				return fmt.Errorf("key %q alias %q output_price override cannot be negative", key.ID, ref.Alias)
+			if ref.OutputPricePerMillion != nil && !finiteNonNegative(*ref.OutputPricePerMillion) {
+				return fmt.Errorf("key %q alias %q output_price override must be finite and non-negative", key.ID, ref.Alias)
 			}
-			if ref.CacheReadPricePerMillion != nil && *ref.CacheReadPricePerMillion < 0 {
-				return fmt.Errorf("key %q alias %q cache_read_price override cannot be negative", key.ID, ref.Alias)
+			if ref.CacheReadPricePerMillion != nil && !finiteNonNegative(*ref.CacheReadPricePerMillion) {
+				return fmt.Errorf("key %q alias %q cache_read_price override must be finite and non-negative", key.ID, ref.Alias)
 			}
-			if ref.PerCallUSD != nil && *ref.PerCallUSD < 0 {
-				return fmt.Errorf("key %q alias %q per_call_usd override cannot be negative", key.ID, ref.Alias)
+			if ref.PerCallUSD != nil && !finiteNonNegative(*ref.PerCallUSD) {
+				return fmt.Errorf("key %q alias %q per_call_usd override must be finite and non-negative", key.ID, ref.Alias)
+			}
+			if !validBillingMultiplier(ref.BillingMultiplier) {
+				return fmt.Errorf("key %q alias %q billing_multiplier override must be a finite number greater than 0", key.ID, ref.Alias)
 			}
 		}
 	}

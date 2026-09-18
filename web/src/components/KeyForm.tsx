@@ -58,6 +58,18 @@ interface PriceRow {
   // request and ignores the token prices (kept dormant for round-tripping).
   billing_mode: "tokens" | "per_call";
   per_call_usd: number;
+  billing_multiplier: number;
+}
+
+function emptyPriceRow(): PriceRow {
+  return {
+    input_price_per_million: 0,
+    output_price_per_million: 0,
+    cache_read_price_per_million: 0,
+    billing_mode: "tokens",
+    per_call_usd: 0,
+    billing_multiplier: 1,
+  };
 }
 
 // Price-map key. A model selected under different tiers (codex free vs team)
@@ -85,6 +97,7 @@ function applyPrices(models: ModelRule[], prices: Record<string, PriceRow>): Mod
       cache_read_price_per_million: row?.cache_read_price_per_million ?? 0,
       billing_mode: row?.billing_mode === "per_call" ? "per_call" : "tokens",
       per_call_usd: row?.per_call_usd ?? 0,
+      billing_multiplier: row?.billing_multiplier ?? 1,
     };
   });
 }
@@ -127,6 +140,7 @@ export default function KeyForm({
         cache_read_price_per_million: m.cache_read_price_per_million ?? 0,
         billing_mode: m.billing_mode === "per_call" ? "per_call" : "tokens",
         per_call_usd: m.per_call_usd ?? 0,
+        billing_multiplier: m.billing_multiplier ?? 1,
       };
     }
     return out;
@@ -190,6 +204,7 @@ export default function KeyForm({
         output_price_per_million: a.output_price_per_million ?? 0,
         cache_read_price_per_million: a.cache_read_price_per_million ?? 0,
         per_call_usd: a.per_call_usd ?? 0,
+        billing_multiplier: a.billing_multiplier ?? 1,
       }));
       setModels((prev) => {
         // Drop any partial entries for this alias first, then append all targets.
@@ -205,6 +220,7 @@ export default function KeyForm({
             cache_read_price_per_million: a.cache_read_price_per_million ?? 0,
             billing_mode: a.billing_mode === "per_call" ? "per_call" : "tokens",
             per_call_usd: a.per_call_usd ?? 0,
+            billing_multiplier: a.billing_multiplier ?? 1,
           };
         }
         return next;
@@ -242,7 +258,7 @@ export default function KeyForm({
       const updated: Record<string, PriceRow> = {};
       for (const m of next) {
         const key = priceKey(m);
-        updated[key] = prev[key] ?? { input_price_per_million: 0, output_price_per_million: 0, cache_read_price_per_million: 0, billing_mode: "tokens", per_call_usd: 0 };
+        updated[key] = prev[key] ?? emptyPriceRow();
       }
       // Rows for (group,alias) pairs no longer selected simply aren't copied.
       return updated;
@@ -254,7 +270,7 @@ export default function KeyForm({
     setPrices((prev) => ({
       ...prev,
       [key]: {
-        ...(prev[key] ?? { input_price_per_million: 0, output_price_per_million: 0, cache_read_price_per_million: 0, billing_mode: "tokens", per_call_usd: 0 }),
+        ...(prev[key] ?? emptyPriceRow()),
         [field]: field === "billing_mode" ? (value === "per_call" ? "per_call" : "tokens") : parseNum(value),
       },
     }));
@@ -279,6 +295,7 @@ export default function KeyForm({
         // dormant until the user switches back to tokens).
         billing_mode: prev[key]?.billing_mode ?? "tokens",
         per_call_usd: prev[key]?.per_call_usd ?? 0,
+        billing_multiplier: prev[key]?.billing_multiplier ?? 1,
       },
     }));
   };
@@ -330,6 +347,13 @@ export default function KeyForm({
       setLocalErr(t("keyForm.idRequired"));
       return;
     }
+    if (models.some((model) => {
+      const multiplier = prices[priceKey(model)]?.billing_multiplier ?? 1;
+      return !Number.isFinite(multiplier) || multiplier <= 0;
+    })) {
+      setLocalErr(t("keyForm.billingMultiplierInvalid"));
+      return;
+    }
     const pricedModels = buildPricedModels();
     setBusy(true);
     try {
@@ -375,13 +399,7 @@ export default function KeyForm({
       const groupsUnion = groupsUnionRaw.length
         ? groupsUnionRaw.map((g) => formatTierLabel(t, g)).join(", ")
         : "—";
-    const row = prices[key] ?? {
-      input_price_per_million: 0,
-      output_price_per_million: 0,
-      cache_read_price_per_million: 0,
-      billing_mode: "tokens" as const,
-      per_call_usd: 0,
-    };
+    const row = prices[key] ?? emptyPriceRow();
     const perCall = row.billing_mode === "per_call";
     // Community price hint only makes sense for a single target (one
     // target_model); for multi-target aliases the price is unified across
@@ -406,6 +424,16 @@ export default function KeyForm({
             >
               {t("keyForm.billingPerCall")}
             </button>
+          </div>
+          <div className="form-row">
+            <label title={t("keyForm.colBillingMultiplierHint")}>{t("keyForm.colBillingMultiplier")}</label>
+            <input
+              className="input"
+              type="number"
+              step="any"
+              value={row.billing_multiplier}
+              onChange={(e) => setPrice(m, "billing_multiplier", e.target.value)}
+            />
           </div>
           {perCall ? (
             <div className="form-row">
@@ -540,6 +568,16 @@ export default function KeyForm({
             </>
           )}
           <td>
+            <input
+              className="input"
+              type="number"
+              step="any"
+              value={row.billing_multiplier}
+              onChange={(e) => setPrice(m, "billing_multiplier", e.target.value)}
+              title={t("keyForm.colBillingMultiplierHint")}
+            />
+          </td>
+          <td>
             {!perCall && hint && (
               <button
                 type="button"
@@ -554,14 +592,14 @@ export default function KeyForm({
         </tr>
         {perCall && row.per_call_usd === 0 && (
           <tr className="muted">
-            <td colSpan={8} style={{ fontSize: "0.85em" }}>
+            <td colSpan={9} style={{ fontSize: "0.85em" }}>
               ⚠ {t("keyForm.perCallZeroWarn")}
             </td>
           </tr>
         )}
         {perCall && (
           <tr className="muted">
-            <td colSpan={8} style={{ fontSize: "0.85em" }}>
+            <td colSpan={9} style={{ fontSize: "0.85em" }}>
               ⚠ {t("keyForm.perCallImageWarn")}
             </td>
           </tr>
@@ -777,6 +815,7 @@ export default function KeyForm({
             </div>
           )}
           <p className="muted kf-hint" style={{ marginTop: 8 }}>{t("keyForm.priceLabel")}</p>
+          <p className="muted kf-hint">{t("keyForm.pricingSettlementHint")}</p>
         </section>}
       </div>
 
@@ -995,6 +1034,7 @@ export default function KeyForm({
                   <th>{t("keyForm.colInput")}</th>
                   <th>{t("keyForm.colOutput")}</th>
                   <th title={t("keyForm.colCacheReadHint")}>{t("keyForm.colCacheRead")}</th>
+                  <th title={t("keyForm.colBillingMultiplierHint")}>{t("keyForm.colBillingMultiplier")}</th>
                   <th title={t("keyForm.colRecommendHint")}>{t("keyForm.colRecommend")}</th>
                 </tr>
               </thead>
@@ -1006,6 +1046,7 @@ export default function KeyForm({
               </tbody>
             </table>
           </div>
+          <p className="muted kf-hint" style={{ marginTop: 8 }}>{t("keyForm.pricingSettlementHint")}</p>
         </div>
       )}
       </div>

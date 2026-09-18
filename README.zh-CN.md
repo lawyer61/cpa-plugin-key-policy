@@ -49,9 +49,11 @@
 | `target_model` | 上游真实模型 id |
 | `group` | 可选，限制用哪一类凭证（见下节） |
 | `dispatch` | `priority`（始终尝试第一个）或 `round-robin`（轮询） |
-| 计费 | `tokens`（百万 token 单价）或 `per_call`（每次固定金额） |
+| 计费 | `tokens`（百万 token 单价）或 `per_call`（每次固定金额），再应用一次正数 `billing_multiplier`（默认 `1`） |
 
 Key 可以**引用**别名，不必重复填目标。多目标别名会展开成多条同名规则；**同一次请求**里鉴权与路由共用同一次选择，保证 `group` 与真实目标一致。
+
+每个计费别名都有独立倍率；单个 Key 可对该别名覆盖。Key 倍率会替换全局倍率，不会叠乘。倍率只在请求结算入账时应用一次，不改变 token/调用次数，也不会重算历史用量。
 
 ### 凭证组：内置档位 + 自定义归类
 
@@ -306,6 +308,7 @@ curl -X POST "$CPA/v0/management/plugins/cpa-key-policy/aliases" \
     "alias": "cheap-chat",
     "dispatch": "priority",
     "billing_mode": "tokens",
+    "billing_multiplier": 1.5,
     "targets": [
       {"provider":"cerebras","target_model":"gpt-oss-120b"},
       {"provider":"codex","target_model":"gpt-5.6-luna","group":"free"}

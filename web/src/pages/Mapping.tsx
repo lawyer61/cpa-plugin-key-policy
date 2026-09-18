@@ -528,6 +528,7 @@ function AliasCard({ alias, onDelete, onEdit }: { alias: AliasMapping; onDelete:
         ) : (
           <>{t("mapping.alias.input")} ${alias.input_price_per_million ?? 0} / {t("mapping.alias.output")} ${alias.output_price_per_million ?? 0} / {t("mapping.alias.cache")} ${alias.cache_read_price_per_million ?? 0} {t("mapping.alias.perMillion")}</>
         )}
+        {` · ${t("mapping.alias.multiplier")} ×${alias.billing_multiplier ?? 1}`}
       </div>
       <div className={"alias-refs" + (refCount === 0 ? " zero" : "")}>
         {refCount && refCount > 0 ? t("mapping.refs", { n: refCount }) : t("mapping.unreferenced")}
@@ -804,6 +805,7 @@ export function AliasEditForm() {
       output_price_per_million: 0,
       cache_read_price_per_million: 0,
       per_call_usd: 0,
+      billing_multiplier: 1,
     };
   });
   const [error, setError] = useState("");
@@ -843,10 +845,15 @@ export function AliasEditForm() {
   };
 
   const handleSave = async () => {
-    setSaving(true);
     setError("");
+    const multiplier = alias.billing_multiplier ?? 1;
+    if (!Number.isFinite(multiplier) || multiplier <= 0) {
+      setError(t("mapping.alias.multiplierInvalid"));
+      return;
+    }
+    setSaving(true);
     try {
-      await upsertAlias(alias);
+      await upsertAlias({ ...alias, billing_multiplier: multiplier });
       leaveForm(true);
     } catch (e: unknown) {
       setError(String(e));
@@ -936,6 +943,17 @@ export function AliasEditForm() {
             <span>{alias.billing_mode === "per_call" ? t("mapping.alias.perCall") : t("mapping.alias.tokens")}</span>
           </label>
         </div>
+        <div className="map-form-row">
+          <label title={t("mapping.alias.multiplierHint")}>{t("mapping.alias.multiplier")}</label>
+          <input
+            className="mono"
+            type="number"
+            step="any"
+            value={alias.billing_multiplier ?? 1}
+            onChange={(e) => setAlias({ ...alias, billing_multiplier: parseFloat(e.target.value) || 0 })}
+          />
+          <span className="muted">{t("mapping.alias.multiplierHint")}</span>
+        </div>
         {alias.billing_mode === "tokens" ? (
           <>
             <div className="map-form-row">
@@ -981,6 +999,7 @@ export function AliasEditForm() {
             />
           </div>
         )}
+        <p className="muted">{t("mapping.alias.pricingSettlementHint")}</p>
         {error && <div className="error">{error}</div>}
         <div className="map-form-foot">
           <button className="btn primary" onClick={handleSave} disabled={saving}>

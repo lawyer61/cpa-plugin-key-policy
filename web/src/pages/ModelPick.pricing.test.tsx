@@ -42,6 +42,7 @@ describe("ModelPick key pricing draft", () => {
       billing_mode: "tokens",
       input_price_per_million: 0.025,
       output_price_per_million: 0.10,
+      billing_multiplier: 1.5,
     };
     const keyDraft: KeyPublic = {
       id: "draft-key",
@@ -76,7 +77,9 @@ describe("ModelPick key pricing draft", () => {
     const state = JSON.parse(host.querySelector("#state-probe")?.textContent || "{}");
     expect(state.pickedModels[0].input_price_per_million).toBe(0.025);
     expect(state.pickedModels[0].output_price_per_million).toBe(0.10);
+    expect(state.pickedModels[0].billing_multiplier).toBe(1.5);
     expect(state.keyDraft.name).toBe("unsaved name");
     expect(state.keyDraft.models[0].input_price_per_million).toBe(0.025);
+    expect(state.keyDraft.models[0].billing_multiplier).toBe(1.5);
   });
 });

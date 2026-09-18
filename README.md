@@ -49,9 +49,11 @@ A reusable name like `fast` that expands to one or more **targets**:
 | `target_model` | Real upstream model id |
 | `group` | Optional credential filter (see [Credential groups](#credential-groups-tiers--classify)) |
 | `dispatch` | `priority` (always first usable target) or `round-robin` |
-| billing | `tokens` (per-million prices) or `per_call` (fixed USD) |
+| billing | `tokens` (per-million prices) or `per_call` (fixed USD), then one positive `billing_multiplier` (default `1`) |
 
 Keys can **reference** aliases instead of duplicating targets. Multi-target aliases expand to several rules with the same alias name; auth and routing share one pick per request so the `group` filter matches the chosen target.
+
+Each billing alias has a positive multiplier. A key may override it for that alias; the key value replaces the global value rather than stacking with it. The multiplier is applied once when the request settles, so token/call counters are unchanged and historical usage is never recalculated.
 
 ### Credential groups (tiers + classify)
 
@@ -318,6 +320,7 @@ curl -X POST "$CPA/v0/management/plugins/cpa-key-policy/aliases" \
     "alias": "cheap-chat",
     "dispatch": "priority",
     "billing_mode": "tokens",
+    "billing_multiplier": 1.5,
     "targets": [
       {"provider":"cerebras","target_model":"gpt-oss-120b"},
       {"provider":"codex","target_model":"gpt-5.6-luna","group":"free"}

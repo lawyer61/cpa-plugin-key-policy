@@ -54,6 +54,7 @@ plugins:
               provider: "codex"
               target_model: "gpt-5.6-luna"
               group: "free" # built-in tier; custom groups use classify:name
+              billing_multiplier: 1 # positive; applied once to the computed charge
             - alias: "compat-demo"
               provider: "cerebras" # openai-compatibility channel name
               target_model: "gpt-oss-120b"

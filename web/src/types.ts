@@ -23,6 +23,8 @@ export interface ModelRule {
   // billing_mode === "per_call". 0 is allowed (free calls). Only meaningful
   // under "per_call".
   per_call_usd?: number;
+  // Positive multiplier applied once to the computed token/per-call charge.
+  billing_multiplier?: number;
 }
 
 export interface UsageSummary {
@@ -389,6 +391,7 @@ export interface AliasMapping {
   output_price_per_million?: number;
   cache_read_price_per_million?: number;
   per_call_usd?: number;
+  billing_multiplier?: number;
 }
 
 // ClassifyRule is a user-defined credential classification rule.
@@ -409,6 +412,7 @@ export interface KeyAliasRef {
   output_price_per_million?: number | null;
   cache_read_price_per_million?: number | null;
   per_call_usd?: number | null;
+  billing_multiplier?: number | null;
 }
 
 // CredentialDescriptor is a normalized credential description for classify preview.
