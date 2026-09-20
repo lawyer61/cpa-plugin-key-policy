@@ -536,6 +536,7 @@ const (
 type quotaRosterEvaluation struct {
 	entry         HostAuthEntry
 	confirmed     bool
+	scopeEligible bool
 	queryEligible bool
 	fingerprint   string
 	planType      string
@@ -577,8 +578,9 @@ func (m *quotaManager) applyRoster(host HostClient, entries []HostAuthEntry, set
 		authID := strings.TrimSpace(entry.ID)
 		seen[authID] = struct{}{}
 		managed := evaluation.confirmed && authManagedByQuotaKeys(authID, evaluation.groups, keys)
-		activation := settings.QuotaActivationEnabled && evaluation.queryEligible && (settings.QuotaActivationScope == "all-codex" || managed)
-		maintenance := evaluation.queryEligible && (managed || activation)
+		configuredForActivation := settings.QuotaActivationEnabled && evaluation.scopeEligible && (settings.QuotaActivationScope == "all-codex" || managed)
+		maintenance := evaluation.scopeEligible && (managed || configuredForActivation)
+		activation := configuredForActivation && evaluation.queryEligible
 		runtime := m.runtime.Auths[authID]
 		if evaluation.confirmed && runtime.CredentialFingerprint != "" && runtime.CredentialFingerprint != evaluation.fingerprint {
 			runtime.Baselines = nil
@@ -599,7 +601,8 @@ func (m *quotaManager) applyRoster(host HostClient, entries []HostAuthEntry, set
 		runtime.InManagedPool = managed
 		runtime.InMaintenanceScope = maintenance
 		runtime.InActivationScope = activation
-		if !activation || !maintenance || evaluation.reason != "" || entry.Unavailable {
+		hardExclusion := evaluation.reason != "" && evaluation.reason != "host_unavailable"
+		if !activation || !maintenance || hardExclusion || (evaluation.reason == "host_unavailable" && !evaluation.queryEligible) {
 			resetActivationRecovery(&runtime.Activation)
 		}
 		runtime.LastRosterSeenAt = now
@@ -617,8 +620,11 @@ func (m *quotaManager) applyRoster(host HostClient, entries []HostAuthEntry, set
 			runtime.ExclusionReason = "out_of_scope"
 		}
 		m.runtime.Auths[authID] = runtime
-		if maintenance {
+		if maintenance && evaluation.queryEligible {
 			eligible = append(eligible, entry)
+		} else if maintenance && evaluation.reason == "host_unavailable" && !evaluation.entry.NextRetryAfter.IsZero() {
+			deferQuotaReviewUntil(&runtime, evaluation.entry.NextRetryAfter, now)
+			m.runtime.Auths[authID] = runtime
 		}
 	}
 	for authID, runtime := range m.runtime.Auths {
@@ -692,28 +698,83 @@ func confirmQuotaRosterEntry(host HostClient, entry HostAuthEntry, rules []polic
 	evaluation.entry.ID = authID
 	evaluation.entry.AuthIndex = entry.AuthIndex
 	evaluation.confirmed = true
+	evaluation.scopeEligible = true
 	evaluation.queryEligible = true
 	evaluation.fingerprint = codexCredentialFingerprint(credentials)
 	evaluation.credentials = credentials
 	evaluation.planType = strings.ToLower(strings.TrimSpace(attributes["plan_type"]))
 	evaluation.groups = policy.GroupsForCredential("codex", attributes, authID, rules)
 	disabled := entry.Disabled || live.Disabled || strings.EqualFold(strings.TrimSpace(entry.Status), "disabled") || strings.EqualFold(strings.TrimSpace(live.Status), "disabled")
-	unavailable := entry.Unavailable || live.Unavailable
+	unavailable, queryEligible, nextRetryAfter := quotaHostUnavailableState(entry, live, now)
+	evaluation.entry.Unavailable = unavailable
+	if unavailable {
+		evaluation.entry.NextRetryAfter = nextRetryAfter
+	}
 	switch {
 	case disabled:
+		evaluation.scopeEligible = false
 		evaluation.queryEligible = false
 		evaluation.reason = "disabled"
-	case unavailable:
-		evaluation.queryEligible = false
-		evaluation.reason = "host_unavailable"
 	case codexAuthUsesUnsupportedProxy(doc.JSON):
+		evaluation.scopeEligible = false
 		evaluation.queryEligible = false
 		evaluation.reason = "per_auth_proxy_unsupported"
 	case codexCredentialsExpired(credentials, now):
+		evaluation.scopeEligible = false
 		evaluation.queryEligible = false
 		evaluation.reason = "access_token_expired"
+	case unavailable:
+		evaluation.queryEligible = queryEligible
+		evaluation.reason = "host_unavailable"
 	}
 	return evaluation
+}
+
+func quotaHostUnavailableState(entry, live HostAuthEntry, now time.Time) (unavailable, queryEligible bool, nextRetryAfter time.Time) {
+	queryEligible = true
+	for _, candidate := range []HostAuthEntry{entry, live} {
+		if !candidate.Unavailable {
+			continue
+		}
+		unavailable = true
+		if candidate.NextRetryAfter.IsZero() {
+			queryEligible = false
+			continue
+		}
+		if candidate.NextRetryAfter.After(nextRetryAfter) {
+			nextRetryAfter = candidate.NextRetryAfter
+		}
+		if candidate.NextRetryAfter.After(now) {
+			queryEligible = false
+		}
+	}
+	return unavailable, queryEligible, nextRetryAfter
+}
+
+func quotaExpiredHostUnavailable(entry HostAuthEntry, now time.Time) bool {
+	return entry.Unavailable && !entry.NextRetryAfter.IsZero() && !entry.NextRetryAfter.After(now)
+}
+
+func quotaActivationCanUseExpiredHostUnavailable(entry, live HostAuthEntry, observation quotaObservation, now time.Time) bool {
+	if !observation.ExplicitAvailable || !observation.knownPositive() {
+		return false
+	}
+	for _, candidate := range []HostAuthEntry{entry, live} {
+		if candidate.Unavailable && !quotaExpiredHostUnavailable(candidate, now) {
+			return false
+		}
+	}
+	return entry.Unavailable || live.Unavailable
+}
+
+func deferQuotaReviewUntil(runtime *quotaAuthRuntime, deadline, now time.Time) {
+	if runtime == nil || deadline.IsZero() {
+		return
+	}
+	if runtime.NextCheckAt.IsZero() || !runtime.NextCheckAt.After(now) || runtime.NextCheckAt.Before(deadline) {
+		runtime.NextCheckAt = deadline
+	}
+	alignActivationDeadline(runtime)
 }
 
 func authManagedByQuotaKeys(authID string, authGroups []string, keys []policy.KeyConfig) bool {
@@ -864,6 +925,14 @@ func (m *quotaManager) refreshAuth(host HostClient, rosterEntry HostAuthEntry, s
 		m.setAuthError(rosterEntry.ID, "disabled_or_unsupported", errors.New("runtime auth is not an enabled Codex credential"))
 		return
 	}
+	unavailable, queryEligible, retryAt := quotaHostUnavailableState(rosterEntry, live, now)
+	if unavailable && !queryEligible {
+		m.pauseHostUnavailableReview(rosterEntry.ID)
+		if retryAt.After(nextCheck) {
+			nextCheck = retryAt
+		}
+		return
+	}
 	doc, err := host.GetAuth(rosterEntry.AuthIndex)
 	if err != nil {
 		m.setAuthError(rosterEntry.ID, "credential_unavailable", err)
@@ -905,10 +974,11 @@ func (m *quotaManager) refreshAuth(host HostClient, rosterEntry HostAuthEntry, s
 	}
 	nextCheck = decisionAt.Add(interval)
 	lazy := m.processObservation(rosterEntry.ID, rosterEntry.AuthIndex, fingerprint, observation, decisionAt)
-	if len(lazy) == 0 || !settings.QuotaActivationEnabled || !m.authActivationAllowed(rosterEntry.ID) {
+	allowExpiredHostUnavailable := quotaActivationCanUseExpiredHostUnavailable(rosterEntry, live, observation, decisionAt)
+	if len(lazy) == 0 || !settings.QuotaActivationEnabled || !m.authActivationAllowed(rosterEntry.ID, allowExpiredHostUnavailable) {
 		return
 	}
-	m.tryActivate(host, rosterEntry, credentials, lazy, decisionAt)
+	m.tryActivate(host, rosterEntry, credentials, lazy, decisionAt, allowExpiredHostUnavailable)
 }
 
 type quotaHTTPError struct {
@@ -1162,8 +1232,8 @@ func quotaCycleID(fingerprint string, baselines map[quotaWindowKind]quotaWindowB
 	return hex.EncodeToString(sum[:16])
 }
 
-func (m *quotaManager) tryActivate(host HostClient, rosterEntry HostAuthEntry, credentials codexCredentials, lazy []quotaWindowKind, now time.Time) {
-	if !m.authActivationAllowed(rosterEntry.ID) {
+func (m *quotaManager) tryActivate(host HostClient, rosterEntry HostAuthEntry, credentials codexCredentials, lazy []quotaWindowKind, now time.Time, allowExpiredHostUnavailable bool) {
+	if !m.authActivationAllowed(rosterEntry.ID, allowExpiredHostUnavailable) {
 		return
 	}
 	live, err := host.GetAuthRuntime(rosterEntry.AuthIndex)
@@ -1171,7 +1241,8 @@ func (m *quotaManager) tryActivate(host HostClient, rosterEntry HostAuthEntry, c
 	if provider == "" {
 		provider = live.Type
 	}
-	if err != nil || (live.ID != "" && live.ID != rosterEntry.ID) || !strings.EqualFold(strings.TrimSpace(provider), "codex") || live.Disabled || live.Unavailable || strings.EqualFold(strings.TrimSpace(live.Status), "disabled") {
+	liveUnavailable := live.Unavailable && !(allowExpiredHostUnavailable && quotaExpiredHostUnavailable(live, now))
+	if err != nil || (live.ID != "" && live.ID != rosterEntry.ID) || !strings.EqualFold(strings.TrimSpace(provider), "codex") || live.Disabled || liveUnavailable || strings.EqualFold(strings.TrimSpace(live.Status), "disabled") {
 		m.setAuthActivationDeferred(rosterEntry.ID, "auth_revalidation_failed", now.Add(30*time.Minute))
 		return
 	}
@@ -1245,7 +1316,7 @@ func (m *quotaManager) tryActivate(host HostClient, rosterEntry HostAuthEntry, c
 		release()
 		return
 	}
-	if !m.authActivationAllowed(rosterEntry.ID) {
+	if !m.authActivationAllowed(rosterEntry.ID, allowExpiredHostUnavailable) {
 		release()
 		m.mu.Lock()
 		runtime = m.runtime.Auths[rosterEntry.ID]
@@ -1411,7 +1482,7 @@ func (m *quotaManager) waitVerifyDelay() bool {
 	}
 }
 
-func (m *quotaManager) authActivationAllowed(authID string) bool {
+func (m *quotaManager) authActivationAllowed(authID string, allowExpiredHostUnavailable bool) bool {
 	settings := m.store.RuntimeSettings()
 	if !settings.QuotaActivationEnabled {
 		return false
@@ -1419,7 +1490,7 @@ func (m *quotaManager) authActivationAllowed(authID string) bool {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	runtime := m.runtime.Auths[authID]
-	if m.persistenceBlocked || !runtime.InMaintenanceScope || runtime.ExclusionReason == "disabled_or_unresolvable" || runtime.ExclusionReason == "host_unavailable" {
+	if m.persistenceBlocked || !runtime.InMaintenanceScope || !runtime.InActivationScope || runtime.ExclusionReason == "disabled_or_unresolvable" || (runtime.ExclusionReason == "host_unavailable" && !allowExpiredHostUnavailable) {
 		return false
 	}
 	if settings.QuotaActivationScope == "all-codex" {
@@ -1439,6 +1510,17 @@ func (m *quotaManager) setNextCheck(authID string, next time.Time) {
 	runtime := m.runtime.Auths[authID]
 	runtime.NextCheckAt = next
 	alignActivationDeadline(&runtime)
+	m.runtime.Auths[authID] = runtime
+	m.mu.Unlock()
+}
+
+func (m *quotaManager) pauseHostUnavailableReview(authID string) {
+	m.mu.Lock()
+	runtime := m.runtime.Auths[authID]
+	runtime.QueryEligible = false
+	runtime.InActivationScope = false
+	runtime.ExclusionReason = "host_unavailable"
+	resetActivationRecovery(&runtime.Activation)
 	m.runtime.Auths[authID] = runtime
 	m.mu.Unlock()
 }
@@ -1611,6 +1693,7 @@ func (m *quotaManager) status() map[string]any {
 			"provider":             runtime.Provider,
 			"status":               runtime.Status,
 			"observable":           true,
+			"query_eligible":       runtime.QueryEligible,
 			"in_managed_pool":      runtime.InManagedPool,
 			"in_maintenance_scope": runtime.InMaintenanceScope,
 			"in_activation_scope":  runtime.InActivationScope,
