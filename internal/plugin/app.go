@@ -324,7 +324,7 @@ func (a *App) interceptRequestAfter(raw []byte) ([]byte, error) {
 		return OKEnvelope(requestRejection(http.StatusUnauthorized, "key_disabled", "cpa-key-policy: configured key was disabled or removed before execution"))
 	}
 	authID := metadataString(req.Metadata, "selected_auth_id")
-	proposalKey := schedulerAffinityProposalKey(key.ID, req.RequestedModel, authID, req.Metadata)
+	proposalKey := schedulerAffinityProposalKey(key.ID, req.RequestedModel, authID, req.Metadata, key.AccountBinding != nil)
 	if authID == "" {
 		a.affinity.resolveProposal(proposalKey, false)
 		return OKEnvelope(requestRejectionWithType(http.StatusServiceUnavailable, "service_unavailable", "selected_auth_unavailable", "cpa-key-policy: host did not expose the selected auth id"))
@@ -595,7 +595,7 @@ func (a *App) pickScheduler(raw []byte) ([]byte, error) {
 	if key != nil && key.SessionAffinity && sessionID != "" {
 		affinityKey := schedulerAffinityKey(req, key, group, globalMode, sessionID)
 		proposalKey := func(authID string) string {
-			return schedulerAffinityProposalKey(key.ID, schedulerRequestedModel(req.Options.Metadata), authID, req.Options.Metadata)
+			return schedulerAffinityProposalKey(key.ID, schedulerRequestedModel(req.Options.Metadata), authID, req.Options.Metadata, binding != nil)
 		}
 		a.selectionMu.Lock()
 		if authID, ok := a.affinity.use(affinityKey, availableIDs, proposalKey); ok {
@@ -667,7 +667,7 @@ func schedulerAffinityKey(req SchedulerPickRequest, key *policy.KeyConfig, group
 // schedulerAffinityProposalKey contains only data available in both
 // scheduler.pick and request.intercept_after. It intentionally hashes the
 // session identity and never stores a raw client key or request body.
-func schedulerAffinityProposalKey(owner, requestedModel, authID string, metadata map[string]any) string {
+func schedulerAffinityProposalKey(owner, requestedModel, authID string, metadata map[string]any, ignoreGroup bool) string {
 	sessionID := schedulerSessionID(metadata)
 	if strings.TrimSpace(owner) == "" || sessionID == "" {
 		return ""
@@ -675,6 +675,9 @@ func schedulerAffinityProposalKey(owner, requestedModel, authID string, metadata
 	sessionHash := sha256.Sum256([]byte(sessionID))
 	var route strings.Builder
 	for _, field := range []string{"request_path", "target_provider", "target_model", "group", "auth_selection_model", "pinned_auth_id"} {
+		if ignoreGroup && field == "group" {
+			continue
+		}
 		route.WriteString(strings.ToLower(metadataString(metadata, field)))
 		route.WriteByte(0)
 	}

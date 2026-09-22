@@ -63,10 +63,8 @@ type lookupQuotaView struct {
 }
 
 type lookupQuotaRoutes struct {
-	allowAnyGroup bool
-	groups        map[string]struct{}
-	hasCodex      bool
-	unsupported   []string
+	hasCodex    bool
+	unsupported []string
 }
 
 type manualQuotaRefreshResult struct {
@@ -136,12 +134,7 @@ func quotaOperationIdentity(fingerprint, authID string) string {
 }
 
 func lookupQuotaRoutesForKey(key policy.KeyConfig) lookupQuotaRoutes {
-	routes := lookupQuotaRoutes{groups: make(map[string]struct{})}
-	type routeKey struct {
-		alias string
-		model string
-	}
-	groupSets := make(map[routeKey]map[string]struct{})
+	routes := lookupQuotaRoutes{}
 	unsupported := make(map[string]struct{})
 	for _, model := range key.Models {
 		provider := strings.ToLower(strings.TrimSpace(model.Provider))
@@ -156,26 +149,7 @@ func lookupQuotaRoutesForKey(key policy.KeyConfig) lookupQuotaRoutes {
 		if alias == "" || target == "" {
 			continue
 		}
-		key := routeKey{alias: alias, model: target}
-		groups := groupSets[key]
-		if groups == nil {
-			groups = make(map[string]struct{})
-			groupSets[key] = groups
-		}
-		groups[strings.ToLower(strings.TrimSpace(model.Group))] = struct{}{}
-	}
-	for _, groups := range groupSets {
-		if len(groups) != 1 {
-			continue
-		}
 		routes.hasCodex = true
-		for group := range groups {
-			if group == "" {
-				routes.allowAnyGroup = true
-			} else {
-				routes.groups[group] = struct{}{}
-			}
-		}
 	}
 	for provider := range unsupported {
 		routes.unsupported = append(routes.unsupported, provider)
@@ -193,7 +167,7 @@ func publicUnsupportedProvider(provider string) string {
 	}
 }
 
-func quotaKeyAllowsAuth(key policy.KeyConfig, authID string, groups []string) bool {
+func quotaKeyAllowsAuth(key policy.KeyConfig, authID string) bool {
 	if !key.Enabled || key.Native || key.AccountBinding == nil || len(key.AccountBinding.Allow) == 0 || !key.AccountBinding.Matches(authID) {
 		return false
 	}
@@ -201,15 +175,7 @@ func quotaKeyAllowsAuth(key policy.KeyConfig, authID string, groups []string) bo
 	if !routes.hasCodex {
 		return false
 	}
-	if routes.allowAnyGroup {
-		return true
-	}
-	for _, group := range groups {
-		if _, ok := routes.groups[strings.ToLower(strings.TrimSpace(group))]; ok {
-			return true
-		}
-	}
-	return false
+	return true
 }
 
 func (m *quotaManager) lookupQuotaView(key policy.KeyConfig, transportAvailable bool) lookupQuotaView {
@@ -258,7 +224,7 @@ func (m *quotaManager) lookupQuotaView(key policy.KeyConfig, transportAvailable 
 		if !runtime.RosterConfirmed || runtime.Provider != "codex" || runtime.CredentialFingerprint == "" || !runtime.LastRosterSeenAt.Equal(lastRosterSync) {
 			continue
 		}
-		if !quotaKeyAllowsAuth(key, authID, runtime.Groups) {
+		if !quotaKeyAllowsAuth(key, authID) {
 			continue
 		}
 		observation, _ := m.cache.get(authID)
@@ -582,7 +548,7 @@ func (m *quotaManager) executeManualQuotaRefresh(token string, target lookupQuot
 		return manualQuotaRefreshResult{status: http.StatusNotFound, code: "quota_account_inaccessible", message: "quota account is not accessible"}
 	}
 	current := m.store.FindByAPIKey(token)
-	if current == nil || !current.Enabled || current.Native || !current.AllowQuotaRefresh || !quotaKeyAllowsAuth(*current, target.authID, evaluation.groups) {
+	if current == nil || !current.Enabled || current.Native || !current.AllowQuotaRefresh || !quotaKeyAllowsAuth(*current, target.authID) {
 		return manualQuotaRefreshResult{status: http.StatusNotFound, code: "quota_account_inaccessible", message: "quota account is not accessible"}
 	}
 	observation, statusCode, err := fetchCodexQuotaWithCallback(host, evaluation.credentials, m.now, hostCallbackID)
@@ -606,7 +572,7 @@ func (m *quotaManager) executeManualQuotaRefresh(token string, target lookupQuot
 		return manualQuotaRefreshResult{status: http.StatusNotFound, code: "quota_account_inaccessible", message: "quota account is not accessible"}
 	}
 	current = m.store.FindByAPIKey(token)
-	if current == nil || !current.Enabled || current.Native || !current.AllowQuotaRefresh || !quotaKeyAllowsAuth(*current, target.authID, post.groups) {
+	if current == nil || !current.Enabled || current.Native || !current.AllowQuotaRefresh || !quotaKeyAllowsAuth(*current, target.authID) {
 		return manualQuotaRefreshResult{status: http.StatusNotFound, code: "quota_account_inaccessible", message: "quota account is not accessible"}
 	}
 	observation.AuthIndex = post.entry.AuthIndex

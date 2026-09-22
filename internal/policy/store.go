@@ -676,6 +676,9 @@ func (s *Store) resolveRuleForAlias(key *KeyConfig, requested string) (ModelRule
 	if len(matches) == 0 {
 		return ModelRule{}, false
 	}
+	if key.AccountBinding != nil {
+		matches = boundRouteRules(matches)
+	}
 	if len(matches) == 1 {
 		return matches[0], true
 	}
@@ -694,6 +697,26 @@ func (s *Store) resolveRuleForAlias(key *KeyConfig, requested string) (ModelRule
 	}
 	s.rrCounters[aliasName] = (idx + 1) % len(matches)
 	return matches[idx], true
+}
+
+// boundRouteRules makes an explicit account binding the complete credential
+// boundary. Group-only duplicates collapse to one provider/model route, and
+// the surviving rule carries no group into scheduler metadata or affinity.
+func boundRouteRules(matches []ModelRule) []ModelRule {
+	seen := make(map[string]struct{}, len(matches))
+	result := make([]ModelRule, 0, len(matches))
+	for _, rule := range matches {
+		routeKey := strings.ToLower(strings.TrimSpace(rule.Alias)) + "\x00" +
+			strings.ToLower(strings.TrimSpace(rule.Provider)) + "\x00" +
+			strings.ToLower(strings.TrimSpace(rule.TargetModel))
+		if _, ok := seen[routeKey]; ok {
+			continue
+		}
+		seen[routeKey] = struct{}{}
+		rule.Group = ""
+		result = append(result, rule)
+	}
+	return result
 }
 
 func pendingPickKey(keyID, alias string) string {
@@ -1152,14 +1175,22 @@ func SchedulerGroupForKey(key *KeyConfig, requested, provider, model string) (st
 		return "", fmt.Errorf("requested model, provider, and target model are required (requested=%q provider=%q model=%q)", requested, provider, model)
 	}
 	groups := make(map[string]struct{})
+	matched := false
 	for _, rule := range key.Models {
 		if !strings.EqualFold(rule.Alias, requested) || !schedulerProviderMatches(rule.Provider, provider) || !strings.EqualFold(rule.TargetModel, model) {
 			continue
 		}
+		matched = true
+		if key.AccountBinding != nil {
+			continue
+		}
 		groups[strings.ToLower(strings.TrimSpace(rule.Group))] = struct{}{}
 	}
-	if len(groups) == 0 {
+	if !matched {
 		return "", fmt.Errorf("no configured target matches alias %q, provider %q, model %q", requested, provider, model)
+	}
+	if key.AccountBinding != nil {
+		return "", nil
 	}
 	if len(groups) > 1 {
 		return "", fmt.Errorf("target is ambiguous across %d credential groups", len(groups))

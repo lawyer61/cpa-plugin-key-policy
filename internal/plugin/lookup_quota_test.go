@@ -122,11 +122,21 @@ func TestLookupQuotaUsesRosterBindingAndStaticRouteIntersection(t *testing.T) {
 	app.quota.cache.observe(teamID, "idx-team", "passive-http", observation)
 
 	first := lookupQuotaPayloadForTest(t, lookupRequestWithCallbackForTest(t, app, secret, "callback-1"))
-	if first.AuthQuotas.Status != "ready" || len(first.AuthQuotas.Accounts) != 1 {
+	if first.AuthQuotas.Status != "ready" || len(first.AuthQuotas.Accounts) != 2 {
 		t.Fatalf("auth quotas=%#v", first.AuthQuotas)
 	}
-	account := first.AuthQuotas.Accounts[0]
-	if account.Tier != "team" || account.Provider != "codex" || account.Ref == "" || account.Label == "" || account.Short == nil || account.Long == nil {
+	var account lookupAuthQuotaAccount
+	tiers := map[string]bool{}
+	for _, candidate := range first.AuthQuotas.Accounts {
+		tiers[candidate.Tier] = true
+		if candidate.Tier == "team" {
+			account = candidate
+		}
+	}
+	if !tiers["team"] || !tiers["free"] {
+		t.Fatalf("bound groups were not all visible: %#v", first.AuthQuotas.Accounts)
+	}
+	if account.Provider != "codex" || account.Ref == "" || account.Label == "" || account.Short == nil || account.Long == nil {
 		t.Fatalf("account=%#v", account)
 	}
 	if account.Short.UsedPercent == nil || *account.Short.UsedPercent != 10 || account.Long.UsedPercent == nil || *account.Long.UsedPercent != 25 {
@@ -139,7 +149,11 @@ func TestLookupQuotaUsesRosterBindingAndStaticRouteIntersection(t *testing.T) {
 		}
 	}
 	second := lookupQuotaPayloadForTest(t, lookupRequestWithCallbackForTest(t, app, secret, "callback-3"))
-	if second.AuthQuotas.Accounts[0].Ref != account.Ref {
+	secondRefs := map[string]bool{}
+	for _, candidate := range second.AuthQuotas.Accounts {
+		secondRefs[candidate.Ref] = true
+	}
+	if !secondRefs[account.Ref] {
 		t.Fatal("anonymous auth reference changed between reads")
 	}
 
@@ -155,7 +169,7 @@ func TestLookupQuotaUsesRosterBindingAndStaticRouteIntersection(t *testing.T) {
 		t.Fatal(err)
 	}
 	other := lookupQuotaPayloadForTest(t, lookupRequestWithCallbackForTest(t, app, otherSecret, "callback-4"))
-	if len(other.AuthQuotas.Accounts) != 1 || other.AuthQuotas.Accounts[0].Ref == account.Ref {
+	if len(other.AuthQuotas.Accounts) != 2 || other.AuthQuotas.Accounts[0].Ref == account.Ref || other.AuthQuotas.Accounts[1].Ref == account.Ref {
 		t.Fatalf("cross-key anonymous refs were linkable: %#v", other.AuthQuotas.Accounts)
 	}
 }
@@ -213,9 +227,10 @@ func TestLookupQuotaDeduplicatesOneUpstreamAccountAcrossAuthFiles(t *testing.T) 
 	}
 }
 
-func TestLookupQuotaStaticRoutesFailClosedOnAmbiguousTarget(t *testing.T) {
+func TestLookupQuotaStaticRoutesAcceptBoundSameTargetGroups(t *testing.T) {
 	key := policy.KeyConfig{
-		Enabled: true,
+		Enabled:        true,
+		AccountBinding: &policy.AccountBinding{Allow: []string{"account-*"}},
 		Models: []policy.ModelRule{
 			{Alias: "fast", Provider: "codex", TargetModel: "same", Group: "team"},
 			{Alias: "fast", Provider: "codex", TargetModel: "same", Group: "plus"},
@@ -224,17 +239,8 @@ func TestLookupQuotaStaticRoutesFailClosedOnAmbiguousTarget(t *testing.T) {
 		},
 	}
 	routes := lookupQuotaRoutesForKey(key)
-	if !routes.hasCodex || routes.allowAnyGroup {
+	if !routes.hasCodex {
 		t.Fatalf("routes=%#v", routes)
-	}
-	if _, ok := routes.groups["team"]; ok {
-		t.Fatal("ambiguous team/plus target granted a static route")
-	}
-	if _, ok := routes.groups["plus"]; ok {
-		t.Fatal("ambiguous team/plus target granted a static route")
-	}
-	if _, ok := routes.groups["free"]; !ok {
-		t.Fatal("independent unambiguous route was not retained")
 	}
 	if len(routes.unsupported) != 1 || routes.unsupported[0] != "antigravity" {
 		t.Fatalf("unsupported providers=%v", routes.unsupported)
@@ -432,6 +438,27 @@ func TestLookupManualQuotaRefreshUpdatesSharedCacheWithoutActivation(t *testing.
 	_, gets, _ = host.counts()
 	if gets != 1 {
 		t.Fatalf("cooldown sent another GET: %d", gets)
+	}
+}
+
+func TestLookupManualQuotaRefreshIgnoresBoundRouteGroup(t *testing.T) {
+	clock := time.Date(2030, 9, 15, 11, 30, 0, 0, time.UTC)
+	host := newFakeQuotaHost(clock)
+	host.documents["idx-a"] = HostAuthDocument{AuthIndex: "idx-a", JSON: quotaCredentialJSON(clock, "plus", "acct-a", "access-a", "refresh-a")}
+	host.getResponses = []HostHTTPResponse{{StatusCode: http.StatusOK, Body: quotaBody(clock, 35)}}
+	app, secret := prepareLookupQuotaApp(t, true, &clock, host)
+
+	payload := lookupQuotaPayloadForTest(t, lookupRequestWithCallbackForTest(t, app, secret, "lookup-callback"))
+	if len(payload.AuthQuotas.Accounts) != 1 || payload.AuthQuotas.Accounts[0].Tier != "plus" {
+		t.Fatalf("bound plus account hidden by team route group: %#v", payload.AuthQuotas.Accounts)
+	}
+	response := quotaRefreshRequestForTest(t, app, secret, payload.AuthQuotas.Accounts[0].Ref, "refresh-callback")
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("refresh status=%d body=%s", response.StatusCode, response.Body)
+	}
+	_, gets, posts := host.counts()
+	if gets != 1 || posts != 0 {
+		t.Fatalf("manual refresh made GET=%d POST=%d", gets, posts)
 	}
 }
 

@@ -86,7 +86,7 @@ func TestQuotaFillFirstPreservesReadyAffinityAndRebindsWhenUnknown(t *testing.T)
 	if first != "account-a-2" {
 		t.Fatalf("first = %q", first)
 	}
-	proposal := schedulerAffinityProposalKey("bound-key", "fast", first, request.Options.Metadata)
+	proposal := schedulerAffinityProposalKey("bound-key", "fast", first, request.Options.Metadata, true)
 	app.affinity.resolveProposal(proposal, true)
 	seedQuotaForTest(app, "account-a-1", now.Add(time.Second), now.Add(30*time.Minute), 10, nil)
 	if got := schedulerPickForTest(t, app, request).AuthID; got != first {

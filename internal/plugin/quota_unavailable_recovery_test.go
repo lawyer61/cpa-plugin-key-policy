@@ -231,6 +231,7 @@ func TestQuotaExpiredHostUnavailablePreservesActivationRecovery(t *testing.T) {
 	}
 
 	now := time.Date(2026, 9, 19, 10, 0, 0, 0, time.UTC)
+	app.quota.now = func() time.Time { return now }
 	host := newFakeQuotaHost(now)
 	entry := host.entries[0]
 	entry.Status = "error"

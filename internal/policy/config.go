@@ -112,8 +112,10 @@ type ModelRule struct {
 	Alias       string `yaml:"alias" json:"alias"`
 	Provider    string `yaml:"provider" json:"provider"`
 	TargetModel string `yaml:"target_model" json:"target_model"`
-	// Group optionally narrows which auth files serve this alias. Empty means
-	// "any file for the provider" (legacy behavior). The planner sets it for
+	// Group optionally narrows which auth files serve this alias when the key
+	// has no explicit AccountBinding. Bound keys treat the allow-list as the
+	// complete credential boundary and ignore this field. Empty means "any file
+	// for the provider" (legacy behavior). The planner sets it for
 	// providers whose auth files carry a tier/plan identity (codex plan_type,
 	// antigravity tier) so the plugin's Scheduler can filter candidates by that
 	// attribute. Format: "<plan>" (e.g. "free", "team", "plus") or "supported"

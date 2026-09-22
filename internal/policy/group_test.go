@@ -169,6 +169,68 @@ func TestAuthenticateAndRouteShareMultiTargetGroup(t *testing.T) {
 	}
 }
 
+// Explicit account bindings make the credential allow-list the complete
+// account boundary. Targets that differ only by group collapse to one route,
+// while genuinely different provider/model routes keep their dispatch order.
+func TestBoundAuthenticateAndRouteIgnoreAndDeduplicateGroups(t *testing.T) {
+	store := NewStore()
+	plain := "bound-multi-group-key"
+	hash, err := HashKey(plain)
+	if err != nil {
+		t.Fatal(err)
+	}
+	multiplier := 1.5
+	if err := store.Configure(Config{
+		Enabled:   true,
+		StateFile: filepath.Join(t.TempDir(), "state.json"),
+		Aliases: []AliasMapping{{
+			Alias:    "mixed",
+			Dispatch: "round-robin",
+			Targets: []AliasTarget{
+				{Provider: "codex", TargetModel: "gpt-5.6-luna", Group: "team"},
+				{Provider: "codex", TargetModel: "gpt-5.6-luna", Group: "plus"},
+				{Provider: "codex", TargetModel: "gpt-5.6-luna", Group: "pro"},
+				{Provider: "codex", TargetModel: "gpt-5.6-terra", Group: "classify:custom"},
+			},
+			InputPricePerMillion: 2.5,
+			BillingMultiplier:    &multiplier,
+		}},
+		Keys: []KeyConfig{{
+			ID: "k", Enabled: true, KeyHash: hash,
+			AccountBinding: &AccountBinding{Allow: []string{"account-*"}, Strategy: BindingStrategyRoundRobin},
+			Aliases:        []KeyAliasRef{{Alias: "mixed"}},
+		}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	hdr := http.Header{"Authorization": {"Bearer " + plain}}
+	body := []byte(`{"model":"mixed"}`)
+	wantModels := []string{"gpt-5.6-luna", "gpt-5.6-terra", "gpt-5.6-luna", "gpt-5.6-terra"}
+	for i, wantModel := range wantModels {
+		dec := store.Authenticate("POST", "/v1/responses", hdr, nil, body)
+		if !dec.Allowed {
+			t.Fatalf("auth %d: expected allowed, got %+v", i, dec)
+		}
+		rule, keyID, ok := store.Route(hdr, nil, "mixed")
+		if !ok || keyID != "k" {
+			t.Fatalf("route %d: expected ok key=k, got ok=%v key=%q", i, ok, keyID)
+		}
+		if dec.Rule.Group != "" || rule.Group != "" {
+			t.Fatalf("call %d retained group: auth=%q route=%q", i, dec.Rule.Group, rule.Group)
+		}
+		if dec.Rule.TargetModel != wantModel || rule.TargetModel != wantModel {
+			t.Fatalf("call %d target auth=%q route=%q, want %q", i, dec.Rule.TargetModel, rule.TargetModel, wantModel)
+		}
+		if rule.InputPricePerMillion != 2.5 || rule.BillingMultiplier == nil || *rule.BillingMultiplier != multiplier {
+			t.Fatalf("call %d lost pricing: %+v", i, rule)
+		}
+	}
+	if group, err := SchedulerGroupForKey(store.FindByID("k"), "mixed", "codex", "gpt-5.6-luna"); err != nil || group != "" {
+		t.Fatalf("bound scheduler group = %q, err=%v", group, err)
+	}
+}
+
 // Priority multi-target always pins the first target's group on both auth and route.
 func TestAuthenticateAndRoutePriorityKeepsFirstGroup(t *testing.T) {
 	store := NewStore()

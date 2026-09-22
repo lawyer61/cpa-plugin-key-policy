@@ -369,8 +369,8 @@ func TestSchedulerAffinityFailsOverWithinAllowedPoolWhenStickyAuthIsFull(t *test
 	if key := app.store.FindByID("key-b"); key == nil || !key.SessionAffinity {
 		t.Fatalf("session affinity config not loaded: %+v", key)
 	}
-	schedulerProposalKey := schedulerAffinityProposalKey("key-b", "fast", firstPick.AuthID, request.Options.Metadata)
-	afterProposalKey := schedulerAffinityProposalKey("key-b", first.RequestedModel, firstPick.AuthID, first.Metadata)
+	schedulerProposalKey := schedulerAffinityProposalKey("key-b", "fast", firstPick.AuthID, request.Options.Metadata, true)
+	afterProposalKey := schedulerAffinityProposalKey("key-b", first.RequestedModel, firstPick.AuthID, first.Metadata, true)
 	if schedulerProposalKey != afterProposalKey {
 		t.Fatalf("proposal key mismatch: scheduler=%q after=%q", schedulerProposalKey, afterProposalKey)
 	}
@@ -378,8 +378,8 @@ func TestSchedulerAffinityFailsOverWithinAllowedPoolWhenStickyAuthIsFull(t *test
 	for name, value := range request.Options.Metadata {
 		otherRouteMetadata[name] = value
 	}
-	otherRouteMetadata["group"] = "other-tier"
-	if other := schedulerAffinityProposalKey("key-b", "fast", firstPick.AuthID, otherRouteMetadata); other == schedulerProposalKey {
+	otherRouteMetadata["target_model"] = "another-model"
+	if other := schedulerAffinityProposalKey("key-b", "fast", firstPick.AuthID, otherRouteMetadata, true); other == schedulerProposalKey {
 		t.Fatal("proposal correlation did not distinguish different route metadata")
 	}
 	if response := interceptForMethod(t, app, MethodRequestInterceptAfter, first); response.Terminate {

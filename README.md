@@ -64,16 +64,16 @@ Two sources of “which auth file may serve this request”:
 | **Built-in tier** (Codex `plan_type`, Antigravity `tier`) | e.g. Free tier / Team | bare name: `free`, `team`, `supported` |
 | **Custom classify rule** | e.g. **Custom · vip** | prefixed: `classify:vip` |
 
-**Runtime rule:** if a mapping sets a group, the plugin scheduler **only** picks auth files in that group. No match → hard failure (`auth_not_found`), never silently fall back to another tier.
+**Runtime rule:** for keys without `account_binding`, a mapping group restricts the scheduler to that credential group. For explicitly bound keys, `account_binding.allow` is the complete account boundary and all built-in/custom groups are ignored. No legal candidate → hard failure, never silently fall back outside the allowed pool.
 
 **Scheduling:** constraints are applied first. The plugin then keeps the highest available `Priority` tier and selects within that intersection:
 
 - Weight is read from the CPA credential candidate's `Weight`, `Attributes.weight`, or `Metadata.weight` field.
 - Missing or invalid weight defaults to `1`; non-positive weight stops new requests; values are capped at `1000000`.
-- RR/WRR rotation state is scoped by downstream key + provider + group + Priority and is shared across compatible requested models. Session-affinity state remains model-specific. Keys with different bindings do not share a cursor.
+- RR/WRR rotation state is scoped by downstream key + provider + effective group + Priority and is shared across compatible requested models. Explicitly bound keys use an empty effective group, so tier labels do not split their pool. Session-affinity state remains model-specific. Keys with different bindings do not share a cursor.
 - Lower-priority credentials participate only when every higher-priority credential is unavailable or has non-positive weight.
-- When CPA omits frontend-auth metadata, the plugin recovers the unique group from the Header key, `requested_model`, and final provider/model. Missing or ambiguous target information fails; it never falls back to the full pool.
-- `global_weighted_round_robin: true` preserves the old group-ignoring behavior only for keys without `account_binding`. It never bypasses an explicit binding or its target group.
+- When CPA omits frontend-auth metadata, the plugin recovers the unique group for unbound keys from the Header key, `requested_model`, and final provider/model. Explicitly bound keys still validate the alias/provider/model route but do not recover or enforce a group. Missing route information fails; it never falls back to the full pool.
+- `global_weighted_round_robin: true` preserves the group-ignoring behavior for unbound keys. Explicit bindings ignore group regardless of this switch and can never be bypassed.
 
 ### Fail-closed account binding
 
@@ -85,7 +85,7 @@ account_binding:
   strategy: weighted-round-robin # weighted-round-robin | round-robin | fill-first | quota-fill-first
 ```
 
-The scheduler intersects the binding, the uniquely recovered target group, candidate provider/status, positive weight, and highest available Priority. An empty intersection returns `auth_not_bound`; it never returns `Handled:false` or delegates to CPA's global pool. Account-bound requests must present the configured key in a Header. Query-only and conflicting protected credentials are terminated before upstream execution.
+For explicitly bound keys, the scheduler validates the alias/provider/model route, intersects the host candidates with `account_binding.allow`, provider/status, positive weight, concurrency, and highest available Priority, then ignores tier/custom group labels. Targets differing only by group collapse to one effective route. An empty intersection returns `auth_not_bound`; it never returns `Handled:false` or delegates to CPA's global pool. Account-bound requests must present the configured key in a Header. Query-only and conflicting protected credentials are terminated before upstream execution.
 
 CPA-native keys are untouched unless explicitly imported as `native: true`. Importing stores the ordinary key hash plus CPA's irreversible `caller_scope`, never another plaintext copy; the secret is not echoed by the API. Native keys keep host authentication and model routing, but an imported binding is enforced by this scheduler. Host session affinity remains available only to native keys that are not taken over by a binding; plugin-handled RR/WRR does not automatically inherit it.
 
@@ -109,7 +109,7 @@ CPA-native keys are untouched unless explicitly imported as `native: true`. Impo
 
 ### Codex quota-aware Fill First and cycle maintenance
 
-- `quota-fill-first` still applies binding, group, provider, status, Priority, positive weight, and auth concurrency first. It reads quota only inside that final legal pool.
+- `quota-fill-first` still applies binding, provider, status, Priority, positive weight, and auth concurrency first. For explicitly bound keys, group does not narrow that pool. It reads quota only inside the final legal pool.
 - Ready accounts are ordered by the earliest weekly/monthly long-window reset. The optional five-hour window is availability-only. A Ready affinity binding is not moved merely because another account resets earlier.
 - If quota evidence is unknown, selection falls back to stable Fill First inside the legal pool. Explicit exhaustion is not cleared by TTL expiry or a local reset timer; newer positive evidence is required.
 - `quota_check_interval` and `quota_cache_ttl` are independent and default to `30m`. Passive signals from normal traffic are primary; background GETs only fill missing, stale, reset-crossed, or verification state.
@@ -119,7 +119,7 @@ CPA-native keys are untouched unless explicitly imported as `native: true`. Impo
 - Activation distinguishes HTTP status from the JSON/SSE generation result. A 200 containing `response.failed` displays its safe error code rather than hiding behind `http_200`; completed or partially generated requests are not automatically replayed.
 - Each activation sequence allows **5 total attempts, including the initial request**. An unknown HTTP 200 without completion/output/token evidence needs two new quota GETs, at least one check interval apart, showing zero usage and a reset that keeps moving by a full window before a recovery attempt. Every recovery needs fresh evidence; restarts or moving reset timestamps do not clear the budget. After `attempts_exhausted`, quota checks continue without further activation POSTs. The cap is fixed and reported by `/quota-status` as `quota_activation_max_attempts`, not an editable setting.
 - Pending activation `next_check_at` follows the actual auth maintenance deadline. Upgrade without deleting either state file; the first observation of an old ambiguous 200 only establishes recovery evidence and does not immediately resend it.
-- A bound derived key's Lookup page shows only Codex accounts in the intersection of the current host roster, its non-empty `account_binding.allow`, and statically provable provider/group routes. Accounts use per-key opaque labels; email, auth ID/index, filename, account ID, proxy, token, and raw errors are never returned. Other providers are reported as unsupported.
+- A bound derived key's Lookup page shows only Codex accounts in the intersection of the current host roster, its non-empty `account_binding.allow`, and a statically provable Codex provider/model route. Group/tier is display-only for bound keys. Accounts use per-key opaque labels; email, auth ID/index, filename, account ID, proxy, token, and raw errors are never returned. Other providers are reported as unsupported.
 - `allow_quota_refresh` defaults to `false`. When enabled, each account card may issue one explicit quota GET. Manual queries are serialized, enforce per-key and per-auth 60-second cooldowns, honor longer upstream `Retry-After`, retain old evidence on failure, and never trigger activation or user billing.
 
 **Operational boundary:** this is a plugin-only control. Keep the plugin enabled and healthy, and do not use CPA Home mode for account-bound traffic because Home selects before the ordinary plugin scheduler. If the plugin is unloaded/fused, a key that still exists in CPA `api-keys` is again governed only by CPA's global pool. For the strongest fail-closed behavior under plugin removal, use plugin-issued keys and never duplicate them in CPA `api-keys`.
@@ -145,11 +145,11 @@ Channels under CPA `openai-compatibility` (e.g. a named proxy) use the **channel
 
 | Hook | Role |
 |------|------|
-| Frontend auth | Know plugin keys; enforce alias allow-list, RPM, budget; stamp route + group metadata |
+| Frontend auth | Know plugin keys; enforce alias allow-list, RPM, budget; stamp route metadata (and group only for unbound keys) |
 | Model router | Alias → provider + target model |
 | Request interceptor | Validate controlled identity and atomically acquire the key concurrency slot |
 | Request lifecycle | Final auth admission and idempotent release for HTTP/SSE success, failure, rejection, or cancellation |
-| Scheduler | Intersect binding + group, then apply capacity, affinity, and WRR/RR/fill-first within the highest Priority tier |
+| Scheduler | Enforce binding or unbound group constraints, then apply capacity, affinity, and WRR/RR/fill-first within the highest Priority tier |
 | Response interceptor | Non-stream JSON: rewrite top-level `model` back to the alias |
 | Usage | Token / per-call billing into the state file |
 | Management API + embedded Web UI | Keys, aliases, classify rules, status |
@@ -202,7 +202,7 @@ plugins:
 Notes:
 
 - If `state_file` exists, it is the source of truth for keys / aliases / classify rules / usage.
-- `global_weighted_round_robin: true` ignores the selected alias target group only for unbound plugin keys. An explicit account binding always remains restrictive. The default is `false`.
+- `global_weighted_round_robin: true` ignores the selected alias target group for unbound plugin keys. Explicitly bound keys ignore group regardless of this switch, while `account_binding.allow` remains fully restrictive. The default is `false`.
 - `quota_activation_enabled` defaults to `false`. Select `all-codex` explicitly in the UI only when host-wide Codex cycle maintenance is intended.
 - Prefer creating keys and aliases in the **Web UI** or Management API; seed YAML `keys` is mainly for first boot.
 - Never commit real key hashes, management secrets, or live host URLs into public docs.

@@ -62,16 +62,16 @@ Key 可以**引用**别名，不必重复填目标。多目标别名会展开成
 | **内置档**（Codex `plan_type`、Antigravity `tier`） | 如「免费档 / Team」 | 裸名：`free`、`team`、`supported` |
 | **自定义归类** | 如 **「自定义 · vip」** | 带前缀：`classify:vip` |
 
-**运行时规则：** 映射里写了 group，调度就**只**在该组凭证里选文件。没有可用文件 → 直接失败（`auth_not_found`），**绝不**偷偷落到其他档。
+**运行时规则：** 未配置 `account_binding` 的 Key 仍按映射 group 限定凭证；显式绑定 Key 则以 `account_binding.allow` 作为完整账号边界，忽略所有内置档位和自定义 group。没有合法候选就直接失败，**绝不**落到允许池外。
 
 **调度：** 插件先应用全部账号约束，再保留交集中 `Priority` 最高的一层并执行池内策略：
 
 - 权重来自 CPA 凭证配置，插件兼容候选的 `Weight`、`Attributes.weight` 和 `Metadata.weight`。
 - 未配置或无法解析时按 `1` 处理；非正数表示暂停接收新请求；最大按 `1000000` 处理。
-- RR/WRR 轮转状态按下游 key + provider + group + Priority 隔离，并在兼容模型间共享；session affinity 仍按模型隔离。绑定不同账号池的 key 不共用游标。
+- RR/WRR 轮转状态按下游 key + provider + 有效 group + Priority 隔离，并在兼容模型间共享；显式绑定 Key 的有效 group 为空，档位不会再拆分绑定池。session affinity 仍按模型隔离，绑定不同账号池的 key 不共用游标。
 - 低 `Priority` 凭证仅在更高优先级凭证全部不可用或权重非正时参与。
-- CPA 没有转发前端鉴权 metadata 时，插件会用 Header key、`requested_model` 和最终 provider/model 恢复唯一 group。信息缺失或目标歧义时直接失败，不会退回全池。
-- `global_weighted_round_robin: true` 只保留未绑定插件 key 的旧有“忽略 group”行为；显式 `account_binding` 及其目标 group 永远优先。
+- CPA 没有转发前端鉴权 metadata 时，未绑定 Key 会用 Header key、`requested_model` 和最终 provider/model 恢复唯一 group；显式绑定 Key 仍校验 alias/provider/model，但不恢复或执行 group。路由信息不足时直接失败，不会退回全池。
+- `global_weighted_round_robin: true` 让未绑定 Key 忽略 group；显式绑定 Key 无论开关状态都忽略 group，但 `account_binding.allow` 始终不可绕过。
 
 ### 失败关闭的账号绑定
 
@@ -83,7 +83,7 @@ account_binding:
   strategy: weighted-round-robin # weighted-round-robin | round-robin | fill-first | quota-fill-first
 ```
 
-调度器依次取账号绑定、唯一目标 group、provider、状态、正权重与最高 Priority 的交集。交集为空返回 `auth_not_bound`，不会 `Handled:false`，也不会委托 CPA 全局池。受绑定请求必须把配置的 key 放在 Header；仅 query 传 key 或 Header 凭证冲突会在访问上游前终止。
+对显式绑定 Key，调度器先校验 alias/provider/model，再取宿主候选与 `account_binding.allow`、provider、状态、正权重、并发及最高 Priority 的交集；档位和自定义 group 不再缩小允许池，仅 group 不同的同 provider/model 目标会合并为一条有效路由。交集为空返回 `auth_not_bound`，不会 `Handled:false`，也不会委托 CPA 全局池。受绑定请求必须把配置的 key 放在 Header；仅 query 传 key 或 Header 凭证冲突会在访问上游前终止。
 
 CPA 原生 key 默认完全不受影响；只有显式以 `native: true` 导入后才接管其账号绑定。导入只保存普通 key hash 与 CPA 的不可逆 `caller_scope`，不会保存或回显第二份明文。原生 key 仍由宿主鉴权和模型路由，但绑定由本插件强制执行。只有未被绑定接管的原生 key 才继续使用宿主 session affinity；插件自己返回 AuthID 的 RR/WRR 不会自动继承亲和性。
 
@@ -107,7 +107,7 @@ CPA 原生 key 默认完全不受影响；只有显式以 `native: true` 导入�
 
 ### Codex 额度感知 Fill First 与周期维护
 
-- 选择 `quota-fill-first` 后，插件仍先应用账号绑定、group、provider、状态、Priority、正权重和 auth 并发；只在最终合法池内读取内存额度缓存。
+- 选择 `quota-fill-first` 后，插件仍先应用账号绑定、provider、状态、Priority、正权重和 auth 并发；显式绑定 Key 不再由 group 缩小账号池，只在最终合法池内读取内存额度缓存。
 - 已知可用账号按**周/月长窗口最早重置**优先；5 小时窗口只判断是否可用，不参与排序。Ready 亲和账号不会仅因另一个账号更早重置而迁移。
 - 无有效额度缓存时，在合法池内按原 Fill First 稳定降级；明确耗尽的账号不会因 TTL 或 reset 到点自动恢复，必须看到更新的正面证据。
 - `quota_check_interval` 与 `quota_cache_ttl` 独立，默认均为 `30m`。正常业务响应的额度信号优先，后台只补查缺失、过期、跨 reset 或待验证状态。
@@ -117,7 +117,7 @@ CPA 原生 key 默认完全不受影响；只有显式以 `native: true` 导入�
 - 激活分别记录 HTTP 状态和 JSON/SSE 生成结果。HTTP 200 中的 `response.failed` 会显示脱敏错误码，不再被 `http_200` 掩盖；已有生成完成、输出或正 token 证据的请求不会自动重复。
 - 每个激活序列**总共最多尝试 5 次，包含首次**。未知 200 若没有完成/输出/token 证据，需要至少相隔一个检查周期的两次新鲜额度 GET，均证明零用量且 reset 随观察时间按完整窗口滑动，才恢复下一次尝试。每次恢复重新取证；重启、刷新或 reset 变化不清零次数。达到 `attempts_exhausted` 后继续查额度，不再发送激活请求。上限为固定值，`/quota-status` 的 `quota_activation_max_attempts` 可查看，不是可编辑设置。
 - 待验证激活的 `next_check_at` 与 auth 的真实维护截止时间同步。升级无需删除主状态或 runtime；旧未知 200 的首次观察只建立恢复证据，不会立即重发。
-- 已绑定派生 Key 的 Lookup 只显示“当前宿主名单 ∩ 非空 `account_binding.allow` ∩ 可静态证明 provider/group 路由”中的 Codex 账号。账号使用每 Key 隔离的匿名编号，不返回邮箱、auth ID/index、文件名、account ID、代理、token 或原始错误；其他提供商明确标为暂不支持。
+- 已绑定派生 Key 的 Lookup 只显示“当前宿主名单 ∩ 非空 `account_binding.allow` ∩ 可静态证明 Codex provider/model 路由”中的账号；group/档位只用于展示，不再作为绑定 Key 的授权条件。账号使用每 Key 隔离的匿名编号，不返回邮箱、auth ID/index、文件名、account ID、代理、token 或原始错误；其他提供商明确标为暂不支持。
 - `allow_quota_refresh` 默认关闭。管理员逐 Key 开启后，持有人可按账号执行一次显式 quota GET；手动查询全局串行，并有每 Key/每 auth 60 秒冷却，遵守更长的 `Retry-After`。失败保留旧快照，且绝不触发激活或用户计费。
 
 **运行边界：** 这是纯插件控制。账号绑定流量必须保持插件启用且健康，也不能使用 CPA Home 模式，因为 Home 会在普通插件 scheduler 之前完成选择。若插件被卸载或熔断，仍留在 CPA `api-keys` 中的原生 key 会重新只受宿主全局账号池控制。若要求插件被移除时也尽量失败关闭，请使用插件签发的 key，并且绝不要把它重复放进 CPA `api-keys`。
@@ -143,11 +143,11 @@ CPA 里配置的兼容通道，映射时 `provider` 填通道 **name**。插件�
 
 | 钩子 | 作用 |
 |------|------|
-| 前端鉴权 | 识别插件 key；校验别名、RPM、额度；写入路由与 group 元数据 |
+| 前端鉴权 | 识别插件 key；校验别名、RPM、额度；写入路由元数据（未绑定 Key 才写 group） |
 | 模型路由 | 别名 → provider + 目标模型 |
 | 请求拦截 | 校验受控请求身份，并原子占用 key 并发名额 |
 | 请求生命周期 | auth 并发最终准入；HTTP/SSE 完成、失败、拒绝或取消时幂等释放 |
-| 调度 | 取 key 绑定与目标 group 的交集，再按容量、session affinity、WRR/RR/fill-first 选择 |
+| 调度 | 执行账号绑定或未绑定 group 约束，再按容量、session affinity、WRR/RR/fill-first 选择 |
 | 响应拦截 | 非流式 JSON：把顶层 `model` 改回别名 |
 | 用量 | token / 按次计费写入 state |
 | 管理 API + 内嵌网页 | Key、别名、归类、状态 |
@@ -200,7 +200,7 @@ plugins:
 说明：
 
 - 若已有 `state_file`，则以其中的 keys / 别名 / 归类 / 用量为准。
-- `global_weighted_round_robin: true` 只会让未绑定的插件 key 忽略目标 group；显式账号绑定始终保持限制。默认为 `false`。
+- `global_weighted_round_robin: true` 会让未绑定插件 Key 忽略目标 group；显式绑定 Key 无论开关状态都忽略 group，但 `account_binding.allow` 始终保持限制。默认为 `false`。
 - `quota_activation_enabled` 默认为 `false`。若要维护宿主全部有效 Codex OAuth auth，请在面板确认风险后显式选择 `all-codex`。
 - 日常请用**网页**或管理 API 建 key 和别名；YAML 种子数据主要用于首次启动。
 - 公开文档里不要写真实管理密钥、主机名或凭证内容。

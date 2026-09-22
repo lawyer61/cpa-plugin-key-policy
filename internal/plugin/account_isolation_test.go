@@ -59,21 +59,24 @@ func boundSchedulerRequest(plain string) SchedulerPickRequest {
 	}
 }
 
-func TestSchedulerIntersectsBindingAndTargetGroup(t *testing.T) {
+func TestSchedulerBindingIgnoresTargetGroup(t *testing.T) {
 	app, plain := configureBoundApp(t, "weighted-round-robin", false)
 	request := boundSchedulerRequest(plain)
 	for i := 0; i < 10; i++ {
-		if got := schedulerPickForTest(t, app, request).AuthID; got != "account-a-team" {
-			t.Fatalf("selected account outside binding/group intersection: %q", got)
+		if got := schedulerPickForTest(t, app, request).AuthID; !strings.HasPrefix(got, "account-a-") {
+			t.Fatalf("selected account outside binding: %q", got)
 		}
+	}
+	if got := schedulerPickForTest(t, app, request).AuthID; got != "account-a-free" {
+		t.Fatalf("old target group still excluded a higher-weight bound account: %q", got)
 	}
 }
 
 func TestGlobalWeightedModeCannotBypassExplicitBinding(t *testing.T) {
 	app, plain := configureBoundApp(t, "weighted-round-robin", true)
 	request := boundSchedulerRequest(plain)
-	if got := schedulerPickForTest(t, app, request).AuthID; got != "account-a-team" {
-		t.Fatalf("global mode bypassed binding or group: %q", got)
+	if got := schedulerPickForTest(t, app, request).AuthID; got != "account-a-free" {
+		t.Fatalf("global mode bypassed binding or retained group: %q", got)
 	}
 }
 
@@ -221,7 +224,7 @@ func TestBoundRequestInterceptorRejectsQueryOnlyAndConflicts(t *testing.T) {
 	}
 }
 
-func TestSchedulerRejectsAmbiguousSameTargetGroups(t *testing.T) {
+func TestBoundSchedulerAcceptsSameTargetAcrossAllGroups(t *testing.T) {
 	plain := "cpa_ambiguous"
 	hash := hashForTest(t, plain)
 	app := NewApp()
@@ -243,6 +246,56 @@ keys:
     key_hash: "` + hash + `"
     account_binding:
       allow: ["account-*"]
+      strategy: round-robin
+    aliases:
+      - alias: fast
+`)
+	request, _ := json.Marshal(LifecycleRequest{ConfigYAML: configYAML})
+	if _, err := app.HandleMethod(MethodPluginReconfigure, request); err != nil {
+		t.Fatal(err)
+	}
+	pickRequest := SchedulerPickRequest{
+		Provider: "codex",
+		Model:    "gpt-5-codex",
+		Options: SchedulerPickOptions{
+			Headers:  map[string][]string{"Authorization": {"Bearer " + plain}},
+			Metadata: map[string]any{"requested_model": "fast", "caller_scope": policy.CallerScopeForKey("ambiguous")},
+		},
+		Candidates: []SchedulerAuthCandidate{
+			{ID: "account-team", Provider: "codex", Weight: 1, Attributes: map[string]string{"plan_type": "team"}},
+			{ID: "account-plus", Provider: "codex", Weight: 1, Attributes: map[string]string{"plan_type": "plus"}},
+			{ID: "account-pro", Provider: "codex", Weight: 1, Attributes: map[string]string{"plan_type": "pro"}},
+			{ID: "account-custom", Provider: "codex", Weight: 1, Attributes: map[string]string{"tier": "enterprise"}},
+		},
+	}
+	want := []string{"account-custom", "account-plus", "account-pro", "account-team"}
+	for i, id := range want {
+		if got := schedulerPickForTest(t, app, pickRequest).AuthID; got != id {
+			t.Fatalf("pick %d = %q, want %q", i, got, id)
+		}
+	}
+}
+
+func TestUnboundSchedulerStillRejectsAmbiguousSameTargetGroups(t *testing.T) {
+	plain := "cpa_unbound_ambiguous"
+	hash := hashForTest(t, plain)
+	app := NewApp()
+	configYAML := []byte(`
+enabled: true
+state_file: "` + filepath.ToSlash(filepath.Join(t.TempDir(), "state.json")) + `"
+aliases:
+  - alias: fast
+    targets:
+      - provider: codex
+        target_model: gpt-5-codex
+        group: team
+      - provider: codex
+        target_model: gpt-5-codex
+        group: plus
+keys:
+  - id: unbound-ambiguous
+    enabled: true
+    key_hash: "` + hash + `"
     aliases:
       - alias: fast
 `)
@@ -255,12 +308,34 @@ keys:
 		Model:    "gpt-5-codex",
 		Options: SchedulerPickOptions{
 			Headers:  map[string][]string{"Authorization": {"Bearer " + plain}},
-			Metadata: map[string]any{"requested_model": "fast", "caller_scope": policy.CallerScopeForKey("ambiguous")},
+			Metadata: map[string]any{"requested_model": "fast", "caller_scope": policy.CallerScopeForKey("unbound-ambiguous")},
 		},
-		Candidates: []SchedulerAuthCandidate{{ID: "account-team", Provider: "codex", Attributes: map[string]string{"plan_type": "team"}}},
+		Candidates: []SchedulerAuthCandidate{{ID: "account-team", Provider: "codex", Weight: 1, Attributes: map[string]string{"plan_type": "team"}}},
 	})
 	if err.Code != "account_constraint_ambiguous" {
 		t.Fatalf("error = %+v", err)
+	}
+}
+
+func TestBoundAffinityProposalIgnoresMetadataGroup(t *testing.T) {
+	base := map[string]any{
+		"canonical_session_id": "session",
+		"target_provider":      "codex",
+		"target_model":         "gpt-5-codex",
+	}
+	team := map[string]any{}
+	plus := map[string]any{}
+	for key, value := range base {
+		team[key] = value
+		plus[key] = value
+	}
+	team["group"] = "team"
+	plus["group"] = "plus"
+	if got, want := schedulerAffinityProposalKey("k", "fast", "account", team, true), schedulerAffinityProposalKey("k", "fast", "account", plus, true); got != want {
+		t.Fatalf("bound proposal keys differed by group: %q != %q", got, want)
+	}
+	if got, want := schedulerAffinityProposalKey("k", "fast", "account", team, false), schedulerAffinityProposalKey("k", "fast", "account", plus, false); got == want {
+		t.Fatal("unbound proposal keys unexpectedly ignored group")
 	}
 }
 
