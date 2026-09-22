@@ -369,20 +369,24 @@ type UsageWindow struct {
 }
 
 type State struct {
-	Version                       int                    `json:"version"`
-	UsageSchemaVersion            int                    `json:"usage_schema_version"`
-	Keys                          []KeyConfig            `json:"keys"`
-	Usage                         map[string]*UsageState `json:"usage,omitempty"`
-	UpdatedAt                     time.Time              `json:"updated_at"`
-	GlobalWeightedRoundRobin      *bool                  `json:"global_weighted_round_robin,omitempty"`
-	AuthConcurrencyLimits         *map[string]int        `json:"auth_concurrency_limits,omitempty"`
-	SessionAffinityIdleTTLSeconds *int                   `json:"session_affinity_idle_ttl_seconds,omitempty"`
-	SessionAffinityMaxEntries     *int                   `json:"session_affinity_max_entries,omitempty"`
-	QuotaCheckInterval            *string                `json:"quota_check_interval,omitempty"`
-	QuotaCacheTTL                 *string                `json:"quota_cache_ttl,omitempty"`
-	QuotaActivationEnabled        *bool                  `json:"quota_activation_enabled,omitempty"`
-	QuotaActivationScope          *string                `json:"quota_activation_scope,omitempty"`
-	QuotaActivationModel          *string                `json:"quota_activation_model,omitempty"`
+	Version            int                    `json:"version"`
+	UsageSchemaVersion int                    `json:"usage_schema_version"`
+	Keys               []KeyConfig            `json:"keys"`
+	Usage              map[string]*UsageState `json:"usage,omitempty"`
+	UpdatedAt          time.Time              `json:"updated_at"`
+	// QuotaManagement is intentionally kept separate from RuntimeSettings:
+	// it contains the recoverable management credential and is never copied
+	// into public status/config DTOs.
+	QuotaManagement               *QuotaManagementSettings `json:"quota_management,omitempty"`
+	GlobalWeightedRoundRobin      *bool                    `json:"global_weighted_round_robin,omitempty"`
+	AuthConcurrencyLimits         *map[string]int          `json:"auth_concurrency_limits,omitempty"`
+	SessionAffinityIdleTTLSeconds *int                     `json:"session_affinity_idle_ttl_seconds,omitempty"`
+	SessionAffinityMaxEntries     *int                     `json:"session_affinity_max_entries,omitempty"`
+	QuotaCheckInterval            *string                  `json:"quota_check_interval,omitempty"`
+	QuotaCacheTTL                 *string                  `json:"quota_cache_ttl,omitempty"`
+	QuotaActivationEnabled        *bool                    `json:"quota_activation_enabled,omitempty"`
+	QuotaActivationScope          *string                  `json:"quota_activation_scope,omitempty"`
+	QuotaActivationModel          *string                  `json:"quota_activation_model,omitempty"`
 	// Aliases is the global alias mapping table, persisted so that key alias
 	// references survive restarts even when config.yaml is not re-read. On
 	// Configure, the config.yaml Aliases take precedence; state Aliases are a
@@ -398,10 +402,33 @@ const (
 	DefaultQuotaCacheTTL                 = "30m"
 	DefaultQuotaActivationScope          = "managed-pools"
 	DefaultQuotaActivationModel          = "gpt-5.6-luna"
+	DefaultQuotaManagementBaseURL        = "http://127.0.0.1:8317"
 	MinQuotaDuration                     = time.Minute
 )
 
+// QuotaManagementSettings is the private, persisted bridge configuration.
+// The Key field is deliberately absent from RuntimeSettings and all public
+// status/config DTOs; only the plugin backend should request this snapshot.
+type QuotaManagementSettings struct {
+	Enabled           bool   `json:"enabled"`
+	ActivationEnabled bool   `json:"activation_enabled"`
+	BaseURL           string `json:"base_url"`
+	Key               string `json:"key"`
+}
+
+func defaultQuotaManagementSettings() QuotaManagementSettings {
+	return QuotaManagementSettings{BaseURL: DefaultQuotaManagementBaseURL}
+}
+
+func normalizeQuotaManagementBaseURL(raw string) string {
+	if trimmed := strings.TrimSpace(raw); trimmed != "" {
+		return trimmed
+	}
+	return DefaultQuotaManagementBaseURL
+}
+
 var ErrInvalidRuntimeSettings = errors.New("invalid runtime settings")
+var ErrInvalidQuotaManagementSettings = errors.New("invalid quota management settings")
 
 // RuntimeSettings are plugin-wide scheduler controls persisted alongside the
 // key state. Maps are copied at Store boundaries so callers cannot mutate live
@@ -1041,6 +1068,12 @@ func LoadState(path string) (*State, error) {
 	if state.Usage == nil {
 		state.Usage = make(map[string]*UsageState)
 	}
+	if state.QuotaManagement == nil {
+		defaults := defaultQuotaManagementSettings()
+		state.QuotaManagement = &defaults
+	} else {
+		state.QuotaManagement.BaseURL = normalizeQuotaManagementBaseURL(state.QuotaManagement.BaseURL)
+	}
 	if state.UsageSchemaVersion == CurrentUsageSchemaVersion {
 		if err := validateUsageStateV2(state.Usage); err != nil {
 			return nil, err
@@ -1115,18 +1148,25 @@ func saveMigratedState(path string, state *State) error {
 
 // SaveState atomically writes the key list plus usage ledger to the state file.
 func SaveState(path string, keys []KeyConfig, usage map[string]*UsageState, aliases []AliasMapping, rules []ClassifyRule) error {
-	return saveStateDocument(path, keys, usage, aliases, rules, nil)
+	var quotaManagement *QuotaManagementSettings
+	if current, err := LoadState(path); err == nil && current.QuotaManagement != nil {
+		privateSettings := *current.QuotaManagement
+		quotaManagement = &privateSettings
+	} else if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	return saveStateDocument(path, keys, usage, aliases, rules, nil, quotaManagement)
 }
 
-func saveStateWithSettings(path string, keys []KeyConfig, usage map[string]*UsageState, aliases []AliasMapping, rules []ClassifyRule, settings RuntimeSettings) error {
+func saveStateWithSettings(path string, keys []KeyConfig, usage map[string]*UsageState, aliases []AliasMapping, rules []ClassifyRule, settings RuntimeSettings, quotaManagement QuotaManagementSettings) error {
 	normalized, err := normalizeRuntimeSettings(settings)
 	if err != nil {
 		return err
 	}
-	return saveStateDocument(path, keys, usage, aliases, rules, &normalized)
+	return saveStateDocument(path, keys, usage, aliases, rules, &normalized, &quotaManagement)
 }
 
-func saveStateDocument(path string, keys []KeyConfig, usage map[string]*UsageState, aliases []AliasMapping, rules []ClassifyRule, settings *RuntimeSettings) error {
+func saveStateDocument(path string, keys []KeyConfig, usage map[string]*UsageState, aliases []AliasMapping, rules []ClassifyRule, settings *RuntimeSettings, quotaManagement *QuotaManagementSettings) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return err
 	}
@@ -1171,6 +1211,11 @@ func saveStateDocument(path string, keys []KeyConfig, usage map[string]*UsageSta
 		state.QuotaActivationScope = &quotaActivationScope
 		state.QuotaActivationModel = &quotaActivationModel
 	}
+	if quotaManagement != nil {
+		privateSettings := *quotaManagement
+		privateSettings.BaseURL = normalizeQuotaManagementBaseURL(privateSettings.BaseURL)
+		state.QuotaManagement = &privateSettings
+	}
 	raw, err := json.MarshalIndent(state, "", "  ")
 	if err != nil {
 		return err
@@ -1203,6 +1248,7 @@ func SaveUsageOnly(path string, usage map[string]*UsageState) error {
 	var quotaActivationEnabled *bool
 	var quotaActivationScope *string
 	var quotaActivationModel *string
+	var quotaManagement *QuotaManagementSettings
 	if cur, err := LoadState(path); err == nil {
 		if cur.UsageSchemaVersion == 0 {
 			return ErrLegacyUsageSchema
@@ -1219,6 +1265,11 @@ func SaveUsageOnly(path string, usage map[string]*UsageState) error {
 		quotaActivationEnabled = cur.QuotaActivationEnabled
 		quotaActivationScope = cur.QuotaActivationScope
 		quotaActivationModel = cur.QuotaActivationModel
+		if cur.QuotaManagement != nil {
+			privateSettings := *cur.QuotaManagement
+			privateSettings.BaseURL = normalizeQuotaManagementBaseURL(privateSettings.BaseURL)
+			quotaManagement = &privateSettings
+		}
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return err
 	}
@@ -1243,6 +1294,7 @@ func SaveUsageOnly(path string, usage map[string]*UsageState) error {
 		QuotaActivationEnabled:        quotaActivationEnabled,
 		QuotaActivationScope:          quotaActivationScope,
 		QuotaActivationModel:          quotaActivationModel,
+		QuotaManagement:               quotaManagement,
 		Aliases:                       aliases,
 		ClassifyRules:                 rules,
 	}

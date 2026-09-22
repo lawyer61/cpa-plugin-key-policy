@@ -184,6 +184,8 @@ export interface StatusResponse {
   rpm_usage?: Record<string, unknown>;
 }
 
+export type QuotaManagementState = "disabled" | "unconfigured" | "ready" | "paused";
+
 export interface SchedulerSettings {
   global_weighted_round_robin: boolean;
   auth_concurrency_limits: Record<string, number>;
@@ -194,6 +196,13 @@ export interface SchedulerSettings {
   quota_activation_enabled: boolean;
   quota_activation_scope: "managed-pools" | "all-codex";
   quota_activation_model: string;
+  // Optional local management bridge for account-level proxy maintenance.
+  quota_management_enabled?: boolean;
+  quota_management_activation_enabled?: boolean;
+  quota_management_base_url?: string;
+  quota_management_key_configured?: boolean;
+  quota_management_state?: QuotaManagementState;
+  quota_management_last_error?: string;
   // Optional runtime counters returned by newer plugin builds.
   current_concurrent_requests?: number;
   current_activation_requests?: number;
@@ -211,7 +220,14 @@ export type SchedulerSettingsPatch = Partial<Pick<
   | "quota_activation_enabled"
   | "quota_activation_scope"
   | "quota_activation_model"
->>;
+  | "quota_management_enabled"
+  | "quota_management_activation_enabled"
+  | "quota_management_base_url"
+>> & {
+  // A blank value is reserved for the explicit clear-key action. Ordinary
+  // saves omit this field so an existing secret remains unchanged.
+  quota_management_key?: string;
+};
 
 export interface QuotaWindowStatus {
   kind: "five_hour" | "weekly" | "monthly" | "unknown";

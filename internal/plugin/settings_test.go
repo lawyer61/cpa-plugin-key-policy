@@ -3,7 +3,9 @@ package plugin
 import (
 	"encoding/json"
 	"net/http"
+	"net/http/httptest"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -34,6 +36,64 @@ func TestSchedulerSettingsManagementAndRestartPersistence(t *testing.T) {
 	assertGlobalWeightedSetting(t, restartedResponse, http.StatusOK, true)
 	assertRuntimeSettings(t, restartedResponse, 4, 900, 321)
 	assertQuotaSettings(t, restartedResponse, "17m", "43m", true, "all-codex", "custom-activation-model")
+}
+
+func TestQuotaManagementSettingsPersistRedactTestAndClear(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet || r.URL.Path != "/v0/management/plugins" {
+			t.Fatalf("connection test request = %s %s", r.Method, r.URL.Path)
+		}
+		if r.Header.Get("Authorization") != "Bearer management-secret" {
+			t.Fatalf("connection test authorization = %q", r.Header.Get("Authorization"))
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"plugins": []any{}})
+	}))
+	defer server.Close()
+
+	statePath := filepath.Join(t.TempDir(), "state.json")
+	app := configureSettingsApp(t, statePath)
+	patch, _ := json.Marshal(map[string]any{
+		"quota_management_enabled":            true,
+		"quota_management_activation_enabled": true,
+		"quota_management_base_url":           server.URL,
+		"quota_management_key":                "management-secret",
+	})
+	response := callManagementForTest(t, app, http.MethodPatch, "/v0/management/plugins/cpa-key-policy/settings", patch)
+	assertQuotaManagementSettings(t, response, true, true, server.URL, true)
+	if strings.Contains(string(response.Body), "management-secret") || strings.Contains(string(response.Body), "quota_management_key\"") {
+		t.Fatalf("settings response leaked management key: %s", response.Body)
+	}
+
+	testResponse := callManagementForTest(t, app, http.MethodPost, "/v0/management/plugins/cpa-key-policy/quota-management/test", nil)
+	if testResponse.StatusCode != http.StatusOK {
+		t.Fatalf("connection test = %d body=%s", testResponse.StatusCode, testResponse.Body)
+	}
+
+	if ordinary := callManagementForTest(t, app, http.MethodPatch, "/v0/management/plugins/cpa-key-policy/settings", []byte(`{"quota_cache_ttl":"41m"}`)); ordinary.StatusCode != http.StatusOK {
+		t.Fatalf("ordinary quota update = %d body=%s", ordinary.StatusCode, ordinary.Body)
+	}
+	restarted := configureSettingsApp(t, statePath)
+	restartedResponse := callManagementForTest(t, restarted, http.MethodGet, "/v0/management/plugins/cpa-key-policy/settings", nil)
+	assertQuotaManagementSettings(t, restartedResponse, true, true, server.URL, true)
+
+	clearResponse := callManagementForTest(t, restarted, http.MethodPatch, "/v0/management/plugins/cpa-key-policy/settings", []byte(`{"quota_management_enabled":false,"quota_management_key":""}`))
+	assertQuotaManagementSettings(t, clearResponse, false, true, server.URL, false)
+}
+
+func TestQuotaManagementSettingsRejectUnsafeBaseAndBaseChangeWithoutKey(t *testing.T) {
+	app := configureSettingsApp(t, filepath.Join(t.TempDir(), "state.json"))
+	unsafe := callManagementForTest(t, app, http.MethodPatch, "/v0/management/plugins/cpa-key-policy/settings", []byte(`{"quota_management_base_url":"http://localhost:8317","quota_management_key":"secret"}`))
+	if unsafe.StatusCode != http.StatusBadRequest {
+		t.Fatalf("unsafe base status = %d body=%s", unsafe.StatusCode, unsafe.Body)
+	}
+	first := callManagementForTest(t, app, http.MethodPatch, "/v0/management/plugins/cpa-key-policy/settings", []byte(`{"quota_management_base_url":"http://127.0.0.1:8318","quota_management_key":"secret"}`))
+	if first.StatusCode != http.StatusOK {
+		t.Fatalf("initial base update = %d body=%s", first.StatusCode, first.Body)
+	}
+	missingKey := callManagementForTest(t, app, http.MethodPatch, "/v0/management/plugins/cpa-key-policy/settings", []byte(`{"quota_management_base_url":"http://127.0.0.1:8319"}`))
+	if missingKey.StatusCode != http.StatusBadRequest {
+		t.Fatalf("base change without key status = %d body=%s", missingKey.StatusCode, missingKey.Body)
+	}
 }
 
 func TestQuotaManagementRouteReturnsRuntimeStatus(t *testing.T) {
@@ -164,5 +224,24 @@ func assertQuotaSettings(t *testing.T, response ManagementResponse, interval, tt
 	}
 	if payload.QuotaCheckInterval != interval || payload.QuotaCacheTTL != ttl || payload.QuotaActivationEnabled != enabled || payload.QuotaActivationScope != scope || payload.QuotaActivationModel != model {
 		t.Fatalf("quota settings = %+v", payload)
+	}
+}
+
+func assertQuotaManagementSettings(t *testing.T, response ManagementResponse, enabled, activation bool, baseURL string, configured bool) {
+	t.Helper()
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("management settings status = %d body=%s", response.StatusCode, response.Body)
+	}
+	var payload struct {
+		Enabled           bool   `json:"quota_management_enabled"`
+		ActivationEnabled bool   `json:"quota_management_activation_enabled"`
+		BaseURL           string `json:"quota_management_base_url"`
+		KeyConfigured     bool   `json:"quota_management_key_configured"`
+	}
+	if err := json.Unmarshal(response.Body, &payload); err != nil {
+		t.Fatal(err)
+	}
+	if payload.Enabled != enabled || payload.ActivationEnabled != activation || payload.BaseURL != baseURL || payload.KeyConfigured != configured {
+		t.Fatalf("quota management settings = %+v", payload)
 	}
 }

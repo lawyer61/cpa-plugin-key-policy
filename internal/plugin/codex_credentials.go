@@ -178,16 +178,3 @@ func lookupTimeDeep(value any, keys ...string) (time.Time, bool) {
 	}
 	return time.Time{}, false
 }
-
-func codexAuthUsesUnsupportedProxy(raw json.RawMessage) bool {
-	var doc map[string]any
-	if json.Unmarshal(raw, &doc) != nil {
-		return false
-	}
-	for _, key := range []string{"proxy", "proxy_url", "proxy-url"} {
-		if value, ok := lookupStringDeep(doc, key); ok && strings.TrimSpace(value) != "" {
-			return true
-		}
-	}
-	return false
-}

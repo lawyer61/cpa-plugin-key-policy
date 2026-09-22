@@ -25,6 +25,7 @@ import {
   fetchCredentialDescriptors,
   fetchSchedulerSettings,
   updateSchedulerSettings,
+  testQuotaManagementConnection,
   fetchQuotaStatus,
 } from "../api/mappings";
 
@@ -120,19 +121,26 @@ function AliasListTab() {
     }
   };
 
-  const handleRuntimeSave = async (patch: SchedulerSettingsPatch) => {
+  const handleRuntimeSave = async (patch: SchedulerSettingsPatch): Promise<SchedulerSettings | undefined> => {
     setSettingsSaving(true);
     setError("");
     try {
       const settings = await updateSchedulerSettings(patch);
-      setSchedulerSettings((prev) => prev ? { ...prev, ...settings } : settings);
+      setSchedulerSettings(settings);
       setGlobalWeighted(settings.global_weighted_round_robin ?? globalWeighted);
       setQuotaStatus(await fetchQuotaStatus().catch(() => quotaStatus));
+      return settings;
     } catch (e: unknown) {
       setError(t("mapping.runtimeSaveFailed") + ": " + String(e));
+      return undefined;
     } finally {
       setSettingsSaving(false);
     }
+  };
+
+  const syncSchedulerSettings = (settings: SchedulerSettings) => {
+    setSchedulerSettings(settings);
+    setGlobalWeighted(settings.global_weighted_round_robin ?? false);
   };
 
   return (
@@ -164,6 +172,7 @@ function AliasListTab() {
         loading={loading}
         saving={settingsSaving}
         onSave={handleRuntimeSave}
+        onSettingsRefreshed={syncSchedulerSettings}
       />
       {loading ? (
         <div className="muted" style={{ padding: 20 }}>{t("keys.loading") || "Loading..."}</div>
@@ -180,6 +189,8 @@ function AliasListTab() {
   );
 }
 
+const DEFAULT_QUOTA_MANAGEMENT_BASE_URL = "http://127.0.0.1:8317";
+
 function RuntimeSettingsPanel({
   settings,
   descriptors,
@@ -187,13 +198,15 @@ function RuntimeSettingsPanel({
   loading,
   saving,
   onSave,
+  onSettingsRefreshed,
 }: {
   settings: SchedulerSettings | null;
   descriptors: CredentialDescriptor[];
   quotaStatus: QuotaStatus | null;
   loading: boolean;
   saving: boolean;
-  onSave: (patch: SchedulerSettingsPatch) => Promise<void>;
+  onSave: (patch: SchedulerSettingsPatch) => Promise<SchedulerSettings | undefined>;
+  onSettingsRefreshed: (settings: SchedulerSettings) => void;
 }) {
   const t = useT();
   const [ttl, setTtl] = useState(0);
@@ -206,6 +219,16 @@ function RuntimeSettingsPanel({
   const [quotaActivationEnabled, setQuotaActivationEnabled] = useState(false);
   const [quotaActivationScope, setQuotaActivationScope] = useState<"managed-pools" | "all-codex">("managed-pools");
   const [quotaActivationModel, setQuotaActivationModel] = useState("gpt-5.6-luna");
+  const [quotaManagementEnabled, setQuotaManagementEnabled] = useState(false);
+  const [quotaManagementActivationEnabled, setQuotaManagementActivationEnabled] = useState(false);
+  const [quotaManagementBaseURL, setQuotaManagementBaseURL] = useState(DEFAULT_QUOTA_MANAGEMENT_BASE_URL);
+  const [loadedQuotaManagementBaseURL, setLoadedQuotaManagementBaseURL] = useState(DEFAULT_QUOTA_MANAGEMENT_BASE_URL);
+  const [quotaManagementKey, setQuotaManagementKey] = useState("");
+  const [quotaManagementKeyConfigured, setQuotaManagementKeyConfigured] = useState(false);
+  const [quotaManagementState, setQuotaManagementState] = useState<"disabled" | "unconfigured" | "ready" | "paused">("disabled");
+  const [quotaManagementTesting, setQuotaManagementTesting] = useState(false);
+  const [quotaManagementError, setQuotaManagementError] = useState("");
+  const [quotaManagementMessage, setQuotaManagementMessage] = useState("");
 
   useEffect(() => {
     if (!settings) return;
@@ -217,6 +240,13 @@ function RuntimeSettingsPanel({
     setQuotaActivationEnabled(settings.quota_activation_enabled ?? false);
     setQuotaActivationScope(settings.quota_activation_scope ?? "managed-pools");
     setQuotaActivationModel(settings.quota_activation_model ?? "gpt-5.6-luna");
+    const baseURL = settings.quota_management_base_url?.trim() || DEFAULT_QUOTA_MANAGEMENT_BASE_URL;
+    setQuotaManagementEnabled(settings.quota_management_enabled ?? false);
+    setQuotaManagementActivationEnabled(settings.quota_management_activation_enabled ?? false);
+    setQuotaManagementBaseURL(baseURL);
+    setLoadedQuotaManagementBaseURL(baseURL);
+    setQuotaManagementKeyConfigured(settings.quota_management_key_configured ?? false);
+    setQuotaManagementState(settings.quota_management_state ?? "disabled");
   }, [settings]);
 
   const configuredIds = Object.keys(authLimits).sort((a, b) => a.localeCompare(b));
@@ -241,7 +271,15 @@ function RuntimeSettingsPanel({
       // A zero limit means no override and must not be sent to the backend.
       if (id && limit > 0) limits[id] = limit;
     }
-    await onSave({
+    setQuotaManagementError("");
+    setQuotaManagementMessage("");
+    const baseURL = quotaManagementBaseURL.trim() || DEFAULT_QUOTA_MANAGEMENT_BASE_URL;
+    const newKey = quotaManagementKey.trim();
+    if (baseURL !== loadedQuotaManagementBaseURL && !newKey) {
+      setQuotaManagementError(t("mapping.quotaManagementBaseURLKeyRequired"));
+      return;
+    }
+    const patch: SchedulerSettingsPatch = {
       auth_concurrency_limits: limits,
       session_affinity_idle_ttl_seconds: Math.max(0, Math.floor(ttl) || 0),
       session_affinity_max_entries: Math.max(0, Math.floor(cacheCap) || 0),
@@ -250,7 +288,54 @@ function RuntimeSettingsPanel({
       quota_activation_enabled: quotaActivationEnabled,
       quota_activation_scope: quotaActivationScope,
       quota_activation_model: quotaActivationModel.trim(),
+      quota_management_enabled: quotaManagementEnabled,
+      quota_management_activation_enabled: quotaManagementActivationEnabled,
+      quota_management_base_url: baseURL,
+    };
+    // An empty password field means “keep the saved secret”; only the
+    // explicit clear action below sends quota_management_key: "".
+    if (newKey) patch.quota_management_key = newKey;
+    const updated = await onSave(patch);
+    if (updated) {
+      setQuotaManagementKey("");
+      setQuotaManagementMessage(t("mapping.quotaManagementSaved"));
+    }
+  };
+
+  const testManagementConnection = async () => {
+    setQuotaManagementError("");
+    setQuotaManagementMessage("");
+    if (!quotaManagementKeyConfigured) {
+      setQuotaManagementError(t("mapping.quotaManagementTestNeedsKey"));
+      return;
+    }
+    setQuotaManagementTesting(true);
+    try {
+      await testQuotaManagementConnection();
+      const refreshed = await fetchSchedulerSettings();
+      onSettingsRefreshed(refreshed);
+      setQuotaManagementKey("");
+      setQuotaManagementMessage(t("mapping.quotaManagementTestSuccess"));
+    } catch (e: unknown) {
+      setQuotaManagementError(t("mapping.quotaManagementTestFailed") + ": " + String(e));
+    } finally {
+      setQuotaManagementTesting(false);
+    }
+  };
+
+  const clearManagementKey = async () => {
+    setQuotaManagementError("");
+    setQuotaManagementMessage("");
+    const updated = await onSave({
+      quota_management_enabled: false,
+      quota_management_key: "",
     });
+    if (updated) {
+      setQuotaManagementEnabled(false);
+      setQuotaManagementKeyConfigured(false);
+      setQuotaManagementKey("");
+      setQuotaManagementMessage(t("mapping.quotaManagementKeyCleared"));
+    }
   };
 
   return (
@@ -404,6 +489,95 @@ function RuntimeSettingsPanel({
               spellCheck={false}
             />
           </div>
+        </div>
+        <div className="quota-management-settings">
+          <div className="runtime-auth-head">
+            <div>
+              <h3>{t("mapping.quotaManagementTitle")}</h3>
+              <p className="muted">{t("mapping.quotaManagementHint")}</p>
+            </div>
+            <span className={"quota-management-status " + quotaManagementState}>
+              {t("mapping.quotaManagementState." + quotaManagementState)}
+            </span>
+          </div>
+          <label className="switch quota-management-toggle">
+            <input
+              id="quota-management-enabled"
+              type="checkbox"
+              checked={quotaManagementEnabled}
+              disabled={loading || saving || !settings}
+              onChange={(event) => setQuotaManagementEnabled(event.target.checked)}
+            />
+            <span className="track"><span className="thumb" /></span>
+            <span>{t("mapping.quotaManagementEnabled")}</span>
+          </label>
+          <p className="muted quota-management-note">{t("mapping.quotaManagementMasterHint")}</p>
+          <label className="switch quota-management-activation-toggle">
+            <input
+              id="quota-management-activation-enabled"
+              type="checkbox"
+              checked={quotaManagementActivationEnabled}
+              disabled={loading || saving || !settings || !quotaManagementEnabled}
+              onChange={(event) => setQuotaManagementActivationEnabled(event.target.checked)}
+            />
+            <span className="track"><span className="thumb" /></span>
+            <span>{t("mapping.quotaManagementActivationEnabled")}</span>
+          </label>
+          <p className="muted quota-management-note">{t("mapping.quotaManagementActivationHint")}</p>
+          <div className="runtime-settings-grid">
+            <div className="form-row">
+              <label htmlFor="quota-management-base-url">{t("mapping.quotaManagementBaseURL")}</label>
+              <input
+                id="quota-management-base-url"
+                className="input mono"
+                value={quotaManagementBaseURL}
+                disabled={loading || saving || !settings}
+                onChange={(event) => setQuotaManagementBaseURL(event.target.value)}
+                placeholder={DEFAULT_QUOTA_MANAGEMENT_BASE_URL}
+                spellCheck={false}
+              />
+            </div>
+            <div className="form-row">
+              <label htmlFor="quota-management-key">{t("mapping.quotaManagementKey")}</label>
+              <input
+                id="quota-management-key"
+                className="input mono"
+                type="password"
+                autoComplete="new-password"
+                value={quotaManagementKey}
+                disabled={loading || saving || !settings}
+                onChange={(event) => setQuotaManagementKey(event.target.value)}
+                placeholder={t("mapping.quotaManagementKeyPlaceholder")}
+                spellCheck={false}
+              />
+              <span className="muted quota-management-key-status">
+                {quotaManagementKeyConfigured
+                  ? t("mapping.quotaManagementKeyConfigured")
+                  : t("mapping.quotaManagementKeyNotConfigured")}
+              </span>
+            </div>
+          </div>
+          <div className="quota-management-actions">
+            <button
+              className="btn sm"
+              type="button"
+              disabled={loading || saving || quotaManagementTesting || !settings || !quotaManagementKeyConfigured}
+              onClick={() => void testManagementConnection()}
+            >
+              {quotaManagementTesting ? t("mapping.quotaManagementTesting") : t("mapping.quotaManagementTest")}
+            </button>
+            <button
+              className="btn sm danger-outline"
+              type="button"
+              disabled={loading || saving || !settings || !quotaManagementKeyConfigured}
+              onClick={() => void clearManagementKey()}
+            >
+              {t("mapping.quotaManagementClearKey")}
+            </button>
+          </div>
+          {!quotaManagementKeyConfigured && <p className="muted quota-management-note">{t("mapping.quotaManagementTestNeedsKey")}</p>}
+          {quotaManagementError && <div className="error quota-management-feedback">{quotaManagementError}</div>}
+          {quotaManagementMessage && <div className="success quota-management-feedback">{quotaManagementMessage}</div>}
         </div>
         <p className="muted quota-warning">{t("mapping.quotaWarning")}</p>
         {quotaStatus?.persistence_blocked && <div className="error">{t("mapping.quotaPersistenceBlocked")}: {quotaStatus.persistence_error}</div>}

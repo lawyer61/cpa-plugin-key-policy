@@ -27,6 +27,9 @@ plugins:
       quota_activation_enabled: false
       quota_activation_scope: "managed-pools" # managed-pools | all-codex
       quota_activation_model: "gpt-5.6-luna"
+      # Account-proxy quota maintenance bridge settings (including its write-only
+      # management key and independent activation switch) are managed in the
+      # plugin UI and persisted only in state_file; do not place the key here.
 
       # Prefer creating keys/aliases/classify rules via Web UI or Management API.
       # Seed keys below are mainly for first boot when state_file does not exist.

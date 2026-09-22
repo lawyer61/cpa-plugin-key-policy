@@ -54,6 +54,7 @@ type lookupQuotaTarget struct {
 	operationID   string
 	backoff       time.Time
 	queryEligible bool
+	transport     string
 	ref           string
 }
 
@@ -278,11 +279,18 @@ func (m *quotaManager) lookupQuotaView(key policy.KeyConfig, transportAvailable 
 			operationID:   quotaOperationIdentity(fingerprint, selected.authID),
 			backoff:       backoff,
 			queryEligible: selected.runtime.QueryEligible,
+			transport:     selected.runtime.MaintenanceTransport,
 			ref:           ref,
 		}
 		if key.AllowQuotaRefresh {
+			accountTransportAvailable := transportAvailable
+			if target.transport == quotaTransportManagement {
+				managementSettings := m.store.QuotaManagementSettings()
+				managementState, _ := m.bridge.status(managementSettings)
+				accountTransportAvailable = quotaManagementReady(managementSettings) && managementState == "ready"
+			}
 			switch {
-			case !transportAvailable || persistenceBlocked:
+			case !accountTransportAvailable || persistenceBlocked:
 				account.RefreshStatus = "transport_unavailable"
 			case !selected.runtime.QueryEligible:
 				account.RefreshStatus = "unavailable"
@@ -352,7 +360,7 @@ func publicQuotaAuthStatus(runtime quotaAuthRuntime) string {
 		return "unavailable"
 	case "access_token_expired":
 		return "expired"
-	case "per_auth_proxy_unsupported":
+	case "per_auth_proxy_unsupported", "per_auth_proxy_invalid":
 		return "unqueryable"
 	}
 	if runtime.QueryEligible {
@@ -473,7 +481,7 @@ func (a *App) lookupQuotaRefresh(headers http.Header, hostCallbackID string) Man
 	if !found || !hmac.Equal([]byte(target.ref), []byte(ref)) {
 		return lookupQuotaError(http.StatusNotFound, "quota_account_inaccessible", "quota account is not accessible", time.Time{})
 	}
-	if strings.TrimSpace(hostCallbackID) == "" {
+	if target.transport != quotaTransportManagement && strings.TrimSpace(hostCallbackID) == "" {
 		return lookupQuotaError(http.StatusServiceUnavailable, "quota_refresh_transport_unavailable", "host request cancellation is unavailable", time.Time{})
 	}
 	a.quota.mu.Lock()
@@ -543,7 +551,7 @@ func (m *quotaManager) executeManualQuotaRefresh(token string, target lookupQuot
 	if !ok {
 		return manualQuotaRefreshResult{status: http.StatusNotFound, code: "quota_account_inaccessible", message: "quota account is not accessible"}
 	}
-	evaluation := confirmQuotaRosterEntry(host, rosterEntry, m.store.ClassifyRulesSnapshot(), now)
+	evaluation := m.confirmQuotaRosterEntry(host, rosterEntry, m.store.ClassifyRulesSnapshot(), now)
 	if !manualQuotaEvaluationMatches(evaluation, target) {
 		return manualQuotaRefreshResult{status: http.StatusNotFound, code: "quota_account_inaccessible", message: "quota account is not accessible"}
 	}
@@ -551,7 +559,8 @@ func (m *quotaManager) executeManualQuotaRefresh(token string, target lookupQuot
 	if current == nil || !current.Enabled || current.Native || !current.AllowQuotaRefresh || !quotaKeyAllowsAuth(*current, target.authID) {
 		return manualQuotaRefreshResult{status: http.StatusNotFound, code: "quota_account_inaccessible", message: "quota account is not accessible"}
 	}
-	observation, statusCode, err := fetchCodexQuotaWithCallback(host, evaluation.credentials, m.now, hostCallbackID)
+	maintenanceTarget := codexMaintenanceTarget{AuthID: target.authID, AuthIndex: target.authIndex, Credentials: evaluation.credentials, Proxy: evaluation.proxy}
+	observation, statusCode, err := m.fetchCodexQuotaTarget(host, maintenanceTarget, hostCallbackID)
 	if err != nil {
 		var httpErr quotaHTTPError
 		if errors.As(err, &httpErr) {
@@ -567,7 +576,7 @@ func (m *quotaManager) executeManualQuotaRefresh(token string, target lookupQuot
 	if !ok {
 		return manualQuotaRefreshResult{status: http.StatusNotFound, code: "quota_account_inaccessible", message: "quota account is not accessible"}
 	}
-	post := confirmQuotaRosterEntry(host, postEntry, m.store.ClassifyRulesSnapshot(), m.now())
+	post := m.confirmQuotaRosterEntry(host, postEntry, m.store.ClassifyRulesSnapshot(), m.now())
 	if !manualQuotaEvaluationMatches(post, target) {
 		return manualQuotaRefreshResult{status: http.StatusNotFound, code: "quota_account_inaccessible", message: "quota account is not accessible"}
 	}
@@ -608,7 +617,8 @@ func manualQuotaEvaluationMatches(evaluation quotaRosterEvaluation, target looku
 	return evaluation.confirmed && evaluation.queryEligible &&
 		strings.TrimSpace(evaluation.entry.ID) == target.authID &&
 		strings.TrimSpace(evaluation.entry.AuthIndex) == target.authIndex &&
-		evaluation.fingerprint == target.fingerprint
+		evaluation.fingerprint == target.fingerprint &&
+		codexMaintenanceTarget{Proxy: evaluation.proxy}.transport() == target.transport
 }
 
 func lookupQuotaError(status int, code, message string, retryAt time.Time) ManagementResponse {

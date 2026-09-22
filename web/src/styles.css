@@ -1150,6 +1150,52 @@ td.strong { font-weight: 600; color: var(--text); }
   align-self: center;
   min-height: 42px;
 }
+.quota-management-settings {
+  margin-top: 18px;
+  padding: 16px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: color-mix(in srgb, var(--panel) 78%, transparent);
+}
+.quota-management-toggle,
+.quota-management-activation-toggle {
+  margin-top: 14px;
+  min-height: 38px;
+}
+.quota-management-note {
+  margin: 6px 0 0;
+  font-size: 12px;
+}
+.quota-management-key-status {
+  display: block;
+  margin-top: 2px;
+  font-size: 12px;
+}
+.quota-management-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 2px;
+}
+.quota-management-feedback {
+  margin-top: 10px;
+}
+.quota-management-status {
+  flex: 0 0 auto;
+  padding: 4px 8px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  color: var(--muted);
+  font-size: 12px;
+}
+.quota-management-status.ready {
+  border-color: color-mix(in srgb, var(--ok) 45%, var(--border));
+  color: var(--ok);
+}
+.quota-management-status.paused {
+  border-color: color-mix(in srgb, var(--danger) 45%, var(--border));
+  color: var(--danger);
+}
 .quota-warning {
   margin: 10px 0 0;
 }
@@ -1551,6 +1597,8 @@ td.strong { font-weight: 600; color: var(--text); }
   .runtime-auth-row { flex-wrap: wrap; }
   .quota-auth-card-head { grid-template-columns: 1fr auto; }
   .quota-auth-card-head .quota-freshness { grid-column: 1 / -1; }
+  .quota-management-settings { padding: 14px; }
+  .quota-management-status { align-self: flex-start; }
   .quota-scope-grid,
   .quota-window-grid,
   .quota-auth-meta { grid-template-columns: 1fr; }

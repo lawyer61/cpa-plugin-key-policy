@@ -1,6 +1,7 @@
 package plugin
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -32,6 +33,7 @@ type quotaManager struct {
 	store         *policy.Store
 	concurrency   *concurrencyTracker
 	cache         *quotaCache
+	bridge        *quotaManagementBridge
 	now           func() time.Time
 	verifyDelay   time.Duration
 	manualTimeout time.Duration
@@ -62,6 +64,7 @@ func newQuotaManager(store *policy.Store, concurrency *concurrencyTracker, now f
 		store:         store,
 		concurrency:   concurrency,
 		cache:         newQuotaCache(now),
+		bridge:        newQuotaManagementBridge(),
 		now:           now,
 		verifyDelay:   3 * time.Second,
 		manualTimeout: 25 * time.Second,
@@ -542,6 +545,7 @@ type quotaRosterEvaluation struct {
 	planType      string
 	groups        []string
 	credentials   codexCredentials
+	proxy         codexAuthProxy
 	reason        string
 }
 
@@ -563,7 +567,7 @@ func (m *quotaManager) applyRoster(host HostClient, entries []HostAuthEntry, set
 		if strings.TrimSpace(entry.ID) == "" {
 			continue
 		}
-		evaluated = append(evaluated, confirmQuotaRosterEntry(host, entry, rules, now))
+		evaluated = append(evaluated, m.confirmQuotaRosterEntry(host, entry, rules, now))
 	}
 
 	eligible := make([]HostAuthEntry, 0, len(evaluated))
@@ -597,6 +601,7 @@ func (m *quotaManager) applyRoster(host HostClient, entries []HostAuthEntry, set
 		runtime.Groups = append([]string(nil), evaluation.groups...)
 		runtime.RosterConfirmed = evaluation.confirmed
 		runtime.QueryEligible = evaluation.queryEligible
+		runtime.MaintenanceTransport = codexMaintenanceTarget{Proxy: evaluation.proxy}.transport()
 		runtime.Status = strings.TrimSpace(entry.Status)
 		runtime.InManagedPool = managed
 		runtime.InMaintenanceScope = maintenance
@@ -663,7 +668,7 @@ func (m *quotaManager) applyRoster(host HostClient, entries []HostAuthEntry, set
 	return eligible
 }
 
-func confirmQuotaRosterEntry(host HostClient, entry HostAuthEntry, rules []policy.ClassifyRule, now time.Time) quotaRosterEvaluation {
+func (m *quotaManager) confirmQuotaRosterEntry(host HostClient, entry HostAuthEntry, rules []policy.ClassifyRule, now time.Time) quotaRosterEvaluation {
 	evaluation := quotaRosterEvaluation{entry: entry}
 	authID := strings.TrimSpace(entry.ID)
 	if host == nil || strings.TrimSpace(entry.AuthIndex) == "" {
@@ -694,6 +699,7 @@ func confirmQuotaRosterEntry(host HostClient, entry HostAuthEntry, rules []polic
 		return evaluation
 	}
 	attributes := codexAuthAttributes(doc.JSON)
+	proxy, proxyErr := parseCodexAuthProxy(doc.JSON)
 	evaluation.entry = live
 	evaluation.entry.ID = authID
 	evaluation.entry.AuthIndex = entry.AuthIndex
@@ -702,6 +708,7 @@ func confirmQuotaRosterEntry(host HostClient, entry HostAuthEntry, rules []polic
 	evaluation.queryEligible = true
 	evaluation.fingerprint = codexCredentialFingerprint(credentials)
 	evaluation.credentials = credentials
+	evaluation.proxy = proxy
 	evaluation.planType = strings.ToLower(strings.TrimSpace(attributes["plan_type"]))
 	evaluation.groups = policy.GroupsForCredential("codex", attributes, authID, rules)
 	disabled := entry.Disabled || live.Disabled || strings.EqualFold(strings.TrimSpace(entry.Status), "disabled") || strings.EqualFold(strings.TrimSpace(live.Status), "disabled")
@@ -715,7 +722,11 @@ func confirmQuotaRosterEntry(host HostClient, entry HostAuthEntry, rules []polic
 		evaluation.scopeEligible = false
 		evaluation.queryEligible = false
 		evaluation.reason = "disabled"
-	case codexAuthUsesUnsupportedProxy(doc.JSON):
+	case proxyErr != nil:
+		evaluation.scopeEligible = false
+		evaluation.queryEligible = false
+		evaluation.reason = "per_auth_proxy_invalid"
+	case proxy.Present && !quotaManagementReady(m.store.QuotaManagementSettings()):
 		evaluation.scopeEligible = false
 		evaluation.queryEligible = false
 		evaluation.reason = "per_auth_proxy_unsupported"
@@ -938,8 +949,13 @@ func (m *quotaManager) refreshAuth(host HostClient, rosterEntry HostAuthEntry, s
 		m.setAuthError(rosterEntry.ID, "credential_unavailable", err)
 		return
 	}
-	if codexAuthUsesUnsupportedProxy(doc.JSON) {
-		m.setAuthError(rosterEntry.ID, "per_auth_proxy_unsupported", errors.New("host callback cannot preserve this auth's per-account proxy"))
+	proxy, err := parseCodexAuthProxy(doc.JSON)
+	if err != nil {
+		m.setAuthError(rosterEntry.ID, "per_auth_proxy_invalid", err)
+		return
+	}
+	if proxy.Present && !quotaManagementReady(m.store.QuotaManagementSettings()) {
+		m.setAuthError(rosterEntry.ID, "per_auth_proxy_unsupported", errors.New("management bridge is not configured"))
 		return
 	}
 	credentials, err := extractCodexCredentials(doc.JSON)
@@ -952,7 +968,8 @@ func (m *quotaManager) refreshAuth(host HostClient, rosterEntry HostAuthEntry, s
 		return
 	}
 	fingerprint := codexCredentialFingerprint(credentials)
-	observation, _, err := m.fetchCodexQuotaBackground(host, credentials, operationID)
+	target := codexMaintenanceTarget{AuthID: rosterEntry.ID, AuthIndex: rosterEntry.AuthIndex, Credentials: credentials, Proxy: proxy}
+	observation, _, err := m.fetchCodexQuotaBackground(host, target, operationID)
 	if err != nil {
 		var httpErr quotaHTTPError
 		if errors.As(err, &httpErr) {
@@ -978,7 +995,7 @@ func (m *quotaManager) refreshAuth(host HostClient, rosterEntry HostAuthEntry, s
 	if len(lazy) == 0 || !settings.QuotaActivationEnabled || !m.authActivationAllowed(rosterEntry.ID, allowExpiredHostUnavailable) {
 		return
 	}
-	m.tryActivate(host, rosterEntry, credentials, lazy, decisionAt, allowExpiredHostUnavailable)
+	m.tryActivate(host, rosterEntry, target, lazy, decisionAt, allowExpiredHostUnavailable)
 }
 
 type quotaHTTPError struct {
@@ -1012,7 +1029,10 @@ func fetchCodexQuotaWithCallback(host HostClient, credentials codexCredentials, 
 	if err != nil {
 		return quotaObservation{}, 0, err
 	}
-	observedAt := now()
+	return parseCodexQuotaResponse(response, now())
+}
+
+func parseCodexQuotaResponse(response HostHTTPResponse, observedAt time.Time) (quotaObservation, int, error) {
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
 		retryAt, _ := parseRetryAfter(response.Headers.Get("Retry-After"), observedAt)
 		return quotaObservation{}, response.StatusCode, quotaHTTPError{status: response.StatusCode, retryAt: retryAt}
@@ -1024,13 +1044,24 @@ func fetchCodexQuotaWithCallback(host HostClient, credentials codexCredentials, 
 	return observation, response.StatusCode, nil
 }
 
-func (m *quotaManager) fetchCodexQuotaBackground(host HostClient, credentials codexCredentials, operationID string) (quotaObservation, int, error) {
+func (m *quotaManager) fetchCodexQuotaTarget(host HostClient, target codexMaintenanceTarget, hostCallbackID string) (quotaObservation, int, error) {
+	if target.Proxy.Present {
+		response, err := m.bridge.doUpstream(context.Background(), m.store.QuotaManagementSettings(), target, http.MethodGet, codexQuotaEndpoint, nil)
+		if err != nil {
+			return quotaObservation{}, 0, err
+		}
+		return parseCodexQuotaResponse(response, m.now())
+	}
+	return fetchCodexQuotaWithCallback(host, target.Credentials, m.now, hostCallbackID)
+}
+
+func (m *quotaManager) fetchCodexQuotaBackground(host HostClient, target codexMaintenanceTarget, operationID string) (quotaObservation, int, error) {
 	releaseGET, acquired := m.operations.acquireBackgroundGET()
 	if !acquired {
 		return quotaObservation{}, 0, errors.New("quota manager stopped")
 	}
 	defer releaseGET()
-	observation, status, err := fetchCodexQuota(host, credentials, m.now)
+	observation, status, err := m.fetchCodexQuotaTarget(host, target, "")
 	m.operations.noteAuthAttempt(operationID)
 	return observation, status, err
 }
@@ -1232,7 +1263,28 @@ func quotaCycleID(fingerprint string, baselines map[quotaWindowKind]quotaWindowB
 	return hex.EncodeToString(sum[:16])
 }
 
-func (m *quotaManager) tryActivate(host HostClient, rosterEntry HostAuthEntry, credentials codexCredentials, lazy []quotaWindowKind, now time.Time, allowExpiredHostUnavailable bool) {
+func (m *quotaManager) doCodexActivation(host HostClient, target codexMaintenanceTarget, payload []byte) (HostHTTPResponse, error) {
+	if target.Proxy.Present {
+		response, err := m.bridge.doUpstream(context.Background(), m.store.QuotaManagementSettings(), target, http.MethodPost, codexActivationEndpoint, payload)
+		if err != nil {
+			return HostHTTPResponse{}, err
+		}
+		return response, nil
+	}
+	return host.Do(HostHTTPRequest{
+		Method: http.MethodPost,
+		URL:    codexActivationEndpoint,
+		Headers: http.Header{
+			"Authorization":      []string{"Bearer " + target.Credentials.AccessToken},
+			"Chatgpt-Account-Id": []string{target.Credentials.AccountID},
+			"Content-Type":       []string{"application/json"},
+			"User-Agent":         []string{codexQuotaUserAgent},
+		},
+		Body: payload,
+	})
+}
+
+func (m *quotaManager) tryActivate(host HostClient, rosterEntry HostAuthEntry, target codexMaintenanceTarget, lazy []quotaWindowKind, now time.Time, allowExpiredHostUnavailable bool) {
 	if !m.authActivationAllowed(rosterEntry.ID, allowExpiredHostUnavailable) {
 		return
 	}
@@ -1247,8 +1299,13 @@ func (m *quotaManager) tryActivate(host HostClient, rosterEntry HostAuthEntry, c
 		return
 	}
 	doc, err := host.GetAuth(rosterEntry.AuthIndex)
-	if err != nil || codexAuthUsesUnsupportedProxy(doc.JSON) {
+	if err != nil {
 		m.setAuthActivationDeferred(rosterEntry.ID, "credential_revalidation_failed", now.Add(30*time.Minute))
+		return
+	}
+	currentProxy, err := parseCodexAuthProxy(doc.JSON)
+	if err != nil || currentProxy.Present != target.Proxy.Present || currentProxy.Value != target.Proxy.Value {
+		m.setAuthActivationDeferred(rosterEntry.ID, "credential_proxy_changed", now.Add(30*time.Minute))
 		return
 	}
 	currentCredentials, err := extractCodexCredentials(doc.JSON)
@@ -1256,11 +1313,20 @@ func (m *quotaManager) tryActivate(host HostClient, rosterEntry HostAuthEntry, c
 		m.setAuthActivationDeferred(rosterEntry.ID, "credential_revalidation_failed", now.Add(30*time.Minute))
 		return
 	}
-	if codexCredentialFingerprint(currentCredentials) != codexCredentialFingerprint(credentials) {
+	if codexCredentialFingerprint(currentCredentials) != codexCredentialFingerprint(target.Credentials) {
 		m.setAuthActivationDeferred(rosterEntry.ID, "credential_instance_changed", now.Add(30*time.Minute))
 		return
 	}
-	credentials = currentCredentials
+	target.Credentials = currentCredentials
+	managementSettings := m.store.QuotaManagementSettings()
+	managementFingerprint := ""
+	if target.Proxy.Present {
+		if !quotaManagementReady(managementSettings) || !managementSettings.ActivationEnabled {
+			m.setAuthActivationDeferred(rosterEntry.ID, "management_activation_disabled", now.Add(30*time.Minute))
+			return
+		}
+		managementFingerprint = quotaManagementSettingsFingerprint(managementSettings)
+	}
 	activationModel := m.store.RuntimeSettings().QuotaActivationModel
 	activationPayload, err := buildCodexActivationPayload(activationModel)
 	if err != nil {
@@ -1332,21 +1398,44 @@ func (m *quotaManager) tryActivate(host HostClient, rosterEntry HostAuthEntry, c
 		_ = m.persist()
 		return
 	}
+	if target.Proxy.Present {
+		currentSettings := m.store.QuotaManagementSettings()
+		if !quotaManagementReady(currentSettings) || !currentSettings.ActivationEnabled || quotaManagementSettingsFingerprint(currentSettings) != managementFingerprint {
+			release()
+			m.mu.Lock()
+			runtime = m.runtime.Auths[rosterEntry.ID]
+			runtime.Activation.Status = "deferred"
+			runtime.Activation.SendIntent = false
+			runtime.Activation.LastResult = "management_activation_disabled_before_send"
+			if runtime.Activation.Attempts > 0 {
+				runtime.Activation.Attempts--
+			}
+			runtime.Activation.LastAttemptAt = time.Time{}
+			m.runtime.Auths[rosterEntry.ID] = runtime
+			m.mu.Unlock()
+			_ = m.persist()
+			return
+		}
+	}
 
-	response, postErr := host.Do(HostHTTPRequest{
-		Method: http.MethodPost,
-		URL:    codexActivationEndpoint,
-		Headers: http.Header{
-			"Authorization":      []string{"Bearer " + credentials.AccessToken},
-			"Chatgpt-Account-Id": []string{credentials.AccountID},
-			"Content-Type":       []string{"application/json"},
-			"User-Agent":         []string{codexQuotaUserAgent},
-		},
-		Body: activationPayload,
-	})
+	response, postErr := m.doCodexActivation(host, target, activationPayload)
 	release()
 	m.mu.Lock()
 	runtime = m.runtime.Auths[rosterEntry.ID]
+	if target.Proxy.Present && postErr != nil && bridgeErrorDefinitelyNotSent(postErr) {
+		runtime.Activation.Status = "deferred"
+		runtime.Activation.SendIntent = false
+		runtime.Activation.LastResult = bridgeErrorCode(postErr)
+		runtime.Activation.LastError = ""
+		if runtime.Activation.Attempts > 0 {
+			runtime.Activation.Attempts--
+		}
+		runtime.Activation.LastAttemptAt = time.Time{}
+		m.runtime.Auths[rosterEntry.ID] = runtime
+		m.mu.Unlock()
+		_ = m.persist()
+		return
+	}
 	runtime.Activation.Status = "verify_pending"
 	runtime.Activation.LastResult = "outcome_unknown"
 	if postErr != nil {
@@ -1383,14 +1472,14 @@ func (m *quotaManager) tryActivate(host HostClient, rosterEntry HostAuthEntry, c
 	if !m.waitVerifyDelay() {
 		return
 	}
-	verified, _, verifyErr := m.fetchCodexQuotaBackground(host, credentials, m.quotaOperationID(rosterEntry.ID))
+	verified, _, verifyErr := m.fetchCodexQuotaBackground(host, target, m.quotaOperationID(rosterEntry.ID))
 	if verifyErr == nil {
 		verifyAt := verified.ObservedAt
 		if verifyAt.IsZero() {
 			verifyAt = m.now()
 		}
 		verified.AuthIndex = rosterEntry.AuthIndex
-		verified.CredentialFingerprint = codexCredentialFingerprint(credentials)
+		verified.CredentialFingerprint = codexCredentialFingerprint(target.Credentials)
 		m.cache.observe(rosterEntry.ID, rosterEntry.AuthIndex, "quota-get", verified)
 		m.processObservation(rosterEntry.ID, rosterEntry.AuthIndex, verified.CredentialFingerprint, verified, verifyAt)
 		m.mu.Lock()
@@ -1657,6 +1746,8 @@ func cloneQuotaRuntimeDocument(src quotaRuntimeDocument) quotaRuntimeDocument {
 
 func (m *quotaManager) status() map[string]any {
 	settings := m.store.RuntimeSettings()
+	managementSettings := m.store.QuotaManagementSettings()
+	managementState, managementError := m.bridge.status(managementSettings)
 	_, ttl := m.durations()
 	now := m.now()
 	concurrency := m.concurrency.snapshot()
@@ -1688,46 +1779,51 @@ func (m *quotaManager) status() map[string]any {
 			availability = "exhausted"
 		}
 		auths = append(auths, map[string]any{
-			"auth_id":              authID,
-			"auth_index":           runtime.AuthIndex,
-			"provider":             runtime.Provider,
-			"status":               runtime.Status,
-			"observable":           true,
-			"query_eligible":       runtime.QueryEligible,
-			"in_managed_pool":      runtime.InManagedPool,
-			"in_maintenance_scope": runtime.InMaintenanceScope,
-			"in_activation_scope":  runtime.InActivationScope,
-			"exclusion_reason":     runtime.ExclusionReason,
-			"availability":         availability,
-			"freshness":            freshness,
-			"observation":          publicQuotaObservation(observation),
-			"last_roster_seen_at":  runtime.LastRosterSeenAt,
-			"last_check_at":        runtime.LastCheckAt,
-			"next_check_at":        runtime.NextCheckAt,
-			"last_result":          runtime.LastResult,
-			"last_error":           runtime.LastError,
-			"activation":           runtime.Activation,
-			"controlled_in_flight": concurrency.Auths[authID],
-			"activation_in_flight": concurrency.AuthActivations[authID],
+			"auth_id":               authID,
+			"auth_index":            runtime.AuthIndex,
+			"provider":              runtime.Provider,
+			"status":                runtime.Status,
+			"observable":            true,
+			"query_eligible":        runtime.QueryEligible,
+			"maintenance_transport": runtime.MaintenanceTransport,
+			"in_managed_pool":       runtime.InManagedPool,
+			"in_maintenance_scope":  runtime.InMaintenanceScope,
+			"in_activation_scope":   runtime.InActivationScope,
+			"exclusion_reason":      runtime.ExclusionReason,
+			"availability":          availability,
+			"freshness":             freshness,
+			"observation":           publicQuotaObservation(observation),
+			"last_roster_seen_at":   runtime.LastRosterSeenAt,
+			"last_check_at":         runtime.LastCheckAt,
+			"next_check_at":         runtime.NextCheckAt,
+			"last_result":           runtime.LastResult,
+			"last_error":            runtime.LastError,
+			"activation":            runtime.Activation,
+			"controlled_in_flight":  concurrency.Auths[authID],
+			"activation_in_flight":  concurrency.AuthActivations[authID],
 		})
 	}
 	sort.Slice(auths, func(i, j int) bool { return fmt.Sprint(auths[i]["auth_id"]) < fmt.Sprint(auths[j]["auth_id"]) })
 	return map[string]any{
-		"quota_check_interval":          settings.QuotaCheckInterval,
-		"quota_cache_ttl":               settings.QuotaCacheTTL,
-		"quota_activation_enabled":      settings.QuotaActivationEnabled,
-		"quota_activation_scope":        settings.QuotaActivationScope,
-		"quota_activation_model":        settings.QuotaActivationModel,
-		"quota_activation_max_attempts": quotaMaxActivationTries,
-		"runtime_path":                  path,
-		"persistence_blocked":           blocked,
-		"persistence_error":             persistErr,
-		"last_error":                    lastError,
-		"last_roster_sync":              doc.LastRosterSync,
-		"last_round_at":                 doc.LastRoundAt,
-		"observed_auth_count":           len(observations),
-		"controlled_activation_current": concurrency.ActivationTotal,
-		"auths":                         auths,
+		"quota_check_interval":                settings.QuotaCheckInterval,
+		"quota_cache_ttl":                     settings.QuotaCacheTTL,
+		"quota_activation_enabled":            settings.QuotaActivationEnabled,
+		"quota_activation_scope":              settings.QuotaActivationScope,
+		"quota_activation_model":              settings.QuotaActivationModel,
+		"quota_activation_max_attempts":       quotaMaxActivationTries,
+		"quota_management_enabled":            managementSettings.Enabled,
+		"quota_management_activation_enabled": managementSettings.ActivationEnabled,
+		"quota_management_state":              managementState,
+		"quota_management_last_error":         managementError,
+		"runtime_path":                        path,
+		"persistence_blocked":                 blocked,
+		"persistence_error":                   persistErr,
+		"last_error":                          lastError,
+		"last_roster_sync":                    doc.LastRosterSync,
+		"last_round_at":                       doc.LastRoundAt,
+		"observed_auth_count":                 len(observations),
+		"controlled_activation_current":       concurrency.ActivationTotal,
+		"auths":                               auths,
 	}
 }
 

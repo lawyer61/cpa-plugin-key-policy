@@ -13,26 +13,30 @@ import (
 )
 
 type Store struct {
-	mu                            sync.RWMutex
-	updateMu                      sync.Mutex
-	usageGate                     sync.RWMutex
-	persistMu                     sync.Mutex
-	enabled                       bool
-	globalWeightedRoundRobin      bool
-	authConcurrencyLimits         map[string]int
-	sessionAffinityIdleTTLSeconds int
-	sessionAffinityMaxEntries     int
-	quotaCheckInterval            string
-	quotaCacheTTL                 string
-	quotaActivationEnabled        bool
-	quotaActivationScope          string
-	quotaActivationModel          string
-	statePath                     string
-	keys                          map[string]*KeyConfig
-	keysByHash                    map[string]*KeyConfig
-	keysByCallerScope             map[string]*KeyConfig
-	limiter                       *RateLimiter
-	usage                         *usageLedger
+	mu                               sync.RWMutex
+	updateMu                         sync.Mutex
+	usageGate                        sync.RWMutex
+	persistMu                        sync.Mutex
+	enabled                          bool
+	globalWeightedRoundRobin         bool
+	authConcurrencyLimits            map[string]int
+	sessionAffinityIdleTTLSeconds    int
+	sessionAffinityMaxEntries        int
+	quotaCheckInterval               string
+	quotaCacheTTL                    string
+	quotaActivationEnabled           bool
+	quotaActivationScope             string
+	quotaActivationModel             string
+	quotaManagementEnabled           bool
+	quotaManagementActivationEnabled bool
+	quotaManagementBaseURL           string
+	quotaManagementKey               string
+	statePath                        string
+	keys                             map[string]*KeyConfig
+	keysByHash                       map[string]*KeyConfig
+	keysByCallerScope                map[string]*KeyConfig
+	limiter                          *RateLimiter
+	usage                            *usageLedger
 	// flusher for periodically persisting the usage ledger to the state file.
 	flusher *usageFlusher
 	// aliases is the global alias mapping table from config.yaml. Used to
@@ -93,6 +97,7 @@ func NewStore() *Store {
 		quotaActivationEnabled:        defaults.QuotaActivationEnabled,
 		quotaActivationScope:          defaults.QuotaActivationScope,
 		quotaActivationModel:          defaults.QuotaActivationModel,
+		quotaManagementBaseURL:        DefaultQuotaManagementBaseURL,
 		keys:                          make(map[string]*KeyConfig),
 		keysByHash:                    make(map[string]*KeyConfig),
 		keysByCallerScope:             make(map[string]*KeyConfig),
@@ -154,6 +159,7 @@ func (s *Store) Configure(cfg Config) error {
 
 	keys := cfg.Keys
 	var loadedUsage map[string]*UsageState
+	quotaManagement := defaultQuotaManagementSettings()
 	firstBoot := false
 	if state, errLoad := LoadState(statePath); errLoad == nil {
 		if state.UsageSchemaVersion == 0 {
@@ -175,6 +181,10 @@ func (s *Store) Configure(cfg Config) error {
 		}
 		keys = state.Keys
 		loadedUsage = state.Usage
+		if state.QuotaManagement != nil {
+			quotaManagement = *state.QuotaManagement
+			quotaManagement.BaseURL = normalizeQuotaManagementBaseURL(quotaManagement.BaseURL)
+		}
 		if state.GlobalWeightedRoundRobin != nil {
 			cfg.GlobalWeightedRoundRobin = *state.GlobalWeightedRoundRobin
 		}
@@ -281,6 +291,10 @@ func (s *Store) Configure(cfg Config) error {
 	s.quotaActivationEnabled = cfg.QuotaActivationEnabled
 	s.quotaActivationScope = cfg.QuotaActivationScope
 	s.quotaActivationModel = cfg.QuotaActivationModel
+	s.quotaManagementEnabled = quotaManagement.Enabled
+	s.quotaManagementActivationEnabled = quotaManagement.ActivationEnabled
+	s.quotaManagementBaseURL = normalizeQuotaManagementBaseURL(quotaManagement.BaseURL)
+	s.quotaManagementKey = quotaManagement.Key
 	s.statePath = statePath
 	// Store the global alias table and classify rules for routing/billing.
 	s.aliases = make(map[string]*AliasMapping, len(cfg.Aliases))
@@ -346,6 +360,93 @@ func (s *Store) RuntimeSettings() RuntimeSettings {
 		QuotaActivationScope:          s.quotaActivationScope,
 		QuotaActivationModel:          s.quotaActivationModel,
 	}
+}
+
+// QuotaManagementSettings returns the complete internal bridge snapshot,
+// including the recoverable management key. Callers must not expose this
+// value through public status, lookup, export, or plugin metadata DTOs.
+func (s *Store) QuotaManagementSettings() QuotaManagementSettings {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.quotaManagementSettingsLocked()
+}
+
+func (s *Store) quotaManagementSettingsLocked() QuotaManagementSettings {
+	return QuotaManagementSettings{
+		Enabled:           s.quotaManagementEnabled,
+		ActivationEnabled: s.quotaManagementActivationEnabled,
+		BaseURL:           normalizeQuotaManagementBaseURL(s.quotaManagementBaseURL),
+		Key:               s.quotaManagementKey,
+	}
+}
+
+// QuotaManagementSettingsPatch applies only non-nil fields. A non-nil empty
+// Key explicitly clears the stored credential.
+type QuotaManagementSettingsPatch struct {
+	Enabled           *bool
+	ActivationEnabled *bool
+	BaseURL           *string
+	Key               *string
+}
+
+// UpdateQuotaManagementSettings validates and atomically persists the private
+// bridge settings. A base URL change requires a non-empty key in the same
+// patch; enabling the bridge requires a non-empty final key.
+func (s *Store) UpdateQuotaManagementSettings(patch QuotaManagementSettingsPatch) (QuotaManagementSettings, error) {
+	s.updateMu.Lock()
+	defer s.updateMu.Unlock()
+
+	s.mu.Lock()
+	previous := s.quotaManagementSettingsLocked()
+	next := previous
+	if patch.Enabled != nil {
+		next.Enabled = *patch.Enabled
+	}
+	if patch.ActivationEnabled != nil {
+		next.ActivationEnabled = *patch.ActivationEnabled
+	}
+	if patch.BaseURL != nil {
+		next.BaseURL = normalizeQuotaManagementBaseURL(*patch.BaseURL)
+		if next.BaseURL != previous.BaseURL {
+			if patch.Key == nil || strings.TrimSpace(*patch.Key) == "" {
+				s.mu.Unlock()
+				return QuotaManagementSettings{}, fmt.Errorf("%w: changing quota management base_url requires a non-empty key in the same patch", ErrInvalidQuotaManagementSettings)
+			}
+		}
+	}
+	if patch.Key != nil {
+		next.Key = strings.TrimSpace(*patch.Key)
+	}
+	if next.Enabled && strings.TrimSpace(next.Key) == "" {
+		s.mu.Unlock()
+		return QuotaManagementSettings{}, fmt.Errorf("%w: quota management cannot be enabled without a key", ErrInvalidQuotaManagementSettings)
+	}
+	if next.Key == "" {
+		next.Key = ""
+	}
+	next.BaseURL = normalizeQuotaManagementBaseURL(next.BaseURL)
+
+	s.quotaManagementEnabled = next.Enabled
+	s.quotaManagementActivationEnabled = next.ActivationEnabled
+	s.quotaManagementBaseURL = next.BaseURL
+	s.quotaManagementKey = next.Key
+	keys := s.keysSnapshotLocked()
+	usage := s.usageSnapshotLocked()
+	aliases := s.aliasesSnapshotLocked()
+	rules := s.classifyRulesSnapshotLocked()
+	path := s.statePath
+	s.mu.Unlock()
+
+	if err := s.saveState(path, keys, usage, aliases, rules); err != nil {
+		s.mu.Lock()
+		s.quotaManagementEnabled = previous.Enabled
+		s.quotaManagementActivationEnabled = previous.ActivationEnabled
+		s.quotaManagementBaseURL = previous.BaseURL
+		s.quotaManagementKey = previous.Key
+		s.mu.Unlock()
+		return QuotaManagementSettings{}, err
+	}
+	return next, nil
 }
 
 // RuntimeSettingsPatch applies only the non-nil fields, then persists the
@@ -1022,6 +1123,7 @@ func (s *Store) ResetUsage(id string) (UsageResetResult, error) {
 	aliases := s.aliasesSnapshotLocked()
 	rules := s.classifyRulesSnapshotLocked()
 	settings := s.runtimeSettingsLocked()
+	quotaManagement := s.quotaManagementSettingsLocked()
 	usage := s.usage
 	s.mu.RUnlock()
 	if usage == nil {
@@ -1040,7 +1142,7 @@ func (s *Store) ResetUsage(id string) (UsageResetResult, error) {
 	zeroDaily := UsageWindow{WindowStart: utcDayStart(resetAt)}
 	zeroWeekly := UsageWindow{WindowStart: utcDayStart(resetAt).Add(-6 * dayWindow)}
 	summary := summaryFromWindows(*key, resetState, zeroDaily, zeroWeekly, resetAt)
-	if err := saveStateWithSettings(path, keys, candidate, aliases, rules, settings); err != nil {
+	if err := saveStateWithSettings(path, keys, candidate, aliases, rules, settings, quotaManagement); err != nil {
 		return UsageResetResult{}, err
 	}
 	usage.entries = candidate
@@ -1983,8 +2085,9 @@ func (s *Store) saveState(path string, keys []KeyConfig, _ map[string]*UsageStat
 	s.mu.RLock()
 	usage := s.usageSnapshotLocked()
 	settings := s.runtimeSettingsLocked()
+	quotaManagement := s.quotaManagementSettingsLocked()
 	s.mu.RUnlock()
-	return saveStateWithSettings(path, keys, usage, aliases, rules, settings)
+	return saveStateWithSettings(path, keys, usage, aliases, rules, settings, quotaManagement)
 }
 
 // persistCurrentStateNoGate writes a complete current snapshot. The caller
@@ -1999,11 +2102,12 @@ func (s *Store) persistCurrentStateNoGate() error {
 	aliases := s.aliasesSnapshotLocked()
 	rules := s.classifyRulesSnapshotLocked()
 	settings := s.runtimeSettingsLocked()
+	quotaManagement := s.quotaManagementSettingsLocked()
 	s.mu.RUnlock()
 	if path == "" {
 		return nil
 	}
-	return saveStateWithSettings(path, keys, usage, aliases, rules, settings)
+	return saveStateWithSettings(path, keys, usage, aliases, rules, settings, quotaManagement)
 }
 
 // StartUsageFlusher launches a goroutine that periodically persists the usage

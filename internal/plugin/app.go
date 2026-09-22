@@ -1,6 +1,7 @@
 package plugin
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/json"
 	"errors"
@@ -919,6 +920,7 @@ func (a *App) managementRegistration() ManagementRegistrationResponse {
 			{Method: http.MethodGet, Path: base + "/status", Description: "Show cpa-key-policy runtime status."},
 			{Method: http.MethodGet, Path: base + "/settings", Description: "Show scheduler settings."},
 			{Method: http.MethodPatch, Path: base + "/settings", Description: "Update scheduler settings."},
+			{Method: http.MethodPost, Path: base + "/quota-management/test", Description: "Test the saved loopback management bridge."},
 			{Method: http.MethodGet, Path: base + "/quota-status", Description: "Show Codex quota observation and maintenance state."},
 			{Method: http.MethodGet, Path: base + "/aliases", Description: "List the global alias mapping table."},
 			{Method: http.MethodPost, Path: base + "/aliases", Description: "Create or update a global alias mapping."},
@@ -996,6 +998,8 @@ func (a *App) handleManagement(raw []byte) ([]byte, error) {
 		return OKEnvelope(a.schedulerSettings())
 	case req.Method == http.MethodPatch && path == base+"/settings":
 		return OKEnvelope(a.updateSchedulerSettings(req.Body))
+	case req.Method == http.MethodPost && path == base+"/quota-management/test":
+		return OKEnvelope(a.testQuotaManagementBridge())
 	case req.Method == http.MethodGet && path == base+"/quota-status":
 		return OKEnvelope(jsonResponse(http.StatusOK, a.quota.status()))
 	case req.Method == http.MethodGet && path == base+"/aliases":
@@ -1031,26 +1035,38 @@ type schedulerSettingsRequest struct {
 	QuotaActivationEnabled        *bool           `json:"quota_activation_enabled"`
 	QuotaActivationScope          *string         `json:"quota_activation_scope"`
 	QuotaActivationModel          *string         `json:"quota_activation_model"`
+	QuotaManagementEnabled        *bool           `json:"quota_management_enabled"`
+	QuotaManagementActivation     *bool           `json:"quota_management_activation_enabled"`
+	QuotaManagementBaseURL        *string         `json:"quota_management_base_url"`
+	QuotaManagementKey            *string         `json:"quota_management_key"`
 }
 
 func (a *App) schedulerSettings() ManagementResponse {
 	settings := a.store.RuntimeSettings()
+	management := a.store.QuotaManagementSettings()
+	managementState, managementError := a.quota.bridge.status(management)
 	concurrency := a.concurrency.snapshot()
 	return jsonResponse(http.StatusOK, map[string]any{
-		"global_weighted_round_robin":       settings.GlobalWeightedRoundRobin,
-		"auth_concurrency_limits":           settings.AuthConcurrencyLimits,
-		"session_affinity_idle_ttl_seconds": settings.SessionAffinityIdleTTLSeconds,
-		"session_affinity_max_entries":      settings.SessionAffinityMaxEntries,
-		"quota_check_interval":              settings.QuotaCheckInterval,
-		"quota_cache_ttl":                   settings.QuotaCacheTTL,
-		"quota_activation_enabled":          settings.QuotaActivationEnabled,
-		"quota_activation_scope":            settings.QuotaActivationScope,
-		"quota_activation_model":            settings.QuotaActivationModel,
-		"current_concurrent_requests":       concurrency.Total,
-		"current_activation_requests":       concurrency.ActivationTotal,
-		"auth_concurrency_current":          concurrency.Auths,
-		"auth_activation_current":           concurrency.AuthActivations,
-		"session_affinity_entries":          a.affinity.size(),
+		"global_weighted_round_robin":         settings.GlobalWeightedRoundRobin,
+		"auth_concurrency_limits":             settings.AuthConcurrencyLimits,
+		"session_affinity_idle_ttl_seconds":   settings.SessionAffinityIdleTTLSeconds,
+		"session_affinity_max_entries":        settings.SessionAffinityMaxEntries,
+		"quota_check_interval":                settings.QuotaCheckInterval,
+		"quota_cache_ttl":                     settings.QuotaCacheTTL,
+		"quota_activation_enabled":            settings.QuotaActivationEnabled,
+		"quota_activation_scope":              settings.QuotaActivationScope,
+		"quota_activation_model":              settings.QuotaActivationModel,
+		"quota_management_enabled":            management.Enabled,
+		"quota_management_activation_enabled": management.ActivationEnabled,
+		"quota_management_base_url":           management.BaseURL,
+		"quota_management_key_configured":     strings.TrimSpace(management.Key) != "",
+		"quota_management_state":              managementState,
+		"quota_management_last_error":         managementError,
+		"current_concurrent_requests":         concurrency.Total,
+		"current_activation_requests":         concurrency.ActivationTotal,
+		"auth_concurrency_current":            concurrency.Auths,
+		"auth_activation_current":             concurrency.AuthActivations,
+		"session_affinity_entries":            a.affinity.size(),
 	})
 }
 
@@ -1062,33 +1078,111 @@ func (a *App) updateSchedulerSettings(body []byte) ManagementResponse {
 	if request.GlobalWeightedRoundRobin == nil && request.AuthConcurrencyLimits == nil &&
 		request.SessionAffinityIdleTTLSeconds == nil && request.SessionAffinityMaxEntries == nil &&
 		request.QuotaCheckInterval == nil && request.QuotaCacheTTL == nil &&
-		request.QuotaActivationEnabled == nil && request.QuotaActivationScope == nil && request.QuotaActivationModel == nil {
+		request.QuotaActivationEnabled == nil && request.QuotaActivationScope == nil && request.QuotaActivationModel == nil &&
+		request.QuotaManagementEnabled == nil && request.QuotaManagementActivation == nil &&
+		request.QuotaManagementBaseURL == nil && request.QuotaManagementKey == nil {
 		return jsonError(http.StatusBadRequest, "missing_setting", "缺少可更新的调度设置")
+	}
+	managementChanged := request.QuotaManagementEnabled != nil || request.QuotaManagementActivation != nil || request.QuotaManagementBaseURL != nil || request.QuotaManagementKey != nil
+	if request.QuotaManagementBaseURL != nil {
+		normalized, err := normalizeQuotaManagementBaseURL(*request.QuotaManagementBaseURL)
+		if err != nil {
+			return jsonError(http.StatusBadRequest, "invalid_quota_management_base_url", err.Error())
+		}
+		request.QuotaManagementBaseURL = &normalized
+	}
+	if request.QuotaManagementKey != nil {
+		trimmed := strings.TrimSpace(*request.QuotaManagementKey)
+		request.QuotaManagementKey = &trimmed
+	}
+	if managementChanged {
+		current := a.store.QuotaManagementSettings()
+		next := current
+		if request.QuotaManagementEnabled != nil {
+			next.Enabled = *request.QuotaManagementEnabled
+		}
+		if request.QuotaManagementActivation != nil {
+			next.ActivationEnabled = *request.QuotaManagementActivation
+		}
+		if request.QuotaManagementBaseURL != nil {
+			next.BaseURL = *request.QuotaManagementBaseURL
+			if next.BaseURL != current.BaseURL && (request.QuotaManagementKey == nil || *request.QuotaManagementKey == "") {
+				return jsonError(http.StatusBadRequest, "invalid_quota_management_setting", "修改管理基址时必须重新输入管理密钥")
+			}
+		}
+		if request.QuotaManagementKey != nil {
+			next.Key = *request.QuotaManagementKey
+		}
+		if next.Enabled && next.Key == "" {
+			return jsonError(http.StatusBadRequest, "invalid_quota_management_setting", "启用管理桥接前必须保存管理密钥")
+		}
 	}
 	previous := a.store.RuntimeSettings()
 	keys := a.store.Keys()
-	settings, err := a.store.UpdateRuntimeSettings(policy.RuntimeSettingsPatch{
-		GlobalWeightedRoundRobin:      request.GlobalWeightedRoundRobin,
-		AuthConcurrencyLimits:         request.AuthConcurrencyLimits,
-		SessionAffinityIdleTTLSeconds: request.SessionAffinityIdleTTLSeconds,
-		SessionAffinityMaxEntries:     request.SessionAffinityMaxEntries,
-		QuotaCheckInterval:            request.QuotaCheckInterval,
-		QuotaCacheTTL:                 request.QuotaCacheTTL,
-		QuotaActivationEnabled:        request.QuotaActivationEnabled,
-		QuotaActivationScope:          request.QuotaActivationScope,
-		QuotaActivationModel:          request.QuotaActivationModel,
-	})
+	settings := previous
+	var err error
+	runtimeChanged := request.GlobalWeightedRoundRobin != nil || request.AuthConcurrencyLimits != nil ||
+		request.SessionAffinityIdleTTLSeconds != nil || request.SessionAffinityMaxEntries != nil ||
+		request.QuotaCheckInterval != nil || request.QuotaCacheTTL != nil || request.QuotaActivationEnabled != nil ||
+		request.QuotaActivationScope != nil || request.QuotaActivationModel != nil
+	if runtimeChanged {
+		settings, err = a.store.UpdateRuntimeSettings(policy.RuntimeSettingsPatch{
+			GlobalWeightedRoundRobin:      request.GlobalWeightedRoundRobin,
+			AuthConcurrencyLimits:         request.AuthConcurrencyLimits,
+			SessionAffinityIdleTTLSeconds: request.SessionAffinityIdleTTLSeconds,
+			SessionAffinityMaxEntries:     request.SessionAffinityMaxEntries,
+			QuotaCheckInterval:            request.QuotaCheckInterval,
+			QuotaCacheTTL:                 request.QuotaCacheTTL,
+			QuotaActivationEnabled:        request.QuotaActivationEnabled,
+			QuotaActivationScope:          request.QuotaActivationScope,
+			QuotaActivationModel:          request.QuotaActivationModel,
+		})
+	}
 	if err != nil {
 		if errors.Is(err, policy.ErrInvalidRuntimeSettings) {
 			return jsonError(http.StatusBadRequest, "invalid_setting", err.Error())
 		}
 		return jsonError(http.StatusInternalServerError, "settings_persist_failed", "保存调度设置失败: "+err.Error())
 	}
+	if managementChanged {
+		if _, err = a.store.UpdateQuotaManagementSettings(policy.QuotaManagementSettingsPatch{
+			Enabled:           request.QuotaManagementEnabled,
+			ActivationEnabled: request.QuotaManagementActivation,
+			BaseURL:           request.QuotaManagementBaseURL,
+			Key:               request.QuotaManagementKey,
+		}); err != nil {
+			if errors.Is(err, policy.ErrInvalidQuotaManagementSettings) {
+				return jsonError(http.StatusBadRequest, "invalid_quota_management_setting", err.Error())
+			}
+			return jsonError(http.StatusInternalServerError, "settings_persist_failed", "保存账号代理维护设置失败: "+err.Error())
+		}
+		a.quota.bridge.reset()
+	}
 	a.affinity.configure(time.Duration(settings.SessionAffinityIdleTTLSeconds)*time.Second, settings.SessionAffinityMaxEntries)
 	a.clearSchedulerState()
 	restartQuotaDeadline := !quotaScheduleNeeded(previous, keys) && quotaScheduleNeeded(settings, keys)
 	a.quota.configure(a.store.StatePath(), restartQuotaDeadline)
 	return a.schedulerSettings()
+}
+
+func (a *App) testQuotaManagementBridge() ManagementResponse {
+	settings := a.store.QuotaManagementSettings()
+	if strings.TrimSpace(settings.Key) == "" {
+		return jsonError(http.StatusConflict, "quota_management_key_missing", "尚未保存管理密钥")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), quotaManagementRequestTimeout)
+	defer cancel()
+	if err := a.quota.bridge.test(ctx, settings); err != nil {
+		status := http.StatusBadGateway
+		var bridgeErr quotaManagementBridgeError
+		if errors.As(err, &bridgeErr) && (bridgeErr.Status == http.StatusUnauthorized || bridgeErr.Status == http.StatusForbidden) {
+			status = bridgeErr.Status
+		}
+		return jsonError(status, bridgeErrorCode(err), "管理接口连接测试失败")
+	}
+	a.quota.invalidateRoster()
+	a.quota.configure(a.store.StatePath(), false)
+	return jsonResponse(http.StatusOK, map[string]any{"ok": true})
 }
 
 type keyWriteRequest struct {

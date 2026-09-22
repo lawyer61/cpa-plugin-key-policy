@@ -1,6 +1,11 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { apiClient } from "./client";
-import { fetchQuotaStatus, fetchSchedulerSettings, updateSchedulerSettings } from "./mappings";
+import {
+  fetchQuotaStatus,
+  fetchSchedulerSettings,
+  testQuotaManagementConnection,
+  updateSchedulerSettings,
+} from "./mappings";
 
 vi.mock("./client", () => ({
   apiClient: vi.fn(),
@@ -10,10 +15,11 @@ vi.mock("./client", () => ({
 describe("调度设置接口", () => {
   const get = vi.fn();
   const patch = vi.fn();
+  const post = vi.fn();
 
   beforeEach(() => {
     vi.clearAllMocks();
-    vi.mocked(apiClient).mockReturnValue({ get, patch } as never);
+    vi.mocked(apiClient).mockReturnValue({ get, patch, post } as never);
   });
 
   it("从插件设置接口读取全局加权开关", async () => {
@@ -76,6 +82,42 @@ describe("调度设置接口", () => {
     expect(patch).toHaveBeenCalledWith(
       "/v0/management/plugins/cpa-key-policy/settings",
       quota,
+    );
+  });
+
+  it("普通设置 PATCH 不携带空的管理密钥字段", async () => {
+    const settings = {
+      quota_management_enabled: false,
+      quota_management_activation_enabled: false,
+      quota_management_base_url: "http://127.0.0.1:8317",
+    };
+    patch.mockResolvedValue({ data: settings });
+    await expect(updateSchedulerSettings(settings)).resolves.toEqual(settings);
+    expect(patch).toHaveBeenCalledWith(
+      "/v0/management/plugins/cpa-key-policy/settings",
+      settings,
+    );
+    expect((patch.mock.calls[0][1] as Record<string, unknown>).quota_management_key).toBeUndefined();
+  });
+
+  it("显式清除管理密钥时保留空字符串", async () => {
+    const patchBody = {
+      quota_management_enabled: false,
+      quota_management_key: "",
+    };
+    patch.mockResolvedValue({ data: patchBody });
+    await expect(updateSchedulerSettings(patchBody)).resolves.toEqual(patchBody);
+    expect(patch).toHaveBeenCalledWith(
+      "/v0/management/plugins/cpa-key-policy/settings",
+      patchBody,
+    );
+  });
+
+  it("调用管理桥接连接测试接口", async () => {
+    post.mockResolvedValue({ data: { ok: true } });
+    await expect(testQuotaManagementConnection()).resolves.toEqual({ ok: true });
+    expect(post).toHaveBeenCalledWith(
+      "/v0/management/plugins/cpa-key-policy/quota-management/test",
     );
   });
 

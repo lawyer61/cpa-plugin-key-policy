@@ -51,6 +51,7 @@ type quotaAuthRuntime struct {
 	Groups                []string                                `json:"groups,omitempty"`
 	RosterConfirmed       bool                                    `json:"roster_confirmed,omitempty"`
 	QueryEligible         bool                                    `json:"query_eligible,omitempty"`
+	MaintenanceTransport  string                                  `json:"maintenance_transport,omitempty"`
 	QuotaBackoffUntil     time.Time                               `json:"quota_backoff_until,omitempty"`
 	Status                string                                  `json:"status,omitempty"`
 	InManagedPool         bool                                    `json:"in_managed_pool,omitempty"`
